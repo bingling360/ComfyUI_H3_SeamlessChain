@@ -1,0 +1,585 @@
+{
+  "id": "h3-chain",
+  "revision": 0,
+  "last_node_id": 11,
+  "last_link_id": 11,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "UNETLoader",
+      "pos": [
+        -620,
+        100
+      ],
+      "size": [
+        340,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "default"
+      ],
+      "title": "MiniMax H3 UNET（ref2va）"
+    },
+    {
+      "id": 2,
+      "type": "MiniMaxH3SigmaShift",
+      "pos": [
+        -220,
+        80
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MiniMaxH3SigmaShift"
+      },
+      "widgets_values": [
+        12.0,
+        3.0
+      ],
+      "title": "Sigma Shift（视频12 / 音频3）"
+    },
+    {
+      "id": 3,
+      "type": "CLIPLoader",
+      "pos": [
+        -620,
+        260
+      ],
+      "size": [
+        340,
+        100
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "default",
+        "minimax"
+      ],
+      "title": "CLIP（minimax / Qwen3-VL）"
+    },
+    {
+      "id": 4,
+      "type": "VAELoader",
+      "pos": [
+        -620,
+        420
+      ],
+      "size": [
+        340,
+        58
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "minimax_h3_video_vae_fp16.safetensors"
+      ],
+      "title": "视频 VAE"
+    },
+    {
+      "id": 5,
+      "type": "VAELoader",
+      "pos": [
+        -620,
+        540
+      ],
+      "size": [
+        340,
+        58
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "minimax_h3_audio_vae_fp32.safetensors"
+      ],
+      "title": "音频 VAE"
+    },
+    {
+      "id": 6,
+      "type": "LoadImage",
+      "pos": [
+        -620,
+        680
+      ],
+      "size": [
+        280,
+        320
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            6
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "example.png",
+        "image"
+      ],
+      "image_upload": false,
+      "title": "参考图 1（主体）"
+    },
+    {
+      "id": 7,
+      "type": "LoadImage",
+      "pos": [
+        -320,
+        680
+      ],
+      "size": [
+        280,
+        320
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            7
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "example.png",
+        "image"
+      ],
+      "image_upload": false,
+      "title": "参考图 2（换装/场景）"
+    },
+    {
+      "id": 8,
+      "type": "ImageBatch",
+      "pos": [
+        20,
+        760
+      ],
+      "size": [
+        220,
+        60
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image1",
+          "type": "IMAGE",
+          "link": 6
+        },
+        {
+          "name": "image2",
+          "type": "IMAGE",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            8
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageBatch"
+      },
+      "title": "参考图合批"
+    },
+    {
+      "id": 9,
+      "type": "H3SeamlessChainSampler",
+      "pos": [
+        280,
+        60
+      ],
+      "size": [
+        520,
+        780
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "模型",
+          "type": "MODEL",
+          "link": 2
+        },
+        {
+          "name": "文本编码器",
+          "type": "CLIP",
+          "link": 3
+        },
+        {
+          "name": "视频VAE",
+          "type": "VAE",
+          "link": 4
+        },
+        {
+          "name": "音频VAE",
+          "type": "VAE",
+          "link": 5
+        },
+        {
+          "name": "首帧图片",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "参考图片",
+          "type": "IMAGE",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "name": "图像",
+          "type": "IMAGE",
+          "links": [
+            9
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "音频",
+          "type": "AUDIO",
+          "links": [
+            10
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "帧率",
+          "type": "INT",
+          "links": null,
+          "slot_index": 2
+        },
+        {
+          "name": "报告",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "H3SeamlessChainSampler"
+      },
+      "widgets_values": [
+        "镜头1：<Picture 1> 中的人物走在黄昏的城市街道上，迎着镜头缓慢走来，风吹动衣角，电影感，浅景深\n镜头2：她停下脚步回头微笑，镜头缓缓环绕，街道两侧的霓虹灯次第亮起，映在她的脸上\n镜头3：她转身走入人群，镜头缓慢拉远，暮色四合，城市的灯火连成一片",
+        864,
+        480,
+        124,
+        22,
+        0,
+        "fixed",
+        25,
+        1.0,
+        "res_multistep",
+        "simple"
+      ],
+      "title": "H3 段间引导续拍（多参三段）"
+    },
+    {
+      "id": 10,
+      "type": "CreateVideo",
+      "pos": [
+        860,
+        80
+      ],
+      "size": [
+        300,
+        180
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 9
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            11
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": [
+        24.0,
+        8
+      ],
+      "title": "创建视频"
+    },
+    {
+      "id": 11,
+      "type": "SaveVideo",
+      "pos": [
+        1220,
+        80
+      ],
+      "size": [
+        340,
+        320
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 11
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "h3_chain_r2v/ComfyUI",
+        "auto",
+        "auto"
+      ],
+      "title": "保存视频"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "MODEL"
+    ],
+    [
+      2,
+      2,
+      0,
+      9,
+      0,
+      "MODEL"
+    ],
+    [
+      3,
+      3,
+      0,
+      9,
+      1,
+      "CLIP"
+    ],
+    [
+      4,
+      4,
+      0,
+      9,
+      2,
+      "VAE"
+    ],
+    [
+      5,
+      5,
+      0,
+      9,
+      3,
+      "VAE"
+    ],
+    [
+      6,
+      6,
+      0,
+      8,
+      0,
+      "IMAGE"
+    ],
+    [
+      7,
+      7,
+      0,
+      8,
+      1,
+      "IMAGE"
+    ],
+    [
+      8,
+      8,
+      0,
+      9,
+      5,
+      "IMAGE"
+    ],
+    [
+      9,
+      9,
+      0,
+      10,
+      0,
+      "IMAGE"
+    ],
+    [
+      10,
+      9,
+      1,
+      10,
+      1,
+      "AUDIO"
+    ],
+    [
+      11,
+      10,
+      0,
+      11,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "参考图片（多张同主体，需同尺寸）",
+      "bounding": [
+        -640,
+        660,
+        620,
+        360
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {},
+  "version": 0.3
+}
