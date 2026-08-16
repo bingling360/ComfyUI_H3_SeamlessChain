@@ -1,8 +1,8 @@
 {
   "id": "h3-chain-r2v-official-base",
   "revision": 0,
-  "last_node_id": 145,
-  "last_link_id": 295,
+  "last_node_id": 151,
+  "last_link_id": 302,
   "nodes": [
     {
       "id": 92,
@@ -330,46 +330,6 @@
       ]
     },
     {
-      "id": 141,
-      "type": "ImageBatch",
-      "pos": [
-        -230,
-        5650
-      ],
-      "size": [
-        230,
-        60
-      ],
-      "flags": {},
-      "order": 8,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "image1",
-          "type": "IMAGE",
-          "link": 283
-        },
-        {
-          "name": "image2",
-          "type": "IMAGE",
-          "link": 284
-        }
-      ],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            285
-          ],
-          "slot_index": 0
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "ImageBatch"
-      }
-    },
-    {
       "id": 142,
       "type": "H3SeamlessChainSampler",
       "title": "H3 段间引导续拍（多参三段）",
@@ -378,8 +338,8 @@
         4870
       ],
       "size": [
-        650,
-        620
+        700,
+        700
       ],
       "flags": {},
       "order": 9,
@@ -411,9 +371,76 @@
           "link": null
         },
         {
-          "name": "参考图片",
+          "label": "提示词_1",
+          "name": "提示词组.提示词_1",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "提示词_1"
+          },
+          "link": 296
+        },
+        {
+          "label": "提示词_2",
+          "name": "提示词组.提示词_2",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "提示词_2"
+          },
+          "link": 297
+        },
+        {
+          "label": "提示词_3",
+          "name": "提示词组.提示词_3",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "提示词_3"
+          },
+          "link": 298
+        },
+        {
+          "label": "参考图片_0",
+          "name": "参考图片组.参考图片_0",
+          "shape": 7,
           "type": "IMAGE",
-          "link": 285
+          "link": 283
+        },
+        {
+          "label": "参考图片_1",
+          "name": "参考图片组.参考图片_1",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 284
+        },
+        {
+          "label": "参考图片_2",
+          "name": "参考图片组.参考图片_2",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "参考视频_0",
+          "name": "参考视频组.参考视频_0",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 300
+        },
+        {
+          "label": "参考视频音轨_0",
+          "name": "参考视频音轨组.参考视频音轨_0",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 301
+        },
+        {
+          "label": "参考音频_0",
+          "name": "参考音频组.参考音频_0",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 302
         }
       ],
       "outputs": [
@@ -466,11 +493,10 @@
         "Node name for S&R": "H3SeamlessChainSampler"
       },
       "widgets_values": [
-        "镜头1：<Picture 1> 中的少年站在城市天台边缘，风吹动红色披风，镜头缓慢推近，黄昏天光，电影感\n镜头2：<Picture 2> 中的机甲巨龙从云层俯冲而下，盘旋在城市上空，雷电在它周身炸开，镜头环绕仰拍\n镜头3：少年跃起跨上龙背，巨龙振翅冲向云海，镜头从侧后方跟拍并缓慢拉远，霓虹城市在脚下缩小",
         864,
         480,
         124,
-        22,
+        "22",
         0,
         "fixed",
         25,
@@ -498,7 +524,7 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "# H3 多参段间引导续拍（基于官方 r2v 模板）\n\n1. 两张 LoadImage 换成你的参考图（需同尺寸），ImageBatch 合成 batch\n2. 提示词每行一段，用 <Picture 1>/<Picture 2> 引用参考图\n3. UNET 用 minimax_h3_ref2va_*（与官方 r2v 模板一致，直连本节点）\n4. 输出：图像+音频 → CreateVideo(24fps) → SaveVideo；「报告」右键可预览分段摘要\n5. 接缝不够顺时把「引导帧数」22 提到 39/56"
+        "# H3 多参段间引导续拍（基于官方 r2v 模板）\n\n1. 两张 LoadImage 换成你的参考图（需同尺寸），ImageBatch 合成 batch\n2. 提示词每行一段，用 <Picture 1>/<Picture 2> 引用参考图\n3. UNET 用 minimax_h3_ref2va_*（与官方 r2v 模板一致，直连本节点）\n4. 输出：图像+音频 → CreateVideo(24fps) → SaveVideo；「报告」右键可预览分段摘要\n5. 接缝不够顺时把「引导帧数」22 提到 39/56\n\n## 参考视频 / 参考音轨 / 参考音频 接法\n\n- **参考视频_0**：`Load Video`（选一个 2-15 秒、24fps 的视频）→ `Get Video Components` → `images`；提示词里用 `<Video 1>` 引用。\n- **参考视频音轨_0**：接**同一个** `Get Video Components` 的 `audio` 输出（与参考视频_0 配对），自动获得 `<Audio 1>` 标签。\n- **参考音频_0**：`LoadAudio`（配乐/音效），提示词里用 `<Audio 2>` 引用（编号按音频连接顺序：视频音轨在前则独立音频从 2 起数）。\n- 不需要参考视频/音频时，断开这些连线（或直接删掉三个加载节点）即可；参考图片最多 9 张（`<Picture 1..9>`），点输入区旁的 + 继续加。"
       ]
     },
     {
@@ -582,6 +608,242 @@
         "auto",
         "auto"
       ]
+    },
+    {
+      "id": 146,
+      "type": "PrimitiveStringMultiline",
+      "title": "第 1 段提示词",
+      "pos": [
+        -1480,
+        5990
+      ],
+      "size": [
+        370,
+        210
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            296
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.2",
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "镜头1：<Picture 1> 中的少年站在城市天台边缘，风吹动红色披风，镜头缓慢推近，黄昏天光，电影感"
+      ]
+    },
+    {
+      "id": 147,
+      "type": "PrimitiveStringMultiline",
+      "title": "第 2 段提示词",
+      "pos": [
+        -1070,
+        5990
+      ],
+      "size": [
+        370,
+        210
+      ],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            297
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.2",
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "镜头2：<Picture 2> 中的机甲巨龙从云层俯冲而下，盘旋在城市上空，雷电在它周身炸开，镜头环绕仰拍"
+      ]
+    },
+    {
+      "id": 148,
+      "type": "PrimitiveStringMultiline",
+      "title": "第 3 段提示词",
+      "pos": [
+        -660,
+        5990
+      ],
+      "size": [
+        370,
+        210
+      ],
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            298
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.2",
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "镜头3：少年跃起跨上龙背，巨龙振翅冲向云海，镜头从侧后方跟拍并缓慢拉远，霓虹城市在脚下缩小"
+      ]
+    },
+    {
+      "id": 149,
+      "type": "LoadVideo",
+      "pos": [
+        -230,
+        6030
+      ],
+      "size": {
+        "0": 300,
+        "1": 110
+      },
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            299
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.2",
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        ""
+      ]
+    },
+    {
+      "id": 150,
+      "type": "GetVideoComponents",
+      "pos": [
+        110,
+        6030
+      ],
+      "size": {
+        "0": 280,
+        "1": 150
+      },
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 299
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            300
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            301
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": null,
+          "slot_index": 2
+        },
+        {
+          "name": "bit_depth",
+          "type": "INT",
+          "links": null,
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.2",
+        "Node name for S&R": "GetVideoComponents"
+      }
+    },
+    {
+      "id": 151,
+      "type": "LoadAudio",
+      "pos": [
+        430,
+        6030
+      ],
+      "size": {
+        "0": 330,
+        "1": 130
+      },
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            302
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "name",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.2",
+        "Node name for S&R": "LoadAudio"
+      },
+      "widgets_values": [
+        ""
+      ]
     }
   ],
   "links": [
@@ -589,24 +851,16 @@
       283,
       137,
       0,
-      141,
-      0,
+      142,
+      8,
       "IMAGE"
     ],
     [
       284,
       139,
       0,
-      141,
-      1,
-      "IMAGE"
-    ],
-    [
-      285,
-      141,
-      0,
       142,
-      5,
+      9,
       "IMAGE"
     ],
     [
@@ -688,6 +942,62 @@
       145,
       0,
       "VIDEO"
+    ],
+    [
+      296,
+      146,
+      0,
+      142,
+      5,
+      "STRING"
+    ],
+    [
+      297,
+      147,
+      0,
+      142,
+      6,
+      "STRING"
+    ],
+    [
+      298,
+      148,
+      0,
+      142,
+      7,
+      "STRING"
+    ],
+    [
+      299,
+      149,
+      0,
+      150,
+      0,
+      "VIDEO"
+    ],
+    [
+      300,
+      150,
+      0,
+      142,
+      11,
+      "IMAGE"
+    ],
+    [
+      301,
+      150,
+      1,
+      142,
+      12,
+      "AUDIO"
+    ],
+    [
+      302,
+      151,
+      0,
+      142,
+      13,
+      "AUDIO"
     ]
   ],
   "groups": [

@@ -37,9 +37,16 @@ pip install -r ComfyUI_H3_SeamlessChain/requirements.txt   # 无依赖，可跳�
    - UNET → 官方 **ModelSamplingMiniMaxH3**（shift video 12 / audio 3）→ 本节点「模型」
    - **CLIP**：type 必须选 `minimax`（Qwen3-VL）→ 本节点「文本编码器」
    - 视频 VAE（`minimax_h3_video_vae`）→「视频VAE」；音频 VAE（`minimax_h3_audio_vae`）→「音频VAE」
-2. 本节点「提示词」里**每个非空行 = 一段视频**的提示词。
-3. 输出：「图像」「帧率」「音频」接官方 `Create Video` → `Save Video`；「报告」可右键预览每段执行摘要。
-4. **分段单独保存**：「分段图像」「分段音频」为逐段展开输出（`OUTPUT_IS_LIST`），再接一组 `Create Video` → `Save Video`，运行时每段各存一个视频文件（自动编号），内容与成品中该段的画面完全一致，方便逐段检查或自行剪辑；不需要时该支路删掉即可，不影响成品输出。
+2. **每段提示词独立输入**：「提示词组」按段展开（提示词_1、提示词_2 …），可以直接写在框里，也可以接 `PrimitiveStringMultiline` 等外部节点；**一个输入框 = 一段视频**，段顺序按编号，点输入区旁的 + / - 增减段（最多 64 段）。
+3. **参考素材（r2v 链）**：四组 autogrow 输入，用法与官方 Reference to Video 完全一致——
+   - 「参考图片组」最多 **9 张**（`<Picture i>` 引用）
+   - 「参考视频组」最多 **3 个**（`<Video k>` 引用）：接 `LoadVideo` 的 `frames` 输出
+   - 「参考视频音轨组」：与同号参考视频配对（参考视频音轨_0 配 参考视频_0），接同一个 `LoadVideo` 的 `audio` 输出，自动获得 `<Audio j>` 标签
+   - 「参考音频组」最多 **3 条**独立音频（配乐/音效，`<Audio j>` 引用）：接 `LoadAudio` / `LoadVideo`
+   - 标签编号**按连接顺序从 1 数**（官方语义）；中间留空的输入框会被自动压实跳过，不会错位
+   - 接了任一参考素材 → 整条链走 r2v，请换 `ref2va` UNET，且不要再接「首帧图片」
+4. 输出：「图像」「帧率」「音频」接官方 `Create Video` → `Save Video`；「报告」可右键预览每段执行摘要。
+5. **分段单独保存**：「分段图像」「分段音频」为逐段展开输出（`OUTPUT_IS_LIST`），再接一组 `Create Video` → `Save Video`，运行时每段各存一个视频文件（自动编号），内容与成品中该段的画面完全一致，方便逐段检查或自行剪辑；不需要时该支路删掉即可，不影响成品输出。
 
 ### 任务链自动判定（无需选 task_type）
 
@@ -47,7 +54,7 @@ pip install -r ComfyUI_H3_SeamlessChain/requirements.txt   # 无依赖，可跳�
 |---|---|---|
 | 什么都不接 | 纯 t2v | fl2va |
 | 「首帧图片」 | 首段 i2v + 续段 t2v | fl2va |
-| 「参考图片」（batch 多张 ≤9） | 每段 r2v（提示词用 `<Picture N>` 引用） | ref2va |
+| 任一「参考」组 | 每段 r2v（提示词用 `<Picture i>` / `<Video k>` / `<Audio j>` 引用） | ref2va |
 
 ### 关键参数（均为节点上的中文控件名）
 
@@ -58,9 +65,8 @@ pip install -r ComfyUI_H3_SeamlessChain/requirements.txt   # 无依赖，可跳�
 
 ## 示例工作流
 
-- `example_workflows/h3_chain_t2v.json`：三段 t2v 续拍（UNET → SigmaShift → 本节点 → Create Video → Save Video）。
-- `example_workflows/h3_chain_r2v_multi_ref.json`：**多参（r2v）三段续拍**，仿官方多参模板结构：LoadImage ×2 → ImageBatch 合批 → 本节点「参考图片」（提示词 `<Picture 1>` 引用主体，ref2va UNET）→ Create Video → Save Video。三张以上参考图时，可换用官方新版 `BatchImages` 节点（Autogrow）合批后再接入；旧版 `ImageBatch` 在新版 ComfyUI 中加载时会提示一键转换。
-- `example_workflows/h3_chain_r2v_official_base.json`：**官方 r2v 模板骨架移植版**——直接以 ComfyUI 官方 `video_minimax_h3_r2v` 工作流为基底改造，模型加载 / CreateVideo / SaveVideo 节点保持官方原样序列化（含 cnr_id / models 元数据），UNET 直连本节点（与官方 r2v 模板一致，无 SigmaShift），并把官方示例参考图（红披风少年 / 机甲龙）沿用为三段提示词示例。已含「分段保存」支路（每段单独存一个视频）。**优先使用本文件**。
+- `example_workflows/h3_chain_t2v.json`：三段 t2v 续拍（UNET → SigmaShift → 本节点 → Create Video → Save Video），三段提示词各接一个 `PrimitiveStringMultiline`。
+- `example_workflows/h3_chain_r2v_official_base.json`：**官方 r2v 模板骨架移植版（优先使用）**——直接以 ComfyUI 官方 `video_minimax_h3_r2v` 工作流为基底改造，模型加载 / CreateVideo / SaveVideo 节点保持官方原样序列化（含 cnr_id / models 元数据），UNET 直连本节点（与官方 r2v 模板一致，无 SigmaShift），并把官方示例参考图（红披风少年 / 机甲龙）沿用为三段提示词示例。节点上四组参考输入（图片×9 / 视频×3 / 视频音轨×3 / 音频×3）均已展开，「参考视频_0 + 参考视频音轨_0」预接了 `LoadVideo` 的 frames/audio 双输出演示接法；已含「分段保存」支路（每段单独存一个视频）。
 
 ## 已知边界（V1）
 

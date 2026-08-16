@@ -105,20 +105,58 @@ def _install_stubs(with_audio_support=False):
     sys.modules["comfy_extras"] = comfy_extras
     sys.modules["comfy_extras.nodes_minimax_h3"] = nmh
 
+    class _Any:
+        def __init__(self, *a, **k):
+            self.args = a
+            self.id = a[0] if a else k.get("id")
+            self.kwargs = k
+            for key, v in k.items():
+                setattr(self, key, v)
+            self.is_output_list = bool(k.get("is_output_list"))
+
+        def __getitem__(self, i):
+            return self.args[i]
+
+    class io_mod:
+        ComfyNode = object
+        Schema = _Any
+        NodeOutput = _Any
+
+        class Autogrow:
+            Input = _Any
+
+            class TemplatePrefix:
+                def __init__(self, *a, **k):
+                    self.args, self.kwargs = a, k
+
+    for name in ["Model", "Clip", "Vae", "Int", "Float", "Combo", "String",
+                 "Image", "Audio", "Latent", "Conditioning"]:
+        setattr(io_mod, name, type(name, (), {"Input": _Any, "Output": _Any}))
+
+    comfy_api = types.ModuleType("comfy_api")
+    latest = types.ModuleType("comfy_api.latest")
+    latest.io = io_mod
+    latest.ComfyExtension = object
+    comfy_api.latest = latest
+    sys.modules["comfy_api"] = comfy_api
+    sys.modules["comfy_api.latest"] = latest
+
 
 def test_structure():
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
     cls = plugin_nodes.H3SeamlessChainSampler
-    it = cls.INPUT_TYPES()
-    for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "提示词", "宽度", "高度",
-                "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器"]:
-        assert key in it["required"], f"missing required input: {key}"
-    assert "首帧图片" in it["optional"] and "参考图片" in it["optional"]
-    assert it["required"]["引导帧数"][0] == [5, 22, 39, 56]
-    assert cls.RETURN_TYPES == ("IMAGE", "AUDIO", "INT", "STRING", "IMAGE", "AUDIO")
-    assert cls.RETURN_NAMES == ("图像", "音频", "帧率", "报告", "分段图像", "分段音频")
-    assert cls.OUTPUT_IS_LIST == (False, False, False, False, True, True)
-    assert cls.FUNCTION == "run" and cls.CATEGORY == "MiniMaxH3"
+    schema = cls.define_schema()
+    ids = [inp.id for inp in schema.inputs]
+    for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽度", "高度",
+                "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
+                "首帧图片", "提示词组", "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
+        assert key in ids, f"missing input: {key}"
+    by_id = {inp.id: inp for inp in schema.inputs}
+    assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
+    assert by_id["种子"].kwargs.get("control_after_generate") is True
+    outs = [(o.id, o.is_output_list) for o in schema.outputs]
+    assert outs == [("图像", False), ("音频", False), ("帧率", False), ("报告", False),
+                    ("分段图像", True), ("分段音频", True)]
     print("PASS test_structure")
 
 
@@ -155,22 +193,22 @@ class _Clip:
 
 def test_run_validation():
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
-    node = plugin_nodes.H3SeamlessChainSampler()
+    cls = plugin_nodes.H3SeamlessChainSampler
     common = {"模型": None, "文本编码器": _Clip(), "视频VAE": None, "音频VAE": None,
               "宽度": 864, "高度": 480, "每段帧数": 124, "引导帧数": 22,
               "种子": 0, "步数": 25, "CFG": 1.0, "采样器": "res_multistep", "调度器": "simple"}
     try:
-        node.run(**common, 提示词="  \n ")
+        cls.execute(**common, 提示词组={"提示词_1": "  ", "提示词_2": ""})
         raise AssertionError("should reject empty prompts")
     except ValueError as e:
         assert "提示词" in str(e)
     try:
-        node.run(**common, 提示词="a\nb",
-                 首帧图片=FakeTensor([1, 480, 864, 3]),
-                 参考图片=FakeTensor([2, 480, 864, 3]))
-        raise AssertionError("should reject first_frame + ref_images")
+        cls.execute(**common, 提示词组={"提示词_1": "a", "提示词_2": "b"},
+                    首帧图片=FakeTensor([1, 480, 864, 3]),
+                    参考图片组={"参考图片_0": FakeTensor([1, 480, 864, 3])})
+        raise AssertionError("should reject first_frame + refs")
     except ValueError as e:
-        assert "不能同时连接" in str(e)
+        assert "不能同时" in str(e)
     print("PASS test_run_validation")
 
 
