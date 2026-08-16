@@ -149,11 +149,14 @@ def test_structure():
     ids = [inp.id for inp in schema.inputs]
     for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽度", "高度",
                 "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
+                "断点续拍", "断点目录", "桥帧门控", "清晰度阈值", "回退上限",
                 "首帧图片", "提示词组", "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
         assert key in ids, f"missing input: {key}"
     by_id = {inp.id: inp for inp in schema.inputs}
     assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
     assert by_id["种子"].kwargs.get("control_after_generate") is True
+    assert by_id["断点续拍"].kwargs.get("options") == ["关闭", "自动续跑"]
+    assert by_id["桥帧门控"].kwargs.get("options") == ["关闭", "标注", "自动回退"]
     outs = [(o.id, o.is_output_list) for o in schema.outputs]
     assert outs == [("图像", False), ("音频", False), ("帧率", False), ("报告", False),
                     ("分段图像", True), ("分段音频", True)]
@@ -168,18 +171,21 @@ def test_capability_probe():
 
 def test_tail_keyframe_slices():
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
-    av = FakeNested(FakeTensor([1, 24, 37, 30, 54]),   # 124 帧段，37 video tokens
-                    FakeTensor([1, 32, 2, 207], wav_len=207))
-    kf = plugin_nodes._tail_keyframe(av, 22, with_audio=True)
+    video = FakeTensor([1, 24, 37, 30, 54])            # 124 帧段，37 video tokens
+    audio = FakeTensor([1, 32, 2, 207], wav_len=207)
+    kf = plugin_nodes._tail_keyframe(video, audio, 22, True)
     assert kf["resolved_frame_index"] == 0
-    assert kf["latent"].shape[2] == 7      # 22 帧 = 7 video tokens
+    assert kf["latent"].shape[2] == 7                  # 22 帧 = 7 video tokens
     assert kf["audio_latent"].shape[-1] == 37
-    kf5 = plugin_nodes._tail_keyframe(av, 5, with_audio=True)
+    kf5 = plugin_nodes._tail_keyframe(video, audio, 5, True)
     assert kf5["latent"].shape[2] == 2 and kf5["audio_latent"].shape[-1] == 8
-    kf39 = plugin_nodes._tail_keyframe(av, 39, with_audio=True)
+    kf39 = plugin_nodes._tail_keyframe(video, audio, 39, True)
     assert kf39["latent"].shape[2] == 12 and kf39["audio_latent"].shape[-1] == 65
-    kf_noaudio = plugin_nodes._tail_keyframe(av, 22, with_audio=False)
+    kf_noaudio = plugin_nodes._tail_keyframe(video, audio, 22, False)
     assert "audio_latent" not in kf_noaudio
+    # 桥帧门控回退：偏移 5 token（=17 帧）+ 对应音频 token，切片长度不变
+    kfb = plugin_nodes._tail_keyframe(video, audio, 22, True, back_tokens=5, back_audio=28)
+    assert kfb["latent"].shape[2] == 7 and kfb["audio_latent"].shape[-1] == 37
     print("PASS test_tail_keyframe_slices")
 
 

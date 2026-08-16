@@ -24,6 +24,7 @@ import comfy.samplers
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo
 from comfy_api.latest import io
 
+from . import checkpoint
 from .grid import video_latent_t, latent_t_to_frames, audio_tokens_for_frames
 
 try:
@@ -45,17 +46,23 @@ def _decode_audio(audio_vae, audio_latent):
     return audio, sample_rate
 
 
-def _tail_keyframe(av_samples, ctx_frames, with_audio):
-    video, audio = av_samples.unbind()
+def _tail_keyframe(video_t, audio_t, ctx_frames, with_audio, back_tokens=0, back_audio=0):
+    """上段尾部 ctx 帧 latent 直切为 keyframe；back_* 为桥帧门控回退偏移。
+
+    回退量必须是 5 token（17 帧）的倍数：切片起点/终点同步平移，
+    切片覆盖帧数不变，且始终落在 17k+5 网格上。
+    """
     vt = video_latent_t(ctx_frames)
+    end = video_t.shape[2] - back_tokens
     kf = {
         "resolved_frame_index": 0,
-        "latent": video[:, :, -vt:, :, :].clone(),
+        "latent": video_t[:, :, end - vt:end, :, :].clone(),
     }
-    if with_audio and audio is not None:
+    if with_audio and audio_t is not None:
         at = audio_tokens_for_frames(ctx_frames)
-        if 0 < at <= audio.shape[-1]:
-            kf["audio_latent"] = audio[..., -at:].clone()
+        aend = audio_t.shape[-1] - back_audio
+        if 0 < at <= aend:
+            kf["audio_latent"] = audio_t[..., aend - at:aend].clone()
     return kf
 
 
@@ -104,6 +111,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Float.Input("CFG", default=1.0, min=0.0, max=100.0, step=0.1),
                 io.Combo.Input("采样器", options=comfy.samplers.KSampler.SAMPLERS, default="res_multistep"),
                 io.Combo.Input("调度器", options=comfy.samplers.KSampler.SCHEDULERS, default="simple"),
+                io.Combo.Input("断点续拍", options=["关闭", "自动续跑"], default="关闭",
+                               tooltip="自动续跑：每段采样后立即落盘 latent 断点（约5MB/段），中断后重跑自动跳过已完成段，结果与一次跑完一致"),
+                io.String.Input("断点目录", default="",
+                                tooltip="空=按参数指纹自动命名于 output/checkpoints/ 下；换链请填新名字或清空旧目录。断点为中间产物，跑完可删"),
+                io.Combo.Input("桥帧门控", options=["关闭", "标注", "自动回退"], default="标注",
+                               tooltip="对将成为重叠桥的尾帧打分（Laplacian清晰度+曝光）：标注=只写报告；自动回退=尾帧低于阈值时向前回退17/34帧取好帧续拍（该段可见帧数随之减少）"),
+                io.Float.Input("清晰度阈值", default=30.0, min=0.0, max=100.0, step=0.5,
+                               tooltip="桥帧总分阈值，低于判定为坏尾。建议先跑「标注」档看报告里的分数分布再定"),
+                io.Int.Input("回退上限", default=34, min=0, max=68, step=17,
+                             tooltip="自动回退最多向前多少帧（17 的倍数，踩 17k+5 网格）"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Autogrow.Input("提示词组", optional=True,
@@ -147,7 +164,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
     @classmethod
     def execute(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽度, 高度, 每段帧数, 引导帧数,
                 种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 提示词组=None,
-                参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None):
+                参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
+                断点续拍="关闭", 断点目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34):
         prompts = _autogrow_items(提示词组, "p")
         seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
         if not seg_prompts:
@@ -165,6 +183,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         length, width, height, seed = int(每段帧数), int(宽度), int(高度), int(种子)
         ctx = int(引导帧数)
+        gate_limit = max(0, int(回退上限) // 17 * 17)
+        if 桥帧门控 != "关闭":
+            from . import qc  # torch 计算图较重，仅在启用门控时加载
         clip, video_vae, audio_vae = 文本编码器, 视频VAE, 音频VAE
         if has_refs:
             chain = "r2v（ref2va UNET）"
@@ -183,47 +204,98 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append("注意：当前 ComfyUI 不含 PR #15439（Add Guide 协议），段间引导降级为仅视频锚定，音频不锚定"
                           + ("；r2v 链上引导会与参考素材冲突失效，强烈建议升级 ComfyUI" if has_refs else ""))
 
+        # 断点指纹不含种子：种子控件开着 control_after_generate 每次运行自动 +1，
+        # 真正的种子以 manifest 权威记录为准（见下方续跑载入逻辑）
+        resume = 断点续拍 == "自动续跑"
+        ckpt_params = {
+            "prompts": seg_prompts, "width": width, "height": height,
+            "length": length, "ctx": ctx, "steps": int(步数), "cfg": float(CFG),
+            "sampler": 采样器, "scheduler": 调度器, "chain": chain,
+            "keyframe_audio": KEYFRAME_AUDIO_SUPPORTED,
+            "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
+        }
+        root, manifest, done = None, None, 0
+        if resume:
+            root = checkpoint.ckpt_dir(ckpt_params, 断点目录.strip())
+            manifest = checkpoint.load_manifest(root)
+            if manifest is not None:
+                if manifest.get("schema") != checkpoint.SCHEMA:
+                    raise ValueError(f"断点目录格式不认识（{manifest.get('schema')}），请换一个目录名")
+                checkpoint.assert_match(manifest["params"], ckpt_params)
+                done = checkpoint.contiguous_done(root, int(manifest.get("done", 0)))
+                saved_seed = int(manifest["params"].get("seed", seed))
+                if saved_seed != seed:
+                    report.append(f"断点续拍：控件种子 {seed} 被忽略，沿用断点种子 {saved_seed}"
+                                  "（control_after_generate 自增所致，属正常）")
+                    seed = saved_seed
+                report.append(f"断点续跑：载入已完成 {done}/{len(seg_prompts)} 段，目录 {root}")
+
         pbar = comfy.utils.ProgressBar(len(seg_prompts))
         all_frames = []
         all_wav = None
         seg_frames = []
         seg_wavs = []
+        trims = []
         guide = None
 
         for i, prompt in enumerate(seg_prompts):
-            seg_len = length + (ctx if i > 0 else 0)
-            if has_refs:
-                out = MiniMaxH3ReferenceToVideo.execute(
-                    clip=clip, vae=video_vae, audio_vae=audio_vae,
-                    prompt=prompt, width=width, height=height, length=seg_len,
-                    ref_image_size="match", **refs)
+            replay = resume and i < done
+            if replay:
+                video_t, audio_t = checkpoint.load_segment(root, i)
+                video_t = video_t.to(video_vae.device)
+                audio_t = audio_t.to(audio_vae.device)
             else:
-                out = MiniMaxH3ImageToVideo.execute(
-                    clip=clip, vae=video_vae, prompt=prompt,
-                    width=width, height=height, length=seg_len,
-                    first_frame=首帧图片 if i == 0 else None)
+                seg_len = length + (ctx if i > 0 else 0)
+                if has_refs:
+                    out = MiniMaxH3ReferenceToVideo.execute(
+                        clip=clip, vae=video_vae, audio_vae=audio_vae,
+                        prompt=prompt, width=width, height=height, length=seg_len,
+                        ref_image_size="match", **refs)
+                else:
+                    out = MiniMaxH3ImageToVideo.execute(
+                        clip=clip, vae=video_vae, prompt=prompt,
+                        width=width, height=height, length=seg_len,
+                        first_frame=首帧图片 if i == 0 else None)
 
-            cond, latent = out[0], out[1]
-            sampled_fc = latent_t_to_frames(latent["samples"].tensors[0].shape[2])
-            if guide is not None:
-                cond = cls._apply_guide(cond, guide, sampled_fc)
+                cond, latent = out[0], out[1]
+                if guide is not None:
+                    cond = cls._apply_guide(
+                        cond, guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]))
 
-            sampled = nodes.common_ksampler(
-                模型, (seed + i) % 0xffffffffffffffff, 步数, CFG,
-                采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
-            av = sampled["samples"]
+                sampled = nodes.common_ksampler(
+                    模型, (seed + i) % 0xffffffffffffffff, 步数, CFG,
+                    采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
+                video_t, audio_t = sampled["samples"].unbind()
+                if resume:
+                    checkpoint.save_segment(root, i, video_t, audio_t)
 
-            video_t, audio_t = av.unbind()
+            sampled_fc = latent_t_to_frames(video_t.shape[2])
             frames = video_vae.decode(video_t)
             if len(frames.shape) == 5:
                 frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
             wav, sample_rate = _decode_audio(audio_vae, audio_t)
 
             skip_f = ctx if i > 0 else 0
-            frames = frames[skip_f:skip_f + length]
+            vis_len = length
+            if 桥帧门控 != "关闭" and i + 1 < len(seg_prompts):
+                window = frames[max(skip_f, frames.shape[0] - (ctx + gate_limit)):]
+                score = qc.frame_scores(window)
+                tail_score = float(score[-1])
+                if 桥帧门控 == "标注":
+                    flag = " ↓ 低于阈值" if tail_score < 清晰度阈值 else ""
+                    report.append(f"段{i + 1} 桥帧总分 {tail_score:.1f}{flag}")
+                else:  # 自动回退
+                    back, hit = qc.pick_backtrack(score, gate_limit, float(清晰度阈值))
+                    if back:
+                        vis_len = length - back
+                        report.append(f"段{i + 1} 尾帧低质（{tail_score:.1f} < {清晰度阈值:g}），"
+                                      f"回退 {back} 帧续拍（回退点 {hit:.1f}）")
+            trims.append(length - vis_len)
+
+            frames = frames[skip_f:skip_f + vis_len]
             total = wav.shape[-1]
             skip_s = round(total * skip_f / sampled_fc)
-            take_s = round(total * length / sampled_fc)
+            take_s = round(total * vis_len / sampled_fc)
             wav = wav[..., skip_s:skip_s + take_s]
 
             all_frames.append(frames.cpu())
@@ -236,12 +308,25 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 note = f"guide=上段尾{ctx}帧" + ("+音频" if "audio_latent" in guide else "")
             else:
                 note = "guide=无（首段）"
-            report.append(f"段{i + 1}/{len(seg_prompts)}：采样{sampled_fc}帧 裁头{skip_f}帧 留{frames.shape[0]}帧 | {note}")
+            origin = "断点载入" if replay else f"采样{sampled_fc}帧"
+            report.append(f"段{i + 1}/{len(seg_prompts)}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧 | {note}")
 
             if i + 1 < len(seg_prompts):
-                guide = _tail_keyframe(av, ctx, KEYFRAME_AUDIO_SUPPORTED)
+                back = length - vis_len
+                guide = _tail_keyframe(video_t, audio_t, ctx, KEYFRAME_AUDIO_SUPPORTED,
+                                       back_tokens=back // 17 * 5,
+                                       back_audio=round(back * 5.0 / 3.0))
+
+            if resume and not replay:
+                checkpoint.save_manifest(root, {
+                    "schema": checkpoint.SCHEMA, "done": i + 1,
+                    "params": {**ckpt_params, "seed": seed}, "trims": list(trims),
+                })
 
             pbar.update(1)
+
+        if resume:
+            report.append(f"断点目录（含中间 latent，跑完可删）：{root}")
 
         images = torch.cat(all_frames, dim=0)
         return io.NodeOutput(
