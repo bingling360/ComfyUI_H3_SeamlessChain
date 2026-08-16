@@ -174,6 +174,47 @@ def test_capability_probe():
     print("PASS test_capability_probe")
 
 
+class _FakeMask:
+    def __init__(self, n):
+        self.n = n
+
+    def __invert__(self):
+        return self
+
+    def sum(self):
+        return self.n
+
+
+def test_bridge_fallback_probe():
+    from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
+    mm = sys.modules["comfy.ldm.minimax.model"]
+    sys.modules["torch"].zeros = lambda *a, **k: FakeTensor(list(a))
+
+    def layout_with(cond_rows):
+        return lambda *a, **k: types.SimpleNamespace(img_update=_FakeMask(cond_rows))
+
+    # 旧协议：keyframe cond 行数恒为单帧 16 行 -> 降级为单帧桥
+    mm.PackedLayout = layout_with(16)
+    plugin_nodes._full_bridge_cache = None
+    assert plugin_nodes.full_bridge_supported() is False
+    kf = plugin_nodes._tail_keyframe(FakeTensor([1, 24, 37, 30, 54]),
+                                     FakeTensor([1, 32, 2, 207], 207), 22, True,
+                                     full_bridge=False)
+    assert kf["latent"].shape[2] == 1 and "audio_latent" not in kf
+
+    # 新协议：2 token 得 32 行 -> 完整桥
+    mm.PackedLayout = layout_with(32)
+    plugin_nodes._full_bridge_cache = None
+    assert plugin_nodes.full_bridge_supported() is True
+
+    # PackedLayout 缺失（无 ComfyUI 环境）-> 安全降级
+    del mm.PackedLayout
+    plugin_nodes._full_bridge_cache = None
+    assert plugin_nodes.full_bridge_supported() is False
+    plugin_nodes._full_bridge_cache = None
+    print("PASS test_bridge_fallback_probe")
+
+
 def test_is_changed():
     import math
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
@@ -238,6 +279,7 @@ if __name__ == "__main__":
     _install_stubs(with_audio_support=False)
     test_structure()
     test_capability_probe()
+    test_bridge_fallback_probe()
     test_is_changed()
     test_tail_keyframe_slices()
     test_run_validation()

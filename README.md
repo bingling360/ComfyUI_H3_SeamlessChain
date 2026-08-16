@@ -33,7 +33,7 @@ pip install -r ComfyUI_H3_SeamlessChain/requirements.txt   # 无依赖，可跳�
 ## 版本要求
 
 - ComfyUI **≥ v0.30.0**（含官方 MiniMax H3 节点），否则插件不加载并在控制台提示。
-- 段间引导携带**音频**锚定需要 ComfyUI 含 [PR #15439](https://github.com/Comfy-Org/ComfyUI/pull/15439)（2026-08-09 之后构建）。旧版本会自动降级为**仅视频**引导（报告中注明）；**r2v 链在旧版本上引导会与参考素材冲突失效，务必升级**。
+- 段间引导的**多帧桥**与**音频锚定**需要 ComfyUI 含 [PR #15439](https://github.com/Comfy-Org/ComfyUI/pull/15439)（2026-08-09 之后构建）。旧版本（如 v0.32.0）的 keyframe 协议每个锚点只收单帧 latent，插件会在运行时自动探测：不支持时自动降级为**单帧桥 + 仅视频引导**（报告中注明，接缝质量受限）。**升级 ComfyUI 后无需改任何参数，自动恢复完整引导帧数**；r2v 链在旧版本上引导还会与参考素材冲突失效，务必升级。
 
 ## 使用（节点界面为中文）
 
@@ -112,6 +112,7 @@ pip install -r ComfyUI_H3_SeamlessChain/requirements.txt   # 无依赖，可跳�
 
 - 不含 fl2v 尾帧组、v2v / rv2v 源视频编辑（属内容生成方式扩展，非段间引导核心，可后续加）。
 - 音频锚定为官方「从锚点向后展开」语义；有节拍的音乐接缝处如察觉轻微不自然，可尝试把 `引导帧数` 提到 39 或 56。
+- 旧版 ComfyUI（不含 PR #15439）上第二段起报 `shape mismatch: value tensor of shape [2835, 96] cannot be broadcast to indexing result of shape [405, 96]`：旧 keyframe 协议只收单帧 latent 所致，现已自动降级为单帧桥规避（报告注明）；升级 ComfyUI 可恢复完整桥。
 - 旧版（v1）断点目录不兼容本版本（报错并提示换目录名），需重新开链。
 - 审片模式下主「图像 / 音频」输出为**已完成段的累计成片**（未完成链不是最终成品）；完整成片在全部段确认完毕后的那次运行输出。
 

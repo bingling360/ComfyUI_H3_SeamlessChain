@@ -16,8 +16,9 @@
 
 兼容性：不 monkey-patch；conditioning/latent 构造直接调用官方
 MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo 节点类，采样走官方
-common_ksampler。keyframe 携带 audio_latent 需要 ComfyUI 含 PR #15439
-（2026-08-09 之后构建），旧版本自动降级为仅视频引导并在报告中说明。
+common_ksampler。多 token 桥与 keyframe 音频需要 ComfyUI 含 PR #15439
+（2026-08-09 之后构建）；旧版 PackedLayout 每个 keyframe 只分配单帧 latent
+行数，钉多 token 桥会形状错位，运行时自动探测并降级为单帧桥（报告说明）。
 """
 
 import time
@@ -38,7 +39,36 @@ try:
     # PR #15439 引入的模块级函数；存在即代表支持 keyframe 音频与 refs/keyframes 合并
     KEYFRAME_AUDIO_SUPPORTED = hasattr(_minimax_model, "_ref_t_span")
 except Exception:
+    _minimax_model = None
     KEYFRAME_AUDIO_SUPPORTED = False
+
+_full_bridge_cache = None
+
+
+def full_bridge_supported():
+    """多 token keyframe 探测（进程内缓存一次）。
+
+    旧版 PackedLayout（PR #15439 之前）对每个 keyframe 固定只分配 1 帧 latent
+    的行数且仅认首/尾锚点，钉 22 帧桥（7 token，2835 行）会形状错位
+    （[2835,96] 无法广播到 [405,96]）。构造一个 2 token 的微型 keyframe 布局
+    实测 cond 行数：翻倍即支持完整桥，否则调用方降级为单帧桥。
+    """
+    global _full_bridge_cache
+    if _full_bridge_cache is not None:
+        return _full_bridge_cache
+    ok = False
+    if _minimax_model is not None:
+        try:
+            import torch
+            layout = _minimax_model.PackedLayout(
+                1, 2, 8, 8, 4,
+                keyframes=[{"resolved_frame_index": 0,
+                            "latent": torch.zeros(1, 24, 2, 8, 8)}])
+            ok = int((~layout.img_update).sum()) == 32  # 2 token × 16 行（8×8 latent）
+        except Exception:
+            ok = False
+    _full_bridge_cache = ok
+    return ok
 
 
 def _decode_audio(audio_vae, audio_latent):
@@ -52,19 +82,21 @@ def _decode_audio(audio_vae, audio_latent):
     return audio, sample_rate
 
 
-def _tail_keyframe(video_t, audio_t, ctx_frames, with_audio, back_tokens=0, back_audio=0):
+def _tail_keyframe(video_t, audio_t, ctx_frames, with_audio, back_tokens=0, back_audio=0, full_bridge=True):
     """上段尾部 ctx 帧 latent 直切为 keyframe；back_* 为桥帧门控回退偏移。
 
     回退量必须是 5 token（17 帧）的倍数：切片起点/终点同步平移，
     切片覆盖帧数不变，且始终落在 17k+5 网格上。
+    旧版 ComfyUI keyframe 协议只收单帧 latent：full_bridge=False 时只钉
+    尾部最后 1 个 token（承载上段末尾画面），且不附音频。
     """
-    vt = video_latent_t(ctx_frames)
+    vt = video_latent_t(ctx_frames) if full_bridge else 1
     end = video_t.shape[2] - back_tokens
     kf = {
         "resolved_frame_index": 0,
         "latent": video_t[:, :, end - vt:end, :, :].clone(),
     }
-    if with_audio and audio_t is not None:
+    if with_audio and full_bridge and audio_t is not None:
         at = audio_tokens_for_frames(ctx_frames)
         aend = audio_t.shape[-1] - back_audio
         if 0 < at <= aend:
@@ -215,6 +247,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if not KEYFRAME_AUDIO_SUPPORTED:
             report.append("注意：当前 ComfyUI 不含 PR #15439（Add Guide 协议），段间引导降级为仅视频锚定，音频不锚定"
                           + ("；r2v 链上引导会与参考素材冲突失效，强烈建议升级 ComfyUI" if has_refs else ""))
+        full_bridge = full_bridge_supported()
+        if not full_bridge:
+            report.append("注意：当前 ComfyUI 的 keyframe 协议仅支持单帧锚定，段间引导已自动降级为单帧桥，"
+                          "接缝质量受限；升级 ComfyUI 后无需改参数即自动恢复完整引导帧数")
 
         # 断点指纹只覆盖共享参数（不含提示词、不含种子）：改某段提示词仍指向同一条链，
         # 重跑起点由逐段提示词哈希比对定位；种子控件开着 control_after_generate 每次运行
@@ -231,7 +267,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
             "width": width, "height": height,
             "length": length, "ctx": ctx, "steps": int(步数), "cfg": float(CFG),
             "sampler": 采样器, "scheduler": 调度器, "chain": chain,
-            "keyframe_audio": KEYFRAME_AUDIO_SUPPORTED,
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
         seg_hashes = [checkpoint.prompt_hash(p) for p in seg_prompts]
@@ -365,7 +400,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
             prev_tail_wav = seg_wav[..., -seam_n:]
 
             if guide is not None:
-                note = f"guide=上段尾{ctx}帧" + ("+音频" if "audio_latent" in guide else "")
+                note = (f"guide=上段尾{ctx}帧" if full_bridge else "guide=单帧桥(旧协议降级)") \
+                    + ("+音频" if "audio_latent" in guide else "")
             else:
                 note = "guide=无（首段）"
             origin = "断点载入" if replay else f"采样{sampled_fc}帧"
@@ -375,9 +411,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
             if i + 1 < len(seg_prompts):
                 back = length - vis_len
-                guide = _tail_keyframe(video_t, audio_t, ctx, KEYFRAME_AUDIO_SUPPORTED,
+                guide = _tail_keyframe(video_t, audio_t, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
                                        back_tokens=back // 17 * 5,
-                                       back_audio=round(back * 5.0 / 3.0))
+                                       back_audio=round(back * 5.0 / 3.0),
+                                       full_bridge=full_bridge)
 
             if use_ckpt and not replay:
                 checkpoint.save_manifest(root, {
