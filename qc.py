@@ -5,6 +5,8 @@
 17 帧 = 5 个 latent token，天然踩 H3 的 17k+5 帧网格，切片 token 数不变。
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -52,3 +54,26 @@ def pick_backtrack(score, limit: int, threshold: float):
         if s >= threshold:
             return back, s
     return 0, tail
+
+
+def seam_metrics(prev_frame, head_frame, prev_wav=None, head_wav=None, rate=44100, tail_s=0.25):
+    """接缝后验测量（测而不干预）：上一段最后可见帧 vs 本段首帧。
+
+    prev_frame / head_frame: [H,W,3] 0-1（任意设备，内部搬 CPU）；
+    prev_wav / head_wav: [C,samples]，调用方已截取接缝两侧约 tail_s 秒。
+    返回 (帧差 0-1 均绝对差, 响度跳变 dB 或 None——wav 缺失/过短时 None)。
+    dB > 0 表示接缝后比接缝前响。
+    """
+    a = prev_frame.detach().float().cpu()
+    b = head_frame.detach().float().cpu()
+    diff = float((a - b).abs().mean())
+    db = None
+    if prev_wav is not None and head_wav is not None:
+        pa = prev_wav.detach().float().cpu()
+        pb = head_wav.detach().float().cpu()
+        n = min(pa.shape[-1], pb.shape[-1])
+        if n >= max(2, int(rate * tail_s * 0.2)):        # 至少约 50ms 才有意义
+            ra = float(pa[..., :n].pow(2).mean().sqrt())
+            rb = float(pb[..., :n].pow(2).mean().sqrt())
+            db = 20.0 * math.log10((ra + 1e-5) / (rb + 1e-5))
+    return diff, db

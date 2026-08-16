@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import torch
-    from qc import frame_scores, pick_backtrack
+    from qc import frame_scores, pick_backtrack, seam_metrics
 except ImportError:
     torch = None
 
@@ -51,6 +51,24 @@ def test_pick_backtrack_levels():
     scores[-1] = 45.0
     back, hit = pick_backtrack(scores, 34, 30.0)
     assert back == 0 and hit == 45.0                      # 尾帧达标 -> 不回退
+
+
+def test_seam_metrics():
+    if torch is None:
+        return print("SKIP test_seam_metrics (no torch)")
+    a = torch.zeros(8, 8, 3)
+    d, db = seam_metrics(a, a)
+    assert d == 0.0 and db is None                       # 同帧 + 无 wav
+    d, _ = seam_metrics(a, torch.ones(8, 8, 3))
+    assert d == 1.0                                      # 全反相 -> 最大帧差
+    loud = torch.full((1, 2205), 0.5)                    # 0.05s @44100
+    silent = torch.zeros(1, 2205)
+    _, db_same = seam_metrics(a, a, silent, silent)
+    assert abs(db_same) < 0.01                           # 同波形 -> ≈0 dB
+    _, db_big = seam_metrics(a, a, loud, silent)
+    assert db_big > 20.0                                 # 前响后静 -> 大正跳变
+    _, db_short = seam_metrics(a, a, silent[..., :10], silent[..., :10])
+    assert db_short is None                              # 过短 wav -> None
 
 
 if __name__ == "__main__":

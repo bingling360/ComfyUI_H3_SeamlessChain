@@ -1,7 +1,11 @@
-"""断点续跑：参数指纹 + manifest 原子读写 + 段 AV latent 落盘。
+"""断点续跑：共享参数指纹 + 逐段提示词哈希 + manifest 原子读写 + 段 AV latent 落盘。
 
 断点只存采样输出的 latent（约 5 MB/段），不存解码像素（约 300 MB/段）：
-续跑时重解码秒级回放，结果与一次跑完逐帧一致（每段种子 = 种子+i，无隐藏状态）。
+续跑时重解码秒级回放，结果与一次跑完逐帧一致（种子序列由 manifest 权威记录）。
+
+v2：指纹只覆盖共享参数（不含提示词、不含种子），改某段提示词仍指向同一条链；
+提示词按段存哈希，改了第 N 段 -> reroll_start 找到首个不一致段，从该段起重做
+（段 N 的锚定依赖段 N-1 尾帧，其后段必然级联重做）。
 
 torch / folder_paths 延迟导入：指纹与 manifest 逻辑在无 ComfyUI 环境下可单测。
 """
@@ -9,19 +13,57 @@ torch / folder_paths 延迟导入：指纹与 manifest 逻辑在无 ComfyUI 环�
 import hashlib
 import json
 import os
+import re
 import tempfile
 
-SCHEMA = "h3seamless/ckpt-v1"
+SCHEMA = "h3seamless/ckpt-v2"
 
 
 def fingerprint(params: dict) -> str:
-    """严格参数 -> 8 位十六进制指纹（sha256，跨进程稳定）。
+    """共享参数 -> 8 位十六进制指纹（sha256，跨进程稳定）。
 
-    params 不含种子：种子控件开着 control_after_generate，每次运行自动 +1，
-    若入指纹则崩溃后续跑永远找不到原目录；种子由 manifest 权威记录。
+    params 由调用方保证不含提示词与种子：种子控件开着 control_after_generate
+    每次运行自动 +1，提示词改动走逐段哈希校验而非换链。
     """
     blob = json.dumps(params, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:8]
+
+
+def prompt_hash(prompt: str) -> str:
+    """单段提示词 -> 8 位十六进制哈希（与共享参数指纹同法）。"""
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8]
+
+
+def reroll_start(old_hashes: list, new_hashes: list, done: int) -> int:
+    """已完成段的提示词哈希 vs 当前提示词哈希 -> 应重做的首段下标。
+
+    返回值 >= done 表示无需重做（调用方仅在返回值 < done 时截断，返回 0 = 整链重做）；
+    首个不一致处即起点；提示词变少（done > len(new_hashes)）则截到新数量；
+    仅末尾追加新段不影响已完成前缀。
+    """
+    for i, (old, new) in enumerate(zip(old_hashes[:done], new_hashes)):
+        if old != new:
+            return i
+    return min(done, len(new_hashes))
+
+
+def truncate(root: str, manifest: dict, start: int) -> dict:
+    """丢弃第 start 段起的进度：截断 manifest 各列表并立即原子落盘，删除被弃段文件。
+
+    截断即时落盘：截断后立刻崩溃也不会复活旧进度。返回更新后的 manifest。
+    """
+    out = dict(manifest)
+    out["done"] = start
+    for key in ("seeds", "trims", "prompt_hashes"):
+        if key in out:
+            out[key] = list(out[key])[:start]
+    save_manifest(root, out)
+    pat = re.compile(r"seg_(\d{3,})\.pt$")
+    for name in os.listdir(root):
+        m = pat.match(name)
+        if m and int(m.group(1)) >= start:
+            os.remove(os.path.join(root, name))
+    return out
 
 
 def ckpt_dir(params: dict, custom: str = "") -> str:

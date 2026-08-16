@@ -150,6 +150,7 @@ def test_structure():
     for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽度", "高度",
                 "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
                 "断点续拍", "断点目录", "桥帧门控", "清晰度阈值", "回退上限",
+                "审片模式", "重跑起始段",
                 "首帧图片", "提示词组", "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
         assert key in ids, f"missing input: {key}"
     by_id = {inp.id: inp for inp in schema.inputs}
@@ -157,6 +158,10 @@ def test_structure():
     assert by_id["种子"].kwargs.get("control_after_generate") is True
     assert by_id["断点续拍"].kwargs.get("options") == ["关闭", "自动续跑"]
     assert by_id["桥帧门控"].kwargs.get("options") == ["关闭", "标注", "自动回退"]
+    assert by_id["审片模式"].kwargs.get("options") == ["关闭", "逐段确认"]
+    assert by_id["审片模式"].kwargs.get("default") == "关闭"
+    assert by_id["重跑起始段"].kwargs.get("default") == 0
+    assert by_id["重跑起始段"].kwargs.get("min") == 0
     outs = [(o.id, o.is_output_list) for o in schema.outputs]
     assert outs == [("图像", False), ("音频", False), ("帧率", False), ("报告", False),
                     ("分段图像", True), ("分段音频", True)]
@@ -167,6 +172,17 @@ def test_capability_probe():
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
     assert plugin_nodes.KEYFRAME_AUDIO_SUPPORTED is False  # stub 未提供 _ref_t_span
     print("PASS test_capability_probe")
+
+
+def test_is_changed():
+    import math
+    from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
+    cls = plugin_nodes.H3SeamlessChainSampler
+    assert math.isnan(cls.IS_CHANGED(审片模式="逐段确认"))         # 审片激活 -> 强制执行
+    assert math.isnan(cls.IS_CHANGED(断点续拍="自动续跑"))         # 断点激活 -> 强制执行
+    assert cls.IS_CHANGED(审片模式="关闭", 断点续拍="关闭") == ""  # 默认 -> 可缓存
+    assert cls.IS_CHANGED() == ""                                  # 无参调用兜底
+    print("PASS test_is_changed")
 
 
 def test_tail_keyframe_slices():
@@ -222,6 +238,7 @@ if __name__ == "__main__":
     _install_stubs(with_audio_support=False)
     test_structure()
     test_capability_probe()
+    test_is_changed()
     test_tail_keyframe_slices()
     test_run_validation()
     print("all tests passed")

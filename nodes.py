@@ -5,6 +5,10 @@
 （官方 conditioning 协议 minimax_keyframes，锚 resolved_frame_index=0），
 采样每步重注入，顺着上一段尾部的运动继续画；解码后裁掉头部重叠桥再拼接。
 
+支持逐段审片（每次运行只生成一段新内容即返回，重新运行继续）与任意段重跑
+（改某段提示词自动从该段重做；「重跑起始段」+ 换种子可从指定段重摇），
+进度存于 latent 断点（v2 schema：逐段种子 / 提示词哈希 / 裁剪量）。
+
 输入形态与官方 MiniMaxH3ReferenceToVideo 对齐（autogrow）：
 - 提示词_1..N：每段一个输入框（或接 PrimitiveStringMultiline）
 - 参考图片_0..9（<Picture i>）/ 参考视频_0..3（<Video k>）
@@ -15,6 +19,8 @@ MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo 节点类，采样走官方
 common_ksampler。keyframe 携带 audio_latent 需要 ComfyUI 含 PR #15439
 （2026-08-09 之后构建），旧版本自动降级为仅视频引导并在报告中说明。
 """
+
+import time
 
 import torch
 import nodes
@@ -121,6 +127,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                tooltip="桥帧总分阈值，低于判定为坏尾。建议先跑「标注」档看报告里的分数分布再定"),
                 io.Int.Input("回退上限", default=34, min=0, max=68, step=17,
                              tooltip="自动回退最多向前多少帧（17 的倍数，踩 17k+5 网格）"),
+                io.Combo.Input("审片模式", options=["关闭", "逐段确认"], default="关闭",
+                               tooltip="逐段确认：每次运行只生成一个新的段落即返回，预览「分段图像」后重新运行继续下一段；"
+                                       "不满意可改该段提示词（自动从该段重跑）或设「重跑起始段」重摇。开启后断点自动启用"),
+                io.Int.Input("重跑起始段", default=0, min=0, max=63,
+                             tooltip="0=自动（沿用断点进度，改过提示词的段自动重做）；N=从第 N 段起丢弃存档重新生成，"
+                                     "配合改「种子」即可重摇该段及之后。用完记得改回 0"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Autogrow.Input("提示词组", optional=True,
@@ -165,7 +177,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
     def execute(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽度, 高度, 每段帧数, 引导帧数,
                 种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 提示词组=None,
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
-                断点续拍="关闭", 断点目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34):
+                断点续拍="关闭", 断点目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
+                审片模式="关闭", 重跑起始段=0):
         prompts = _autogrow_items(提示词组, "p")
         seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
         if not seg_prompts:
@@ -184,8 +197,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         length, width, height, seed = int(每段帧数), int(宽度), int(高度), int(种子)
         ctx = int(引导帧数)
         gate_limit = max(0, int(回退上限) // 17 * 17)
-        if 桥帧门控 != "关闭":
-            from . import qc  # torch 计算图较重，仅在启用门控时加载
+        from . import qc  # 桥帧打分 + 接缝测量共用（延迟导入：无 ComfyUI 环境下结构单测不触达）
         clip, video_vae, audio_vae = 文本编码器, 视频VAE, 音频VAE
         if has_refs:
             chain = "r2v（ref2va UNET）"
@@ -204,31 +216,48 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append("注意：当前 ComfyUI 不含 PR #15439（Add Guide 协议），段间引导降级为仅视频锚定，音频不锚定"
                           + ("；r2v 链上引导会与参考素材冲突失效，强烈建议升级 ComfyUI" if has_refs else ""))
 
-        # 断点指纹不含种子：种子控件开着 control_after_generate 每次运行自动 +1，
-        # 真正的种子以 manifest 权威记录为准（见下方续跑载入逻辑）
+        # 断点指纹只覆盖共享参数（不含提示词、不含种子）：改某段提示词仍指向同一条链，
+        # 重跑起点由逐段提示词哈希比对定位；种子控件开着 control_after_generate 每次运行
+        # 自动 +1，真正的种子序列由 manifest 权威记录（见下方续跑载入逻辑）
         resume = 断点续拍 == "自动续跑"
+        review = 审片模式 == "逐段确认"
+        reroll = max(0, int(重跑起始段))
+        use_ckpt = resume or review          # 审片必须落盘才能跨次运行续接
+        if review and not resume:
+            report.append("审片模式：断点自动启用（每段落盘 latent，跨次运行续接）")
+        elif reroll > 0:
+            report.append("注意：「重跑起始段」仅在断点续拍/审片模式下生效，本次已忽略")
         ckpt_params = {
-            "prompts": seg_prompts, "width": width, "height": height,
+            "width": width, "height": height,
             "length": length, "ctx": ctx, "steps": int(步数), "cfg": float(CFG),
             "sampler": 采样器, "scheduler": 调度器, "chain": chain,
             "keyframe_audio": KEYFRAME_AUDIO_SUPPORTED,
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
-        root, manifest, done = None, None, 0
-        if resume:
+        seg_hashes = [checkpoint.prompt_hash(p) for p in seg_prompts]
+        root, manifest, done, seeds = None, None, 0, []
+        if use_ckpt:
             root = checkpoint.ckpt_dir(ckpt_params, 断点目录.strip())
             manifest = checkpoint.load_manifest(root)
             if manifest is not None:
                 if manifest.get("schema") != checkpoint.SCHEMA:
-                    raise ValueError(f"断点目录格式不认识（{manifest.get('schema')}），请换一个目录名")
+                    raise ValueError(f"断点目录格式不认识（{manifest.get('schema')}），请换一个目录名；"
+                                     "旧版 v1 断点不兼容本版本，请清空旧目录或换新名字")
                 checkpoint.assert_match(manifest["params"], ckpt_params)
                 done = checkpoint.contiguous_done(root, int(manifest.get("done", 0)))
-                saved_seed = int(manifest["params"].get("seed", seed))
-                if saved_seed != seed:
-                    report.append(f"断点续拍：控件种子 {seed} 被忽略，沿用断点种子 {saved_seed}"
-                                  "（control_after_generate 自增所致，属正常）")
-                    seed = saved_seed
+                hashes = list(manifest.get("prompt_hashes", []))
+                start = min(reroll, done) if reroll > 0 else min(
+                    checkpoint.reroll_start(hashes, seg_hashes, done), done)
+                if start < done:
+                    manifest = checkpoint.truncate(root, manifest, start)
+                    done = start
+                    原因 = "手动指定「重跑起始段」" if reroll > 0 else "检测到该段提示词已修改"
+                    report.append(f"断点续跑：{原因}，从段 {start + 1} 起重新生成"
+                                  + (f"（段 1-{start} 沿用断点）" if start else "（整链重做）"))
+                seeds = [int(s) for s in manifest.get("seeds", [])]
                 report.append(f"断点续跑：载入已完成 {done}/{len(seg_prompts)} 段，目录 {root}")
+                if reroll == 0 and seeds:
+                    report.append("控件种子仅在「重跑起始段」> 0 时生效，当前沿用断点种子序列")
 
         pbar = comfy.utils.ProgressBar(len(seg_prompts))
         all_frames = []
@@ -237,14 +266,26 @@ class H3SeamlessChainSampler(io.ComfyNode):
         seg_wavs = []
         trims = []
         guide = None
+        prev_tail_frame = None
+        prev_tail_wav = None
 
         for i, prompt in enumerate(seg_prompts):
-            replay = resume and i < done
+            replay = use_ckpt and i < done
             if replay:
                 video_t, audio_t = checkpoint.load_segment(root, i)
                 video_t = video_t.to(video_vae.device)
                 audio_t = audio_t.to(audio_vae.device)
+                dt = 0.0
+                cur_seed = seeds[i] if i < len(seeds) else None
             else:
+                # 种子规则：重摇（重跑起始段>0）用控件种子；否则延续断点种子序列的等差，
+                # 使审片多轮运行与一次跑完逐帧一致；断点无种子（首段）才用控件种子
+                if reroll > 0:
+                    cur_seed = (seed + i) % 0xffffffffffffffff
+                elif seeds:
+                    cur_seed = (seeds[-1] + i - len(seeds) + 1) % 0xffffffffffffffff
+                else:
+                    cur_seed = (seed + i) % 0xffffffffffffffff
                 seg_len = length + (ctx if i > 0 else 0)
                 if has_refs:
                     out = MiniMaxH3ReferenceToVideo.execute(
@@ -262,11 +303,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     cond = cls._apply_guide(
                         cond, guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]))
 
+                t0 = time.perf_counter()
                 sampled = nodes.common_ksampler(
-                    模型, (seed + i) % 0xffffffffffffffff, 步数, CFG,
+                    模型, cur_seed, 步数, CFG,
                     采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
+                dt = time.perf_counter() - t0
                 video_t, audio_t = sampled["samples"].unbind()
-                if resume:
+                # 维持不变量 seeds[i] = 第 i 段种子（段文件缺失导致 done 回退时，
+                # 重做段的种子可能与 manifest 残留记录相同，按下标赋值避免列表重复错位）
+                if i < len(seeds):
+                    seeds[i] = cur_seed
+                else:
+                    seeds.append(cur_seed)
+                if use_ckpt:
                     checkpoint.save_segment(root, i, video_t, audio_t)
 
             sampled_fc = latent_t_to_frames(video_t.shape[2])
@@ -298,18 +347,31 @@ class H3SeamlessChainSampler(io.ComfyNode):
             take_s = round(total * vis_len / sampled_fc)
             wav = wav[..., skip_s:skip_s + take_s]
 
+            # 接缝后验测量（测而不干预）：上一段最后可见帧 vs 本段首帧
+            seam_n = int(sample_rate * 0.25)
+            if i > 0 and prev_tail_frame is not None:
+                d, db = qc.seam_metrics(prev_tail_frame, frames[0],
+                                        prev_tail_wav, wav[..., :seam_n], rate=sample_rate)
+                db_txt = f"{db:+.1f} dB" if db is not None else "—"
+                flag = " ↑ 建议人工检查" if d > 0.08 or (db is not None and abs(db) > 6.0) else ""
+                report.append(f"段{i + 1} 接缝：帧差 {d:.3f} · 响度跳变 {db_txt}{flag}")
+
             all_frames.append(frames.cpu())
             seg_frames.append(frames.cpu())
             seg_wav = wav.cpu()
             seg_wavs.append({"waveform": seg_wav, "sample_rate": sample_rate})
             all_wav = seg_wav if all_wav is None else torch.cat([all_wav, seg_wav], dim=-1)
+            prev_tail_frame = frames[-1].cpu()
+            prev_tail_wav = seg_wav[..., -seam_n:]
 
             if guide is not None:
                 note = f"guide=上段尾{ctx}帧" + ("+音频" if "audio_latent" in guide else "")
             else:
                 note = "guide=无（首段）"
             origin = "断点载入" if replay else f"采样{sampled_fc}帧"
-            report.append(f"段{i + 1}/{len(seg_prompts)}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧 | {note}")
+            seed_txt = cur_seed if cur_seed is not None else "—"
+            report.append(f"段{i + 1}/{len(seg_prompts)}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧"
+                          f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {dt:.0f}s") + f" | {note}")
 
             if i + 1 < len(seg_prompts):
                 back = length - vis_len
@@ -317,15 +379,28 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        back_tokens=back // 17 * 5,
                                        back_audio=round(back * 5.0 / 3.0))
 
-            if resume and not replay:
+            if use_ckpt and not replay:
                 checkpoint.save_manifest(root, {
                     "schema": checkpoint.SCHEMA, "done": i + 1,
-                    "params": {**ckpt_params, "seed": seed}, "trims": list(trims),
+                    "seeds": list(seeds[:i + 1]), "trims": list(trims[:i + 1]),
+                    "prompt_hashes": seg_hashes[:i + 1],
+                    "params": ckpt_params,
                 })
 
             pbar.update(1)
 
-        if resume:
+            if review and not replay and i + 1 < len(seg_prompts):
+                report.append(f"审片：段 {i + 1} 已完成并落盘 → 预览「分段图像」；满意请直接重新运行继续段 {i + 2}；"
+                              f"不满意：改「提示词_{i + 1}」后运行（自动从本段重跑），"
+                              f"或设「重跑起始段」={i + 1} 并改「种子」重摇")
+                break
+
+        if use_ckpt:
+            if review:
+                if len(seg_frames) == len(seg_prompts):
+                    report.append("审片：本链已全部完成")
+                if reroll > 0:
+                    report.append(f"注意：「重跑起始段」={reroll} 已生效，确认无误后请改回 0")
             report.append(f"断点目录（含中间 latent，跑完可删）：{root}")
 
         images = torch.cat(all_frames, dim=0)
@@ -337,6 +412,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seg_frames,
             seg_wavs,
         )
+
+    @classmethod
+    def IS_CHANGED(cls, 审片模式="关闭", 断点续拍="关闭", **kwargs):
+        if 审片模式 == "逐段确认" or 断点续拍 == "自动续跑":
+            return float("nan")   # 断点/审片激活时输入不变也强制真正执行（重读最新 manifest）
+        return ""
 
     @staticmethod
     def _apply_guide(cond, guide, sampled_fc):

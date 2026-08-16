@@ -10,12 +10,49 @@ import checkpoint
 
 
 def test_fingerprint_stable():
-    p = {"prompts": ["a", "b"], "width": 864, "height": 480,
-         "length": 124, "ctx": 22, "steps": 25}
+    p = {"width": 864, "height": 480, "length": 124, "ctx": 22, "steps": 25}
     assert checkpoint.fingerprint(p) == checkpoint.fingerprint(dict(reversed(list(p.items()))))
     assert len(checkpoint.fingerprint(p)) == 8
-    p2 = dict(p, prompts=["a", "c"])                     # 提示词变了 -> 指纹必须变
-    assert checkpoint.fingerprint(p) != checkpoint.fingerprint(p2)
+    assert checkpoint.fingerprint(p) != checkpoint.fingerprint({**p, "width": 960})
+
+
+def test_prompt_hash():
+    assert checkpoint.prompt_hash("abc") == checkpoint.prompt_hash("abc")
+    assert checkpoint.prompt_hash("abc") != checkpoint.prompt_hash("abd")
+    assert checkpoint.prompt_hash("雪花") == checkpoint.prompt_hash("雪花")   # 中文跨进程稳定
+    assert len(checkpoint.prompt_hash("abc")) == 8
+
+
+def test_reroll_start():
+    hs = ["a", "b", "c", "d"]
+    # 返回 >= done 表示无需重做（调用方仅在返回值 < done 时截断；返回 0 = 整链重做）
+    assert checkpoint.reroll_start(hs, list(hs), 4) == 4              # 一致 -> 无需重做
+    assert checkpoint.reroll_start(hs, ["a", "b", "X", "d"], 4) == 2  # 改第 3 段 -> 从下标 2
+    assert checkpoint.reroll_start(["X"] + hs[1:], hs, 4) == 0        # 改第 1 段 -> 整链重做
+    assert checkpoint.reroll_start(hs, ["a", "b"], 4) == 2           # 提示词变少 -> 截到新数量
+    assert checkpoint.reroll_start(hs, hs + ["e"], 4) == 4           # 末尾追加 -> 前缀不动
+    assert checkpoint.reroll_start([], ["a"], 0) == 0
+
+
+def test_truncate():
+    root = tempfile.mkdtemp()
+    try:
+        for idx in range(4):
+            open(checkpoint.seg_path(root, idx), "wb").close()
+        m = {"schema": checkpoint.SCHEMA, "done": 4,
+             "seeds": [1, 2, 3, 4], "trims": [0, 0, 17, 0],
+             "prompt_hashes": ["a", "b", "c", "d"], "params": {"width": 864}}
+        out = checkpoint.truncate(root, m, 2)
+        assert out["done"] == 2
+        assert out["seeds"] == [1, 2] and out["trims"] == [0, 0] and out["prompt_hashes"] == ["a", "b"]
+        assert out["params"] == {"width": 864}                       # 原参数不动
+        assert checkpoint.load_manifest(root) == out                 # 截断即时落盘
+        for idx in range(2):
+            assert os.path.exists(checkpoint.seg_path(root, idx))    # 保留段
+        for idx in (2, 3):
+            assert not os.path.exists(checkpoint.seg_path(root, idx))  # 被弃段已删
+    finally:
+        shutil.rmtree(root)
 
 
 def test_manifest_roundtrip():
@@ -23,7 +60,9 @@ def test_manifest_roundtrip():
     try:
         assert checkpoint.load_manifest(root) is None    # 空目录
         m = {"schema": checkpoint.SCHEMA, "done": 3,
-             "params": {"prompts": ["甲", "乙"], "seed": 7}, "trims": [0, 17, 0]}
+             "seeds": [101, 102, 103], "trims": [0, 17, 0],
+             "prompt_hashes": ["a1b2c3d4", "e5f6a7b8", "c9d0e1f2"],
+             "params": {"width": 864, "seed": 7}}
         checkpoint.save_manifest(root, m)
         assert checkpoint.load_manifest(root) == m
         assert not [f for f in os.listdir(root) if f.startswith(".tmp_")]  # 无残留临时文件
