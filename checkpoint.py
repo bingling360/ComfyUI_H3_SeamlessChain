@@ -50,17 +50,20 @@ def reroll_start(old_hashes: list, new_hashes: list, done: int) -> int:
 def truncate(root: str, manifest: dict, start: int) -> dict:
     """丢弃第 start 段起的进度：截断 manifest 各列表并立即原子落盘，删除被弃段文件。
 
-    截断即时落盘：截断后立刻崩溃也不会复活旧进度。返回更新后的 manifest。
+    截断即时落盘：截断后立刻崩溃也不会复活旧进度。段文件含 latent(.pt)、
+    分段视频(.mp4) 与缩略图(.png)，三者同下标一起清，防止重跑后残留旧画面。
+    返回更新后的 manifest。
     """
     out = dict(manifest)
     out["done"] = start
-    for key in ("seeds", "trims", "prompt_hashes", "thumbs", "prompts", "seams", "bridge_scores"):
+    for key in ("seeds", "trims", "prompt_hashes", "thumbs", "videos", "prompts", "seams", "bridge_scores"):
         if key in out:
             out[key] = list(out[key])[:start]
     save_manifest(root, out)
-    pat = re.compile(r"seg_(\d{3,})\.pt$")
+    pat = re.compile(r"seg_(\d{3,})\.(?:pt|mp4)$")
+    thumb_pat = re.compile(r"thumb_(\d{3,})\.png$")
     for name in os.listdir(root):
-        m = pat.match(name)
+        m = pat.match(name) or thumb_pat.match(name)
         if m and int(m.group(1)) >= start:
             os.remove(os.path.join(root, name))
     return out
@@ -192,4 +195,63 @@ def save_thumb(seg_dir: str, idx: int, frame) -> str:
         img.save(os.path.join(seg_dir, name))
         return name
     except Exception:
+        return ""
+
+
+def save_segment_mp4(seg_dir: str, idx: int, frames, wav, sample_rate: int,
+                     fps: int = 24, fresh: bool = True) -> str:
+    """段可见帧 + 音轨 -> seg_NNN.mp4（H.264 + AAC，PyAV）。审片面板据此直接播放每段。
+
+    PyAV 是 ComfyUI 新视频栈（CreateVideo/SaveVideo）的既有依赖，此处仅复用；
+    缺失或编码失败返回空串并清理半成品（面板回退为缩略图，不影响主流程）。
+    fresh=False（断点回放）且文件已存在时直接沿用，避免每次续跑全链重编码。
+    """
+    name = f"seg_{idx:03d}.mp4"
+    path = os.path.join(seg_dir, name)
+    if not fresh and os.path.exists(path):
+        return name
+    try:
+        import av
+        import numpy
+
+        arr = (frames.detach().float().clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8")
+        h, w = arr.shape[1], arr.shape[2]
+        h, w = h - h % 2, w - w % 2  # yuv420p 要求偶数尺寸
+        arr = numpy.ascontiguousarray(arr[:, :h, :w, :3])
+        pcm = numpy.ascontiguousarray(wav.detach().float().cpu().clamp(-1.0, 1.0).numpy())
+        ch = int(pcm.shape[0])
+        layout = "stereo" if ch >= 2 else "mono"
+
+        container = av.open(path, mode="w")
+        try:
+            vstream = container.add_stream("libx264", rate=fps)
+            vstream.width, vstream.height = w, h
+            vstream.pix_fmt = "yuv420p"
+            vstream.options = {"crf": "20", "preset": "veryfast"}
+            astream = container.add_stream("aac", rate=int(sample_rate), layout=layout)
+
+            for i in range(arr.shape[0]):
+                for packet in vstream.encode(av.VideoFrame.from_ndarray(arr[i], format="rgb24")):
+                    container.mux(packet)
+            if ch > 2:
+                pcm = pcm[:2]
+            for start in range(0, pcm.shape[1], 1024):
+                aframe = av.AudioFrame.from_ndarray(
+                    pcm[:, start:start + 1024], format="fltp", layout=layout)
+                aframe.sample_rate = int(sample_rate)
+                for packet in astream.encode(aframe):
+                    container.mux(packet)
+            for packet in vstream.encode():
+                container.mux(packet)
+            for packet in astream.encode():
+                container.mux(packet)
+        finally:
+            container.close()
+        return name
+    except Exception:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
         return ""

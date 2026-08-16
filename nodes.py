@@ -351,13 +351,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     report.append("控件种子仅在「重跑起始段」> 0 时生效，当前沿用断点种子序列")
         full_hashes = ([prologue_hash] if off else []) + seg_hashes
         if review:
-            report.append("审片面板：左侧「长片审片」侧栏（旧版前端为悬浮按钮）可查看各段缩略图，"
-                          "一键继续下一段 / 重摇此段 / 改词重跑")
+            report.append("审片面板：左侧「长片审片」侧栏（旧版前端为悬浮按钮）可逐段播放分段视频、"
+                          "看缩略图与接缝/桥分，一键继续下一段 / 重摇此段 / 改词重跑")
 
         pbar = comfy.utils.ProgressBar(len(seg_prompts))
         total = len(seg_prompts) + off
         prompt_list = (["「序章（上传视频）」"] if off else []) + list(seg_prompts)
-        thumbs, seams, bridge_scores = [], [], []
+        thumbs, videos, seams, bridge_scores = [], [], [], []
         all_frames = []
         all_wav = None
         seg_frames = []
@@ -374,6 +374,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                    "updated_at": time.time()})
 
         if off:
+            prologue_fresh = False
             if use_ckpt and done >= 1:
                 pv, pa = checkpoint.load_segment(root, 0)
                 pv = pv.to(video_vae.device)
@@ -390,6 +391,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 else:
                     pa = torch.zeros(1, 32, 2, audio_tokens_for_frames(fc), device=video_vae.device)
                 prologue_origin = f"编码{fc}帧"
+                prologue_fresh = True
                 if use_ckpt:
                     checkpoint.save_segment(root, 0, pv, pa)
                     seeds = [0]
@@ -397,7 +399,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     checkpoint.save_manifest(root, {
                         "schema": checkpoint.SCHEMA, "done": 1, "has_prologue": True,
                         "seeds": [0], "trims": [0], "prompt_hashes": [prologue_hash],
-                        "total": total, "thumbs": [], "prompts": prompt_list,
+                        "total": total, "thumbs": [], "videos": [], "prompts": prompt_list,
                         "seams": [None], "bridge_scores": [None], "params": ckpt_params})
                 report.append(f"序章：上传视频编码为段 1/{total}（{fc} 帧"
                               + ("，超长仅取前段" if raw_fc > fc else "")
@@ -408,6 +410,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 pframes = pframes.reshape(-1, pframes.shape[-3], pframes.shape[-2], pframes.shape[-1])
             pwav, sample_rate = _decode_audio(audio_vae, pa)
             thumbs.append(checkpoint.save_thumb(root, 0, pframes[0]) if use_ckpt else "")
+            videos.append(checkpoint.save_segment_mp4(root, 0, pframes, pwav, sample_rate,
+                                                      fresh=prologue_fresh) if use_ckpt else "")
             seams.append(None)
             bridge_scores.append(None)
             all_frames.append(pframes.cpu())
@@ -525,8 +529,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             prev_tail_wav = seg_wav[..., -seam_n:]
             if use_ckpt:
                 thumbs.append(checkpoint.save_thumb(root, g, frames[0]))
+                videos.append(checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate,
+                                                          fresh=not replay))
             else:
                 thumbs.append("")
+                videos.append("")
 
             if guide is not None:
                 note = (f"guide=上段尾{ctx}帧" if full_bridge else "guide=单帧桥(旧协议降级)") \
@@ -551,7 +558,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     "schema": checkpoint.SCHEMA, "done": done, "has_prologue": bool(off),
                     "seeds": list(seeds[:done]), "trims": list(trims[:done]),
                     "prompt_hashes": full_hashes[:done],
-                    "total": total, "thumbs": list(thumbs[:done]),
+                    "total": total, "thumbs": list(thumbs[:done]), "videos": list(videos[:done]),
                     "prompts": prompt_list[:done],
                     "seams": seams[:done], "bridge_scores": bridge_scores[:done],
                     "params": ckpt_params,
@@ -566,6 +573,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 break
 
         if use_ckpt:
+            # 兜底回写：纯回放运行（无新段）也会重解码全部段，把缩略图/分段视频/指标
+            # 等增量键补齐——旧版本断点的 manifest 缺这些键时由此自愈，面板无需重跑整链
+            checkpoint.save_manifest(root, {
+                "schema": checkpoint.SCHEMA, "done": done, "has_prologue": bool(off),
+                "seeds": list(seeds[:done]), "trims": list(trims[:done]),
+                "prompt_hashes": full_hashes[:done],
+                "total": total, "thumbs": list(thumbs[:done]), "videos": list(videos[:done]),
+                "prompts": prompt_list[:done],
+                "seams": seams[:done], "bridge_scores": bridge_scores[:done],
+                "params": ckpt_params,
+            })
             if review:
                 if len(seg_frames) == total:
                     report.append("审片：本链已全部完成")

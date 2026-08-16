@@ -40,10 +40,13 @@ def test_truncate():
     try:
         for idx in range(4):
             open(checkpoint.seg_path(root, idx), "wb").close()
+        for idx in (2, 3):
+            open(os.path.join(root, f"seg_{idx:03d}.mp4"), "wb").close()   # 分段视频
+            open(os.path.join(root, f"thumb_{idx:03d}.png"), "wb").close()  # 缩略图
         m = {"schema": checkpoint.SCHEMA, "done": 4,
              "seeds": [1, 2, 3, 4], "trims": [0, 0, 17, 0],
              "prompt_hashes": ["a", "b", "c", "d"], "params": {"width": 864},
-             "total": 8, "thumbs": ["t0", "t1", "t2", "t3"],
+             "total": 8, "thumbs": ["t0", "t1", "t2", "t3"], "videos": ["v0", "v1", "v2", "v3"],
              "prompts": ["p0", "p1", "p2", "p3"],
              "seams": [None, [0.01, -0.5], [0.09, 7.0], None],
              "bridge_scores": [None, 31.5, 20.1, 44.0]}
@@ -52,13 +55,16 @@ def test_truncate():
         assert out["seeds"] == [1, 2] and out["trims"] == [0, 0] and out["prompt_hashes"] == ["a", "b"]
         assert out["params"] == {"width": 864}                       # 原参数不动
         assert out["total"] == 8                                      # 段总数是链属性，不截断
-        assert out["thumbs"] == ["t0", "t1"] and out["prompts"] == ["p0", "p1"]
+        assert out["thumbs"] == ["t0", "t1"] and out["videos"] == ["v0", "v1"]
+        assert out["prompts"] == ["p0", "p1"]
         assert out["seams"] == [None, [0.01, -0.5]] and out["bridge_scores"] == [None, 31.5]
         assert checkpoint.load_manifest(root) == out                 # 截断即时落盘
         for idx in range(2):
             assert os.path.exists(checkpoint.seg_path(root, idx))    # 保留段
         for idx in (2, 3):
-            assert not os.path.exists(checkpoint.seg_path(root, idx))  # 被弃段已删
+            assert not os.path.exists(checkpoint.seg_path(root, idx))          # 被弃 latent
+            assert not os.path.exists(os.path.join(root, f"seg_{idx:03d}.mp4"))  # 被弃分段视频
+            assert not os.path.exists(os.path.join(root, f"thumb_{idx:03d}.png"))  # 被弃缩略图
     finally:
         shutil.rmtree(root)
 
@@ -126,6 +132,20 @@ def test_save_thumb_graceful():
     try:
         assert checkpoint.save_thumb(out_dir, 0, object()) == ""
         assert not os.path.exists(os.path.join(out_dir, "thumb_000.png"))
+    finally:
+        shutil.rmtree(out_dir)
+
+
+def test_save_segment_mp4_graceful():
+    # 无 PyAV / 非 torch 输入 -> 空串且不落半成品文件（面板回退缩略图）
+    out_dir = tempfile.mkdtemp()
+    try:
+        assert checkpoint.save_segment_mp4(out_dir, 0, object(), object(), 44100) == ""
+        assert not os.path.exists(os.path.join(out_dir, "seg_000.mp4"))
+        # 回放快路径：fresh=False 且文件已存在 -> 直接返回文件名（不重编码）
+        open(os.path.join(out_dir, "seg_000.mp4"), "wb").close()
+        assert checkpoint.save_segment_mp4(out_dir, 0, object(), object(), 44100,
+                                           fresh=False) == "seg_000.mp4"
     finally:
         shutil.rmtree(out_dir)
 

@@ -126,6 +126,7 @@ function renderCards(state, mf) {
     const done = state.done ?? (mf?.done ?? 0);
     const hasPrologue = !!(mf?.has_prologue);
     const thumbs = mf?.thumbs || [];
+    const vids = mf?.videos || [];
     const seeds = mf?.seeds || [];
     const seams = mf?.seams || [];
     const bridges = mf?.bridge_scores || [];
@@ -136,9 +137,16 @@ function renderCards(state, mf) {
         const isPrologue = hasPrologue && idx === 0;
         const card = el("div", "h3c-card" + (isDone ? "" : " h3c-todo"));
         const thumbFile = thumbs[idx];
-        const thumb = isDone && thumbFile
-            ? `<img loading="lazy" src="${viewUrl(state.dir, thumbFile)}">`
-            : `<div class="h3c-thumb-empty">${isDone ? "…" : "待生成"}</div>`;
+        const videoFile = isDone ? vids[idx] : null;
+        const thumbSrc = isDone && thumbFile ? viewUrl(state.dir, thumbFile) : "";
+        let media;
+        if (videoFile) {
+            media = `<video class="h3c-video" controls preload="metadata"${thumbSrc ? ` poster="${thumbSrc}"` : ""} src="${viewUrl(state.dir, videoFile)}"></video>`;
+        } else if (thumbSrc) {
+            media = `<img loading="lazy" src="${thumbSrc}">`;
+        } else {
+            media = `<div class="h3c-thumb-empty">${isDone ? "…" : "待生成"}</div>`;
+        }
         const stateBadge = !isDone ? badge("待生成", "h3c-b-todo")
             : isPrologue ? badge("序章（上传）", "h3c-b-pro") : badge("已完成", "h3c-b-ok");
         const seedTxt = isDone && seeds[idx] != null ? `种子 ${seeds[idx]}` : "";
@@ -147,13 +155,15 @@ function renderCards(state, mf) {
         const meta = [seedTxt, seamTxt, bridgeTxt].filter(Boolean).join(" · ");
         const promptTxt = escapeHtml((prompts[idx] || "").slice(0, 60)) + ((prompts[idx] || "").length > 60 ? "…" : "");
         card.innerHTML = `
-            <div class="h3c-thumb">${thumb}</div>
+            <div class="h3c-thumb">${media}</div>
             <div class="h3c-body">
                 <div class="h3c-title">段 ${idx + 1} ${stateBadge}</div>
                 ${meta ? `<div class="h3c-meta">${escapeHtml(meta)}</div>` : ""}
                 ${promptTxt ? `<div class="h3c-prompt" title="双击卡片可编辑提示词">${promptTxt}</div>` : ""}
                 <div class="h3c-actions" data-idx="${idx}"></div>
             </div>`;
+        const img = card.querySelector(".h3c-thumb img");
+        if (img) img.onerror = () => img.replaceWith(el("div", "h3c-thumb-empty", "⚠ 加载失败"));
         const actions = card.querySelector(".h3c-actions");
         if (isDone && !isPrologue) {
             const genIdx = idx - (hasPrologue ? 1 : 0) + 1; // 提示词_N（1-based 生成段）
@@ -271,8 +281,9 @@ const CSS = `
 .h3c-cards { display:flex; flex-direction:column; gap:8px; }
 .h3c-card { display:flex; gap:8px; padding:8px; border-radius:8px; background:var(--comfy-menu-bg, rgba(32,32,32,.6)); border:1px solid rgba(128,128,128,.25); }
 .h3c-todo { opacity:.45; }
-.h3c-thumb { width:104px; min-width:104px; aspect-ratio:16/9; border-radius:6px; overflow:hidden; background:rgba(0,0,0,.35); display:flex; align-items:center; justify-content:center; }
+.h3c-thumb { width:124px; min-width:124px; aspect-ratio:16/9; border-radius:6px; overflow:hidden; background:rgba(0,0,0,.35); display:flex; align-items:center; justify-content:center; }
 .h3c-thumb img { width:100%; height:100%; object-fit:cover; }
+.h3c-video { width:100%; height:100%; object-fit:contain; background:#000; }
 .h3c-thumb-empty { font-size:11px; opacity:.6; }
 .h3c-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:4px; }
 .h3c-title { display:flex; gap:6px; align-items:center; font-weight:600; }
@@ -333,9 +344,11 @@ app.registerExtension({
         if (app.extensionManager && typeof app.extensionManager.registerSidebarTab === "function") {
             app.extensionManager.registerSidebarTab({
                 id: "h3chain-review",
-                icon: ICON,
+                // 图标必须是已加载图标库的类名（前端内置 PrimeVue）：官方文档
+                // docs.comfy.org → 侧边栏标签页；传 SVG 源码不会渲染
+                icon: "pi pi-video",
                 title: "长片审片",
-                tooltip: "H3 Seamless Chain：各段缩略图与一键继续 / 重摇 / 改词重跑",
+                tooltip: "H3 Seamless Chain：逐段播放分段视频，一键继续 / 重摇 / 改词重跑",
                 type: "custom",
                 render: (elTarget) => mount(elTarget),
             });
