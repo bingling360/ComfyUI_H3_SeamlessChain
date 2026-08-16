@@ -3,6 +3,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -41,11 +42,18 @@ def test_truncate():
             open(checkpoint.seg_path(root, idx), "wb").close()
         m = {"schema": checkpoint.SCHEMA, "done": 4,
              "seeds": [1, 2, 3, 4], "trims": [0, 0, 17, 0],
-             "prompt_hashes": ["a", "b", "c", "d"], "params": {"width": 864}}
+             "prompt_hashes": ["a", "b", "c", "d"], "params": {"width": 864},
+             "total": 8, "thumbs": ["t0", "t1", "t2", "t3"],
+             "prompts": ["p0", "p1", "p2", "p3"],
+             "seams": [None, [0.01, -0.5], [0.09, 7.0], None],
+             "bridge_scores": [None, 31.5, 20.1, 44.0]}
         out = checkpoint.truncate(root, m, 2)
         assert out["done"] == 2
         assert out["seeds"] == [1, 2] and out["trims"] == [0, 0] and out["prompt_hashes"] == ["a", "b"]
         assert out["params"] == {"width": 864}                       # 原参数不动
+        assert out["total"] == 8                                      # 段总数是链属性，不截断
+        assert out["thumbs"] == ["t0", "t1"] and out["prompts"] == ["p0", "p1"]
+        assert out["seams"] == [None, [0.01, -0.5]] and out["bridge_scores"] == [None, 31.5]
         assert checkpoint.load_manifest(root) == out                 # 截断即时落盘
         for idx in range(2):
             assert os.path.exists(checkpoint.seg_path(root, idx))    # 保留段
@@ -92,6 +100,34 @@ def test_contiguous_done():
         assert checkpoint.contiguous_done(root, 0) == 0
     finally:
         shutil.rmtree(root)
+
+
+def test_state_roundtrip():
+    out_dir = tempfile.mkdtemp()
+    sys.modules["folder_paths"] = types.SimpleNamespace(get_output_directory=lambda: out_dir)
+    try:
+        assert checkpoint.load_state() is None                 # 尚无状态文件
+        state = {"dir": "h3chain_x", "total": 5, "done": 2, "review": True,
+                 "reroll": 0, "report": "段1…", "updated_at": 1.5}
+        checkpoint.save_state(state)
+        assert checkpoint.load_state() == state                 # 原子写后可原样读回
+        # 坏 JSON（写入中途损坏）-> None，面板据此显示空态而不是抛错
+        with open(os.path.join(checkpoint.checkpoints_root(), "h3chain_state.json"), "w") as f:
+            f.write("{broken")
+        assert checkpoint.load_state() is None
+    finally:
+        del sys.modules["folder_paths"]
+        shutil.rmtree(out_dir)
+
+
+def test_save_thumb_graceful():
+    # 无 PIL / 非 torch 帧对象 -> 返回空串（面板降级为占位），绝不抛错
+    out_dir = tempfile.mkdtemp()
+    try:
+        assert checkpoint.save_thumb(out_dir, 0, object()) == ""
+        assert not os.path.exists(os.path.join(out_dir, "thumb_000.png"))
+    finally:
+        shutil.rmtree(out_dir)
 
 
 if __name__ == "__main__":

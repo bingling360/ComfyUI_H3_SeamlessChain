@@ -18,6 +18,15 @@ def align_frame_count(n):
     return n
 
 
+def align_frame_count_down(n):
+    """像素帧数向下对齐到 17k+5 网格；不足 5 帧返回 0（调用方自行报错）。"""
+    if n < 5:
+        return 0
+    while n % 17 != 5:
+        n -= 1
+    return n
+
+
 def video_latent_t(frame_count):
     """像素帧数 -> 视频 latent token 数（官方 temporal_shape 同式）。"""
     return 2 if frame_count <= 5 else ((frame_count - 5) // 17) * 5 + 2

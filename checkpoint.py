@@ -54,7 +54,7 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
     """
     out = dict(manifest)
     out["done"] = start
-    for key in ("seeds", "trims", "prompt_hashes"):
+    for key in ("seeds", "trims", "prompt_hashes", "thumbs", "prompts", "seams", "bridge_scores"):
         if key in out:
             out[key] = list(out[key])[:start]
     save_manifest(root, out)
@@ -147,3 +147,49 @@ def load_segment(root: str, idx: int):
     with open(seg_path(root, idx), "rb") as f:
         payload = torch.load(f, map_location="cpu", weights_only=True)
     return payload["video"], payload["audio"]
+
+
+def checkpoints_root() -> str:
+    from folder_paths import get_output_directory
+
+    return os.path.join(get_output_directory(), "checkpoints")
+
+
+def save_state(state: dict):
+    """链状态指针写到 checkpoints/h3chain_state.json（审片面板据此定位当前链）。
+
+    固定路径 + /api/view 端点：面板无需自建 HTTP 路由，也不必复刻指纹算法。
+    """
+    root = checkpoints_root()
+    os.makedirs(root, exist_ok=True)
+    _atomic_write(os.path.join(root, "h3chain_state.json"),
+                  json.dumps(state, ensure_ascii=False, indent=1).encode("utf-8"))
+
+
+def load_state():
+    path = os.path.join(checkpoints_root(), "h3chain_state.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_thumb(seg_dir: str, idx: int, frame) -> str:
+    """段可见首帧 -> thumb_NNN.png（长边 256）。Pillow 缺失时返回空串（面板降级占位）。"""
+    name = f"thumb_{idx:03d}.png"
+    try:
+        from PIL import Image
+
+        arr = (frame.detach().float().clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8")
+        img = Image.fromarray(arr)
+        w, h = img.size
+        scale = 256.0 / max(w, h)
+        if scale < 1.0:
+            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+        img.save(os.path.join(seg_dir, name))
+        return name
+    except Exception:
+        return ""

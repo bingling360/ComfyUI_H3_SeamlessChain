@@ -1,5 +1,7 @@
 import traceback
 
+WEB_DIRECTORY = "./web"  # 审片面板（h3chain_panel.js）随插件分发，走 ComfyUI 自带 /extensions 加载
+
 try:
     from comfy_api.latest import ComfyExtension
 

@@ -4,8 +4,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from grid import (align_frame_count, video_latent_t, latent_t_to_frames,
-                  audio_tokens_for_frames, FRAME_PER_TOKEN, FRAME_RESCALE)
+from grid import (align_frame_count, align_frame_count_down, video_latent_t,
+                  latent_t_to_frames, audio_tokens_for_frames,
+                  FRAME_PER_TOKEN, FRAME_RESCALE)
 
 
 def test_grid_alignment():
@@ -16,6 +17,18 @@ def test_grid_alignment():
     assert align_frame_count(146) == 158
     for k in range(0, 21):
         assert align_frame_count(17 * k + 5) == 17 * k + 5
+
+
+def test_align_frame_count_down():
+    assert align_frame_count_down(5) == 5
+    assert align_frame_count_down(6) == 5          # 向下回到网格点
+    assert align_frame_count_down(124) == 124
+    assert align_frame_count_down(130) == 124
+    assert align_frame_count_down(158) == 158
+    assert align_frame_count_down(4) == 0          # 不足最小 5 帧 -> 调用方报错
+    assert align_frame_count_down(0) == 0
+    for k in range(0, 21):
+        assert align_frame_count_down(17 * k + 5) == 17 * k + 5
 
 
 def test_token_frame_roundtrip():

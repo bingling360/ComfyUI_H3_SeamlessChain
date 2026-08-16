@@ -151,7 +151,8 @@ def test_structure():
                 "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
                 "断点续拍", "断点目录", "桥帧门控", "清晰度阈值", "回退上限",
                 "审片模式", "重跑起始段",
-                "首帧图片", "提示词组", "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
+                "首帧图片", "起始视频", "起始视频音轨",
+                "提示词组", "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
         assert key in ids, f"missing input: {key}"
     by_id = {inp.id: inp for inp in schema.inputs}
     assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
@@ -270,6 +271,13 @@ def test_run_validation():
                     首帧图片=FakeTensor([1, 480, 864, 3]),
                     参考图片组={"参考图片_0": FakeTensor([1, 480, 864, 3])})
         raise AssertionError("should reject first_frame + refs")
+    except ValueError as e:
+        assert "不能同时" in str(e)
+    try:
+        cls.execute(**common, 提示词组={"提示词_1": "a", "提示词_2": "b"},
+                    首帧图片=FakeTensor([1, 480, 864, 3]),
+                    起始视频=FakeTensor([124, 480, 864, 3]))
+        raise AssertionError("should reject prologue + first_frame")
     except ValueError as e:
         assert "不能同时" in str(e)
     print("PASS test_run_validation")
