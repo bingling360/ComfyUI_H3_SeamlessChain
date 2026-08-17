@@ -17,6 +17,7 @@ import { api } from "/scripts/api.js";
 const NODE_TYPE = "H3SeamlessChainSampler";
 const W_REROLL = "重跑起始段";
 const W_SEED = "种子";
+const W_DIR = "断点目录";
 
 let container = null;
 let pendingReset = false;
@@ -192,6 +193,20 @@ function doReroll(segNo) {
     scheduleRefresh();
 }
 
+function newProject() {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    const t = new Date();
+    const pad = (x) => String(x).padStart(2, "0");
+    const def = `h3chain_${t.getFullYear()}${pad(t.getMonth() + 1)}${pad(t.getDate())}_${pad(t.getHours())}${pad(t.getMinutes())}${pad(t.getSeconds())}`;
+    const name = prompt("新项目断点目录名（新目录 = 空白链，上一条的尾帧引导不会带入）：", def);
+    if (!name || !name.trim()) return;
+    setWidgetValue(node, W_DIR, name.trim());
+    setWidgetValue(node, W_REROLL, 0);
+    pendingReset = false;
+    scheduleRefresh();
+}
+
 function openEditor(card, genIdx, text) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
@@ -223,9 +238,18 @@ function openEditor(card, genIdx, text) {
 function render(state, mf) {
     if (!container) return;
     container.innerHTML = "";
+
+    // 新建项目按钮：始终可用（跑前 / 跑后都能开下一条空白链）
+    const projBar = el("div", "h3c-projbar");
+    const newBtn = el("button", "h3c-btn h3c-btn-primary", "＋ 新建项目");
+    newBtn.title = "换一个新断点目录 = 空白链：上一条视频的尾帧引导不会带入，从第 1 段重新画起";
+    newBtn.onclick = newProject;
+    projBar.append(newBtn);
+    container.append(projBar);
+
     if (!state || !state.dir) {
         container.append(el("div", "h3c-empty",
-            "还没有链状态：请先运行一次 H3 Seamless Chain 工作流（开启「审片模式」或「断点续拍」），面板会自动出现各段缩略图。"));
+            "还没有链状态：点上方「＋ 新建项目」开一条空白链，或直接运行一次工作流（开启「审片模式」或「断点续拍」）。"));
         return;
     }
     const head = el("div", "h3c-head");
@@ -241,10 +265,16 @@ function render(state, mf) {
         <div class="h3c-status">${escapeHtml(statusLine(state, mf))}</div>`;
     container.append(head);
 
-    if ((state.done ?? 0) < (state.total ?? 0)) {
+    const done = state.done ?? (mf?.done ?? 0);
+    const total = state.total ?? (mf?.total ?? 0);
+    if (done < total) {
         const cont = el("button", "h3c-btn h3c-btn-primary h3c-continue", "▶ 继续下一段");
         cont.onclick = () => { queuePrompt(); scheduleRefresh(); };
         container.append(cont);
+    } else if (total > 0 && done >= total) {
+        // 本链跑完：提示开下一条（按钮已在顶部，这里只给文字引导）
+        container.append(el("div", "h3c-next-hint",
+            `本链已全部完成 ✓ 想开下一条视频？点顶部「＋ 新建项目」换新目录即可，提示词会沿用作底稿。`));
     }
     container.append(renderCards(state, mf));
 
@@ -268,6 +298,9 @@ async function refresh() {
 
 const CSS = `
 .h3c-panel { display:flex; flex-direction:column; gap:10px; padding:10px; font-size:12px; color:var(--input-text, #ddd); }
+.h3c-projbar { display:flex; gap:6px; }
+.h3c-projbar .h3c-btn { padding:6px 12px; font-size:12px; }
+.h3c-next-hint { padding:8px 10px; border-radius:6px; background:rgba(80,200,120,.12); border:1px solid rgba(80,200,120,.35); line-height:1.6; opacity:.9; }
 .h3c-empty { opacity:.8; line-height:1.7; padding:8px 4px; }
 .h3c-head .h3c-chain { font-weight:600; font-size:13px; word-break:break-all; }
 .h3c-head .h3c-sub { margin-top:3px; opacity:.85; display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
