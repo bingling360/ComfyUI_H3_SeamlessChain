@@ -18,9 +18,13 @@ def frame_scores(frames):
 
     总分 = log1p(Laplacian方差×1000) + 对比度×2 − 曝光裁剪占比×2.5
     （与 LtoJ 总控台选帧打分同形，便于阈值互相参考；灰度、最长边 ≤512 计算）
+
+    灰度换算到 0-255 域再计算：LtoJ 阈值 30 标定在 255 域（清晰帧约
+    90-130、糊帧 <30）；若在 0-1 域算，清晰帧只有 1-3，阈值 30 会把
+    所有帧全部误报为坏尾（0-1 域方差缩小 255² 倍，log1p 压不住差值）。
     """
     rgb = frames[..., :3].float().movedim(-1, 1)                 # [N,3,H,W]
-    gray = rgb[:, 0] * 0.299 + rgb[:, 1] * 0.587 + rgb[:, 2] * 0.114
+    gray = (rgb[:, 0] * 0.299 + rgb[:, 1] * 0.587 + rgb[:, 2] * 0.114) * 255.0
     h, w = gray.shape[-2:]
     scale = 512 / max(h, w)
     if scale < 1.0:
@@ -31,7 +35,7 @@ def frame_scores(frames):
     lap = F.conv2d(gray.unsqueeze(1), lap_k, padding=1).squeeze(1)
     sharp = lap.flatten(1).var(dim=1, unbiased=False)
     contrast = gray.flatten(1).std(dim=1, unbiased=False)
-    clipped = ((gray < 0.02) | (gray > 0.98)).float().flatten(1).mean(dim=1)
+    clipped = ((gray < 5.0) | (gray > 250.0)).float().flatten(1).mean(dim=1)
     return torch.log1p(sharp * 1000.0) + contrast * 2.0 - clipped * 2.5
 
 
