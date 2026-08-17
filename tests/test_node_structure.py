@@ -150,12 +150,14 @@ def test_structure():
     for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽度", "高度",
                 "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
                 "断点续拍", "断点目录", "桥帧门控", "清晰度阈值", "回退上限",
-                "审片模式", "重跑起始段",
+                "审片模式", "重跑起始段", "插入视频",
                 "首帧图片", "起始视频", "起始视频音轨",
                 "提示词组", "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
         assert key in ids, f"missing input: {key}"
     by_id = {inp.id: inp for inp in schema.inputs}
     assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
+    assert by_id["插入视频"].kwargs.get("multiline") is True
+    assert by_id["插入视频"].kwargs.get("default") == ""
     assert by_id["种子"].kwargs.get("control_after_generate") is True
     assert by_id["断点续拍"].kwargs.get("options") == ["关闭", "自动续跑"]
     assert by_id["桥帧门控"].kwargs.get("options") == ["关闭", "标注", "自动回退"]
@@ -280,6 +282,22 @@ def test_run_validation():
         raise AssertionError("should reject prologue + first_frame")
     except ValueError as e:
         assert "不能同时" in str(e)
+    try:
+        cls.execute(**common, 提示词组={"提示词_1": "a"}, 插入视频="bad-line")
+        raise AssertionError("should reject malformed insert spec")
+    except ValueError as e:
+        assert "格式" in str(e)
+    try:
+        cls.execute(**common, 提示词组={"提示词_1": "a"}, 插入视频="9|x.mp4")
+        raise AssertionError("should reject out-of-range insert position")
+    except ValueError as e:
+        assert "超出范围" in str(e)
+    try:
+        cls.execute(**common, 提示词组={"提示词_1": "a"},
+                    起始视频=FakeTensor([124, 480, 864, 3]), 插入视频="1|ad.mp4")
+        raise AssertionError("should reject prologue + insert at pos 1")
+    except ValueError as e:
+        assert "冲突" in str(e)
     print("PASS test_run_validation")
 
 

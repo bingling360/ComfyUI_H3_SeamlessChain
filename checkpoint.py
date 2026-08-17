@@ -162,11 +162,47 @@ def save_state(state: dict):
     """链状态指针写到 checkpoints/h3chain_state.json（审片面板据此定位当前链）。
 
     固定路径 + /api/view 端点：面板无需自建 HTTP 路由，也不必复刻指纹算法。
+    同时把该链 upsert 进项目索引 h3chain_index.json——/api/view 只能按精确
+    文件名取文件、无法列目录，索引即面板「项目列表」的唯一数据源。
     """
     root = checkpoints_root()
     os.makedirs(root, exist_ok=True)
     _atomic_write(os.path.join(root, "h3chain_state.json"),
                   json.dumps(state, ensure_ascii=False, indent=1).encode("utf-8"))
+    if state.get("dir"):
+        upsert_index({k: state[k] for k in
+                      ("dir", "total", "done", "review", "reroll", "updated_at") if k in state})
+
+
+def _index_path() -> str:
+    return os.path.join(checkpoints_root(), "h3chain_index.json")
+
+
+def load_index() -> list:
+    """项目索引：全部链目录条目，按 updated_at 降序（损坏/缺失容忍为空表）。"""
+    try:
+        with open(_index_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("projects") if isinstance(data, dict) else data
+        return [p for p in items if isinstance(p, dict) and p.get("dir")] if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+def save_index(projects: list):
+    _atomic_write(_index_path(),
+                  json.dumps({"projects": projects}, ensure_ascii=False, indent=1).encode("utf-8"))
+
+
+def upsert_index(entry: dict):
+    """按「dir」合并项目条目（同链多次运行只留最新），顺带剔除磁盘上已删的陈旧目录。"""
+    root = checkpoints_root()
+    projects = [p for p in load_index()
+                if p.get("dir") != entry.get("dir")
+                and os.path.isdir(os.path.join(root, str(p.get("dir"))))]
+    projects.append(dict(entry))
+    projects.sort(key=lambda p: p.get("updated_at") or 0, reverse=True)
+    save_index(projects)
 
 
 def load_state():

@@ -126,6 +126,34 @@ def test_state_roundtrip():
         shutil.rmtree(out_dir)
 
 
+def test_project_index():
+    out_dir = tempfile.mkdtemp()
+    sys.modules["folder_paths"] = types.SimpleNamespace(get_output_directory=lambda: out_dir)
+    try:
+        for d in ("chainA", "chainB"):
+            os.makedirs(os.path.join(out_dir, "checkpoints", d), exist_ok=True)
+        # save_state 顺带 upsert：/api/view 无法列目录，索引即面板项目列表的唯一数据源
+        checkpoint.save_state({"dir": "chainA", "total": 8, "done": 3, "review": False,
+                               "reroll": 0, "report": "", "updated_at": 1.0})
+        assert [p["dir"] for p in checkpoint.load_index()] == ["chainA"]
+        checkpoint.save_state({"dir": "chainB", "total": 4, "done": 4, "review": True,
+                               "reroll": 0, "report": "", "updated_at": 2.0})
+        assert [p["dir"] for p in checkpoint.load_index()] == ["chainB", "chainA"]  # 更新时间降序
+        checkpoint.save_state({"dir": "chainA", "total": 8, "done": 9, "review": False,
+                               "reroll": 0, "report": "", "updated_at": 3.0})
+        idx = checkpoint.load_index()
+        assert [p["dir"] for p in idx] == ["chainA", "chainB"]   # 同目录合并不重复
+        assert idx[0]["done"] == 9
+        assert "report" not in idx[0]                            # 索引不搬运行报告
+        # 磁盘上已删的目录在下次 upsert 时剔除
+        shutil.rmtree(os.path.join(out_dir, "checkpoints", "chainB"))
+        checkpoint.upsert_index({"dir": "chainA", "updated_at": 4.0})
+        assert [p["dir"] for p in checkpoint.load_index()] == ["chainA"]
+    finally:
+        del sys.modules["folder_paths"]
+        shutil.rmtree(out_dir)
+
+
 def test_save_thumb_graceful():
     # 无 PIL / 非 torch 帧对象 -> 返回空串（面板降级为占位），绝不抛错
     out_dir = tempfile.mkdtemp()
