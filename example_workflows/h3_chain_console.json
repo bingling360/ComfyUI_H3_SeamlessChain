@@ -1,8 +1,8 @@
 {
  "id": "h3-chain-storyboard-review",
  "revision": 0,
- "last_node_id": 30,
- "last_link_id": 202,
+ "last_node_id": 26,
+ "last_link_id": 108,
  "nodes": [
   {
    "id": 1,
@@ -183,7 +183,7 @@
    "id": 6,
    "type": "H3SeamlessChainSampler",
    "pos": [
-    240,
+    640,
     40
    ],
    "size": [
@@ -197,22 +197,22 @@
     {
      "name": "模型",
      "type": "MODEL",
-     "link": 2
+     "link": null
     },
     {
      "name": "文本编码器",
      "type": "CLIP",
-     "link": 3
+     "link": null
     },
     {
      "name": "视频VAE",
      "type": "VAE",
-     "link": 4
+     "link": null
     },
     {
      "name": "音频VAE",
      "type": "VAE",
-     "link": 5
+     "link": null
     },
     {
      "name": "首帧图片",
@@ -222,12 +222,12 @@
     {
      "name": "起始视频",
      "type": "IMAGE",
-     "link": 24
+     "link": null
     },
     {
      "name": "起始视频音轨",
      "type": "AUDIO",
-     "link": 25
+     "link": null
     },
     {
      "label": "提示词_1",
@@ -237,7 +237,7 @@
      "widget": {
       "name": "提示词_1"
      },
-     "link": 19
+     "link": null
     },
     {
      "label": "提示词_2",
@@ -247,7 +247,7 @@
      "widget": {
       "name": "提示词_2"
      },
-     "link": 20
+     "link": null
     },
     {
      "label": "提示词_3",
@@ -257,7 +257,7 @@
      "widget": {
       "name": "提示词_3"
      },
-     "link": 21
+     "link": null
     },
     {
      "label": "提示词_4",
@@ -267,7 +267,21 @@
      "widget": {
       "name": "提示词_4"
      },
-     "link": 22
+     "link": null
+    },
+    {
+     "name": "提示词清单",
+     "type": "STRING",
+     "link": 104
+    },
+    {
+     "name": "存档目录",
+     "type": "STRING",
+     "link": 105,
+     "widget": {
+      "name": "存档目录"
+     },
+     "label": "存档目录"
     }
    ],
    "outputs": [
@@ -275,7 +289,7 @@
      "name": "图像",
      "type": "IMAGE",
      "links": [
-      200
+      106
      ],
      "slot_index": 0
     },
@@ -283,7 +297,7 @@
      "name": "音频",
      "type": "AUDIO",
      "links": [
-      201
+      107
      ],
      "slot_index": 1
     },
@@ -291,7 +305,7 @@
      "name": "帧率",
      "type": "INT",
      "links": [
-      202
+      108
      ],
      "slot_index": 2
     },
@@ -317,44 +331,42 @@
    "properties": {
     "Node name for S&R": "H3SeamlessChainSampler"
    },
-   "widgets_values": [
-    864,
-    480,
-    124,
-    "22",
-    0,
-    "fixed",
-    25,
-    1.0,
-    "res_multistep",
-    "simple",
-    "自动存档",
-    "长片A",
-    "标注",
-    30.0,
-    34,
-    "smoothstep",
-    6,
-    0.0,
-    "逐段确认",
-    0
-   ],
-   "title": "H3 长片审片续拍（四段分镜）"
+   "widgets_values": {
+    "宽度": 864,
+    "高度": 480,
+    "每段帧数": 124,
+    "引导帧数": "22",
+    "种子": 0,
+    "control_after_generate": "fixed",
+    "步数": 25,
+    "CFG": 1.0,
+    "采样器": "res_multistep",
+    "调度器": "simple",
+    "自动存档": "自动存档",
+    "桥帧门控": "标注",
+    "清晰度阈值": 30.0,
+    "回退上限": 34,
+    "接缝混合": "smoothstep",
+    "混合帧数": 6,
+    "锚定加噪": 0.0,
+    "审片模式": "关闭",
+    "重跑起始段": 0
+   },
+   "title": "H3 无缝续拍（接控制台）"
   },
   {
-   "id": 9,
+   "id": 21,
    "type": "PrimitiveStringMultiline",
-   "title": "分镜 1（第 1 段）",
    "pos": [
-    -1480,
-    880
+    -320,
+    120
    ],
    "size": [
-    340,
-    200
+    300,
+    100
    ],
    "flags": {},
-   "order": 20,
+   "order": 1,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -362,34 +374,33 @@
      "name": "STRING",
      "type": "STRING",
      "links": [
-      19
+      100
      ],
      "slot_index": 0
     }
    ],
    "properties": {
-    "cnr_id": "comfy-core",
-    "ver": "0.30.2",
     "Node name for S&R": "PrimitiveStringMultiline"
    },
    "widgets_values": [
-    "镜头1：黄昏的城市天台，一位穿风衣的女子缓缓走向栏杆，远景，电影感"
-   ]
+    "深夜城市天台，霓虹灯在雨中晕开，一个穿风衣的男人背对镜头望向远处高楼",
+    false
+   ],
+   "title": "第1段提示词"
   },
   {
-   "id": 10,
+   "id": 22,
    "type": "PrimitiveStringMultiline",
-   "title": "分镜 2（第 2 段）",
    "pos": [
-    -1110,
-    880
+    -320,
+    250
    ],
    "size": [
-    340,
-    200
+    300,
+    100
    ],
    "flags": {},
-   "order": 21,
+   "order": 1,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -397,34 +408,33 @@
      "name": "STRING",
      "type": "STRING",
      "links": [
-      20
+      101
      ],
      "slot_index": 0
     }
    ],
    "properties": {
-    "cnr_id": "comfy-core",
-    "ver": "0.30.2",
     "Node name for S&R": "PrimitiveStringMultiline"
    },
    "widgets_values": [
-    "镜头2：她扶住栏杆眺望远方，镜头缓慢推近她的侧脸，城市灯光次第亮起"
-   ]
+    "男人转身走向天台边缘，风吹起风衣下摆，远处一辆车灯划过湿漉的街道",
+    false
+   ],
+   "title": "第2段提示词"
   },
   {
-   "id": 11,
+   "id": 23,
    "type": "PrimitiveStringMultiline",
-   "title": "分镜 3（第 3 段）",
    "pos": [
-    -740,
-    880
+    -320,
+    380
    ],
    "size": [
-    340,
-    200
+    300,
+    100
    ],
    "flags": {},
-   "order": 22,
+   "order": 1,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -432,34 +442,33 @@
      "name": "STRING",
      "type": "STRING",
      "links": [
-      21
+      102
      ],
      "slot_index": 0
     }
    ],
    "properties": {
-    "cnr_id": "comfy-core",
-    "ver": "0.30.2",
     "Node name for S&R": "PrimitiveStringMultiline"
    },
    "widgets_values": [
-    "镜头3：她转身离开，镜头跟随背影走向天台门口，她推开门"
-   ]
+    "镜头切到街道视角，车轮碾过积水倒影，霓虹招牌在水面碎成光斑",
+    false
+   ],
+   "title": "第3段提示词"
   },
   {
-   "id": 12,
+   "id": 24,
    "type": "PrimitiveStringMultiline",
-   "title": "分镜 4（第 4 段）",
    "pos": [
-    -370,
-    880
+    -320,
+    510
    ],
    "size": [
-    340,
-    200
+    300,
+    100
    ],
    "flags": {},
-   "order": 23,
+   "order": 1,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -467,145 +476,131 @@
      "name": "STRING",
      "type": "STRING",
      "links": [
-      22
+      103
      ],
      "slot_index": 0
     }
    ],
    "properties": {
-    "cnr_id": "comfy-core",
-    "ver": "0.30.2",
     "Node name for S&R": "PrimitiveStringMultiline"
    },
    "widgets_values": [
-    "镜头4：楼梯间内，她拾级而下，光影在墙面流动，最后推开门走进夜色"
-   ]
+    "男人在天台边缘停下，抬头看夜空，一束探照灯从云层后扫过",
+    false
+   ],
+   "title": "第4段提示词"
   },
   {
-   "id": 15,
-   "type": "MarkdownNote",
-   "title": "使用说明（长片审片生产流程）",
+   "id": 20,
+   "type": "H3ChainConsole",
    "pos": [
-    240,
-    880
+    40,
+    40
    ],
    "size": [
-    700,
-    620
+    560,
+    840
    ],
    "flags": {},
-   "order": 10,
+   "order": 4,
    "mode": 0,
-   "inputs": [],
-   "outputs": [],
-   "properties": {},
-   "widgets_values": [
-    "# 长片审片生产工作流（推荐）\n\n一个「分镜」节点 = 一段视频，从左到右即段序；审片模式下**每次运行只生成一段新内容**，看完确认再继续，长片不怕跑废。\n\n## 日常循环\n1. 点运行 → 生成下一段后自动停下\n2. 控制台节点（H3ChainConsole）面板看各段缩略图 / 种子 / 接缝与桥分；或在成片保存节点「本次分段」里看最新一段；右键主节点预览「报告」\n3. 满意 → 控制台点「▶ 继续下一段」（或什么都不改再点运行）→ 自动续接（已完成段秒级载入）\n4. 不满意二选一（控制台段卡片一键完成）：\n   - 「✏ 改词重跑」→ 控制台内改该段提示词 → **自动从该段重做**（其后段级联重做，之前段沿用）\n   - 「🎲 重摇此段」→ 自动换种子重摇该段及之后（运行成功后「重跑起始段」自动复位 0）\n5. 全部段确认完把「审片模式」改回关闭再运行一次 → 成片保存节点输出完整长片（画廊可看历史）\n\n## 序章：从上传视频续拍\n- 左下「LoadVideo → 拆分视频组件」两节点默认 **bypass**；启用（Ctrl+B）并选一段 ≥5 帧、24fps 的视频 → 它成为第 0 段「序章」，成片以它开头，分镜 1 从它的结尾续拍\n- 换上传视频 = 整链重做（序章指纹变了）；不用时保持 bypass 即可，不影响正常生成\n\n## 进阶\n- 第一条链保持「桥帧门控=标注」只看报告分数分布；熟悉后改「自动回退」自动剪坏尾\n- 报告里接缝有「↑ 建议人工检查」或音乐节拍不齐 → 「引导帧数」22 提到 39/56\n- 每段自动落盘 latent 存档（约5MB/段），中断后重跑自动续接；**开新片请在控制台点「＋新建」（或改「存档目录」名）**\n- 种子控件会自动 +1，无需理会（种子序列由存档记录，多轮运行结果一致）\n- r2v 链：UNET 换 minimax_h3_ref2va_*，参考素材接四组「参考」输入，提示词用 <Picture i> / <Video k> / <Audio j> 引用\n\n## 这套流程吸收了谁的长处\n- **Contex-Loop**：分镜单 + 逐段审片门 + 改词自动定位重跑段\n- **Motion-Context**：接缝只测不管（报告标注帧差与响度跳变）\n- **Director**：每段成功即落盘视频（分段保存支路，审片直接看文件）\n- **总控台**：生成前桥帧打分门控（标注 → 自动回退两阶段）\n- **本项目**：latent 断点续跑 + 官方协议零 patch 全自动引擎"
-   ]
-  },
-  {
-   "id": 16,
-   "type": "LoadVideo",
-   "title": "序章视频（默认 bypass，启用即以上传视频开头）",
-   "pos": [
-    -1480,
-    640
-   ],
-   "size": {
-    "0": 340,
-    "1": 110
-   },
-   "flags": {},
-   "order": 30,
-   "mode": 4,
-   "inputs": [],
-   "outputs": [
-    {
-     "name": "video",
-     "type": "VIDEO",
-     "links": [
-      23
-     ],
-     "slot_index": 0
-    }
-   ],
-   "properties": {
-    "cnr_id": "comfy-core",
-    "ver": "0.30.2",
-    "Node name for S&R": "LoadVideo"
-   },
-   "widgets_values": [
-    ""
-   ]
-  },
-  {
-   "id": 17,
-   "type": "GetVideoComponents",
-   "title": "拆分视频组件（frames→起始视频，audio→音轨）",
-   "pos": [
-    -1110,
-    640
-   ],
-   "size": {
-    "0": 280,
-    "1": 150
-   },
-   "flags": {},
-   "order": 31,
-   "mode": 4,
    "inputs": [
     {
-     "name": "video",
-     "type": "VIDEO",
-     "link": 23
+     "name": "提示词组.提示词_1",
+     "type": "STRING",
+     "link": 100,
+     "widget": {
+      "name": "提示词_1"
+     },
+     "label": "提示词_1",
+     "shape": 7
+    },
+    {
+     "name": "提示词组.提示词_2",
+     "type": "STRING",
+     "link": 101,
+     "widget": {
+      "name": "提示词_2"
+     },
+     "label": "提示词_2",
+     "shape": 7
+    },
+    {
+     "name": "提示词组.提示词_3",
+     "type": "STRING",
+     "link": 102,
+     "widget": {
+      "name": "提示词_3"
+     },
+     "label": "提示词_3",
+     "shape": 7
+    },
+    {
+     "name": "提示词组.提示词_4",
+     "type": "STRING",
+     "link": 103,
+     "widget": {
+      "name": "提示词_4"
+     },
+     "label": "提示词_4",
+     "shape": 7
     }
    ],
    "outputs": [
     {
-     "name": "images",
+     "name": "首帧",
      "type": "IMAGE",
-     "links": [
-      24
-     ],
+     "links": null,
      "slot_index": 0
     },
     {
-     "name": "audio",
-     "type": "AUDIO",
-     "links": [
-      25
-     ],
+     "name": "序章视频",
+     "type": "IMAGE",
+     "links": null,
      "slot_index": 1
     },
     {
-     "name": "fps",
-     "type": "FLOAT",
+     "name": "序章音轨",
+     "type": "AUDIO",
      "links": null,
      "slot_index": 2
     },
     {
-     "name": "bit_depth",
-     "type": "INT",
-     "links": null,
+     "name": "提示词清单",
+     "type": "STRING",
+     "links": [
+      104
+     ],
      "slot_index": 3
+    },
+    {
+     "name": "存档名",
+     "type": "STRING",
+     "links": [
+      105
+     ],
+     "slot_index": 4
     }
    ],
    "properties": {
-    "cnr_id": "comfy-core",
-    "ver": "0.30.2",
-    "Node name for S&R": "GetVideoComponents"
-   }
+    "Node name for S&R": "H3ChainConsole"
+   },
+   "widgets_values": {
+    "存档名": "",
+    "首帧文件": ""
+   },
+   "title": "控制台（存档 · 提示词 · 首帧/序章）"
   },
   {
-   "id": 30,
+   "id": 25,
    "type": "H3ChainSaver",
    "pos": [
-    1050,
-    40
+    1080,
+    120
    ],
    "size": [
     540,
-    700
+    720
    ],
    "flags": {},
    "order": 6,
@@ -614,17 +609,17 @@
     {
      "name": "图像",
      "type": "IMAGE",
-     "link": 200
+     "link": 106
     },
     {
      "name": "音频",
      "type": "AUDIO",
-     "link": 201
+     "link": 107
     },
     {
      "name": "帧率",
      "type": "INT",
-     "link": 202
+     "link": 108
     }
    ],
    "outputs": [
@@ -643,126 +638,99 @@
     "CRF": 20
    },
    "title": "成片保存（历史 · 分段 · 当前）"
+  },
+  {
+   "id": 26,
+   "type": "MarkdownNote",
+   "pos": [
+    -320,
+    -160
+   ],
+   "size": [
+    340,
+    260
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "properties": {},
+   "widgets_values": [
+    "# 控制台工作流（H3 Chain Console）\n\n1. **控制台节点**填各段提示词（Primitive 一段一个，或直接在控制台的提示词框里写）；「＋新建」开时间戳新存档，下拉选历史存档读档续拍，⤺回填旧存档提示词。\n2. 上传首帧图片或序章视频（可选，控制台「上传」按钮，接 fl2va UNET）。\n3. Queue 运行；逐段结果在控制台段卡片里播放，不满意点「🎲重摇此段 / ✏改词重跑」。\n4. **成片保存节点**自动存最终 mp4 + 复制分段视频，画廊里看成片历史/本次分段/当前成片。\n\n采样器开了「自动存档」：中断重跑自动跳过已完成段。模型加载 fl2va UNET；换 ref2va 时在采样器接参考素材并换 UNET。"
+   ]
   }
  ],
  "links": [
   [
-   1,
-   1,
-   0,
-   2,
-   0,
-   "MODEL"
-  ],
-  [
-   2,
-   2,
-   0,
-   6,
-   0,
-   "MODEL"
-  ],
-  [
-   3,
-   3,
-   0,
-   6,
-   1,
-   "CLIP"
-  ],
-  [
-   4,
-   4,
-   0,
-   6,
-   2,
-   "VAE"
-  ],
-  [
-   5,
-   5,
-   0,
-   6,
-   3,
-   "VAE"
-  ],
-  [
-   19,
-   9,
-   0,
-   6,
-   7,
-   "STRING"
-  ],
-  [
-   20,
-   10,
-   0,
-   6,
-   8,
-   "STRING"
-  ],
-  [
+   100,
    21,
-   11,
    0,
-   6,
-   9,
+   20,
+   0,
    "STRING"
   ],
   [
+   101,
    22,
-   12,
    0,
-   6,
-   10,
+   20,
+   1,
    "STRING"
   ],
   [
+   102,
    23,
-   16,
    0,
-   17,
-   0,
-   "VIDEO"
+   20,
+   2,
+   "STRING"
   ],
   [
+   103,
    24,
-   17,
    0,
-   6,
-   5,
-   "IMAGE"
+   20,
+   3,
+   "STRING"
   ],
   [
+   104,
+   20,
+   3,
+   6,
+   11,
+   "STRING"
+  ],
+  [
+   105,
+   20,
+   4,
+   6,
+   12,
+   "STRING"
+  ],
+  [
+   106,
+   6,
+   0,
    25,
-   17,
-   1,
-   6,
-   6,
-   "AUDIO"
-  ],
-  [
-   200,
-   6,
-   0,
-   30,
    0,
    "IMAGE"
   ],
   [
-   201,
+   107,
    6,
    1,
-   30,
+   25,
    1,
    "AUDIO"
   ],
   [
-   202,
+   108,
    6,
    2,
-   30,
+   25,
    2,
    "INT"
   ]
