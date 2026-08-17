@@ -9,10 +9,12 @@ try:
     from .storyboard import H3StoryboardChain
     from .console import H3ChainConsole
     from .saver import H3ChainSaver
+    from .seam_doctor import H3SeamDoctor
 
     class H3SeamlessChainExtension(ComfyExtension):
         async def get_node_list(self):
-            return [H3SeamlessChainSampler, H3StoryboardChain, H3ChainConsole, H3ChainSaver]
+            return [H3SeamlessChainSampler, H3StoryboardChain, H3ChainConsole,
+                    H3ChainSaver, H3SeamDoctor]
 
         async def add_routes(self, routes):
             try:

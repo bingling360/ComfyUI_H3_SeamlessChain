@@ -48,7 +48,16 @@ def _install_stubs(with_audio_support=False):
     torch = types.ModuleType("torch")
     torch.cat = lambda xs, dim=0: FakeTensor([1])
     torch.std = lambda *a, **k: FakeTensor([1])
+    # torch.nn.functional 占位（seam_doctor 顶层 import，stub 下只需可导入）
+    torch_nn = types.ModuleType("torch.nn")
+    torch_nn_f = types.ModuleType("torch.nn.functional")
+    torch_nn_f.interpolate = lambda *a, **k: FakeTensor([1])
+    torch_nn_f.conv2d = lambda *a, **k: FakeTensor([1])
+    torch_nn.functional = torch_nn_f
+    torch.nn = torch_nn
     sys.modules["torch"] = torch
+    sys.modules["torch.nn"] = torch_nn
+    sys.modules["torch.nn.functional"] = torch_nn_f
 
     nodes_mod = types.ModuleType("nodes")
     nodes_mod.common_ksampler = lambda *a, **k: ({},)

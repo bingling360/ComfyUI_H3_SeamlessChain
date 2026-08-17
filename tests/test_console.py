@@ -120,7 +120,10 @@ def test_schema():
 
 if __name__ == "__main__":
     _install_stubs(with_audio_support=False)
-    del sys.modules["torch"]  # 换回真实 torch（_load_image 需要 from_numpy；nodes 已随 stub 加载）
+    # 换回真实 torch（_load_image 需要 from_numpy；连带清掉 stub 的 torch.nn* 残留，
+    # 否则真 torch 的 autograd 会 import 到假 torch.nn.parameter 报错）
+    for m in [k for k in list(sys.modules) if k == "torch" or k.startswith("torch.")]:
+        del sys.modules[m]
     try:
         import torch  # noqa: F401
     except ImportError:
