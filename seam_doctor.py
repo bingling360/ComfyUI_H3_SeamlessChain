@@ -21,6 +21,8 @@
 """
 
 import math
+import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -489,6 +491,24 @@ def build_gallery(video, metrics, max_rows=12):
     return torch.from_numpy(arr)[None]                     # [1,H,W,3]
 
 
+def save_report(report, subdir="h3_seam_doctor"):
+    """报告存盘 output/<subdir>/report_时间戳.txt -> 相对路径；无 ComfyUI 环境返回 None。"""
+    try:
+        import folder_paths
+        root = folder_paths.get_output_directory()
+    except Exception:
+        return None
+    try:
+        d = os.path.join(root, subdir)
+        os.makedirs(d, exist_ok=True)
+        name = f"report_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+            f.write(report)
+        return os.path.join(subdir, name)
+    except Exception:
+        return None
+
+
 def analyze(video, wav, sr, fps, segs, window, radius, kmax, ratio_th):
     """体检入口：定位接缝 -> 逐缝诊断 -> (报告, 体检图, metrics)。"""
     video = video.detach()
@@ -579,6 +599,11 @@ try:
                 图像, wav, sr, fps, segs,
                 int(scalar(窗口帧数, 8)), int(scalar(位移搜索半径, 16)),
                 int(scalar(断层探测深度, 8)), float(scalar(跳变阈值倍率, 3.0)))
+            rel = save_report(report)
+            if rel:
+                report = (f"{report}\n\n报告已存盘：{rel}"
+                          f"\n（ComfyUI 的 output 目录下，记事本打开即读）")
+                print(f"[H3SeamDoctor] 接缝体检报告已存盘：{rel}")
             return io.NodeOutput(report, gallery if gallery is not None else 图像[:1])
 except ImportError:
     pass                                              # 无 ComfyUI 的单测环境：纯逻辑照常可用

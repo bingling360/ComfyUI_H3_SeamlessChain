@@ -188,6 +188,24 @@ def test_join_consistency_metrics():
     assert m["join"][1] > 1e-4                   # 缝后帧与段首不同 -> 混合生效
 
 
+def test_save_report():
+    import shutil
+    import tempfile
+    import types
+    root = tempfile.mkdtemp()
+    sys.modules["folder_paths"] = types.SimpleNamespace(
+        get_output_directory=lambda: root)
+    try:
+        rel = sd.save_report("体检内容 abc")
+        assert rel and rel.startswith("h3_seam_doctor") and rel.endswith(".txt")
+        with open(os.path.join(root, rel), encoding="utf-8") as f:
+            assert f.read() == "体检内容 abc"
+    finally:
+        del sys.modules["folder_paths"]
+        shutil.rmtree(root)
+    assert sd.save_report("x") is None            # 无 folder_paths 环境 -> None 不炸
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
