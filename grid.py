@@ -37,6 +37,23 @@ def latent_t_to_frames(latent_t):
     return sum(FRAME_PER_TOKEN[k % 5] for k in range(latent_t))
 
 
+def frames_to_latent_t(frames, up=True):
+    """像素帧数 -> token 数：up=True 最小可覆盖（不丢帧），False 最大不超出。
+
+    latent_t_to_frames 严格递增（FRAME_PER_TOKEN 全正），逆映射唯一；
+    用于把输出末端对齐到 token 边界——latent 只能整 token 切，
+    keyframe 锚定末端与输出末端必须重合，否则续拍点落进从未输出的填充帧。
+    """
+    if frames <= 0:
+        return 0
+    t = (frames // sum(FRAME_PER_TOKEN)) * len(FRAME_PER_TOKEN)
+    while latent_t_to_frames(t) < frames:
+        t += 1
+    if not up and latent_t_to_frames(t) > frames:
+        t -= 1
+    return t
+
+
 def audio_tokens_for_frames(frames):
     """像素帧数 -> 音频 latent token 数（1 视频帧 = FRAME_RESCALE 个音频 latent 帧）。"""
     return round(frames * FRAME_RESCALE)

@@ -38,7 +38,8 @@ from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3Refere
 from comfy_api.latest import io
 
 from . import checkpoint
-from .grid import video_latent_t, latent_t_to_frames, audio_tokens_for_frames, align_frame_count_down
+from .grid import (video_latent_t, latent_t_to_frames, frames_to_latent_t,
+                   audio_tokens_for_frames, align_frame_count_down)
 
 try:
     import comfy.ldm.minimax.model as _minimax_model
@@ -120,10 +121,16 @@ def _apply_anchor_noise(cond, aug):
     })
 
 
-def _decode_audio(audio_vae, audio_latent):
-    # 与官方 VAEDecodeAudio（comfy_extras/nodes_audio.vae_decode_audio）保持一致
+def _decode_audio(audio_vae, audio_latent, norm_skip_frac=0.0):
+    # 与官方 VAEDecodeAudio（comfy_extras/nodes_audio.vae_decode_audio）保持一致；
+    # norm_skip_frac>0 时归一化 std 只统计保留区——锚定区音频随后整段裁掉，
+    # 若计入会抬高归一化分母、系统性压低本段响度，接缝处即响度跳变
     audio = audio_vae.decode(audio_latent).movedim(-1, 1)
-    std = torch.std(audio, dim=[1, 2], keepdim=True) * 5.0
+    if 0.0 < norm_skip_frac < 1.0:
+        body = audio[..., round(audio.shape[-1] * norm_skip_frac):]
+    else:
+        body = audio
+    std = torch.std(body, dim=[1, 2], keepdim=True) * 5.0
     std[std < 1.0] = 1.0
     audio = audio / std
     sample_rate = getattr(audio_vae, "audio_sample_rate_output",
@@ -131,23 +138,24 @@ def _decode_audio(audio_vae, audio_latent):
     return audio, sample_rate
 
 
-def _tail_keyframe(video_t, audio_t, ctx_frames, with_audio, back_tokens=0, back_audio=0, full_bridge=True):
-    """上段尾部 ctx 帧 latent 直切为 keyframe；back_* 为桥帧门控回退偏移。
+def _tail_keyframe(video_t, audio_t, ctx_frames, with_audio, end_tokens=None, full_bridge=True):
+    """上段尾部 ctx 帧 latent 直切为 keyframe；end_tokens 为输出末端 token 边界。
 
-    回退量必须是 5 token（17 帧）的倍数：切片起点/终点同步平移，
-    切片覆盖帧数不变，且始终落在 17k+5 网格上。
+    end_tokens=None（序章等外部源）取原始尾部；生成段必须传 kept 末端对齐值，
+    保证锚定末端 == 输出末端——否则下段续拍点落在本段从未输出的网格填充帧上，
+    每个接缝跳过最多 16 帧内容（观感即"接缝跳变"）。
     旧版 ComfyUI keyframe 协议只收单帧 latent：full_bridge=False 时只钉
     尾部最后 1 个 token（承载上段末尾画面），且不附音频。
     """
     vt = video_latent_t(ctx_frames) if full_bridge else 1
-    end = video_t.shape[2] - back_tokens
+    end = video_t.shape[2] if end_tokens is None else min(end_tokens, video_t.shape[2])
     kf = {
         "resolved_frame_index": 0,
         "latent": video_t[:, :, end - vt:end, :, :].clone(),
     }
     if with_audio and full_bridge and audio_t is not None:
         at = audio_tokens_for_frames(ctx_frames)
-        aend = audio_t.shape[-1] - back_audio
+        aend = min(audio_tokens_for_frames(latent_t_to_frames(end)), audio_t.shape[-1])
         if 0 < at <= aend:
             kf["audio_latent"] = audio_t[..., aend - at:aend].clone()
     return kf
@@ -550,13 +558,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     checkpoint.save_segment(root, g, video_t, audio_t)
 
             sampled_fc = latent_t_to_frames(video_t.shape[2])
+            skip_f = 0 if (i == 0 and off == 0) else ctx
+            vis_len = length
             frames = video_vae.decode(video_t)
             if len(frames.shape) == 5:
                 frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
-            wav, sample_rate = _decode_audio(audio_vae, audio_t)
-
-            skip_f = 0 if (i == 0 and off == 0) else ctx
-            vis_len = length
+            # 音频归一化只统计保留区（见 _decode_audio）：锚定区音频不计入 std
+            wav, sample_rate = _decode_audio(audio_vae, audio_t,
+                                             norm_skip_frac=skip_f / sampled_fc if skip_f else 0.0)
             seg_bridge_score = None
             if 桥帧门控 != "关闭" and i + 1 < len(seg_prompts):
                 window = frames[max(skip_f, frames.shape[0] - (ctx + gate_limit)):]
@@ -573,6 +582,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         report.append(f"段{g + 1} 尾帧低质（{tail_score:.1f} < {清晰度阈值:g}），"
                                       f"回退 {back} 帧续拍（回退点 {hit:.1f}）")
             bridge_scores.append(seg_bridge_score)
+            # 尾切对齐 token 网格：kept 末端必须与 guide 锚定末端重合。此前 guide
+            # 取采样 latent 原始尾部（含 17k+5 网格填充帧，从未输出），下段续拍点
+            # 落在本段输出末尾之后——ctx=56 时每个接缝跳过 15 帧（0.6s）内容。
+            # 门控回退时向下对齐（不回吐坏帧），否则向上（不丢内容，每段至多多留几帧）
+            end_t = frames_to_latent_t(skip_f + vis_len, up=(length - vis_len) == 0)
+            vis_len = latent_t_to_frames(end_t) - skip_f
             trims.append(length - vis_len)
 
             frames = frames[skip_f:skip_f + vis_len]
@@ -580,6 +595,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
             skip_s = round(wav_total * skip_f / sampled_fc)
             take_s = round(wav_total * vis_len / sampled_fc)
             wav = wav[..., skip_s:skip_s + take_s]
+
+            # 段首响度对齐（与分镜链同款）：增益匹配上段尾 RMS（±6dB 钳制 + 1s 渐出），
+            # 增益不沿链累积；归一化已排除锚定区，此处兜住内容本身的响度差
+            if (i > 0 or off) and prev_tail_wav is not None:
+                wav, gain_db = qc.loudness_align_head(wav, prev_tail_wav, rate=sample_rate)
+                if gain_db is not None:
+                    report.append(f"段{g + 1} 响度对齐：段首 {gain_db:+.1f} dB（1s 渐出）")
 
             # 接缝后验测量（测而不干预）：上一段最后可见帧 vs 本段首帧
             seam_n = int(sample_rate * 0.25)
@@ -627,11 +649,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {dt:.0f}s") + f" | {note}")
 
             if i + 1 < len(seg_prompts):
-                back = length - vis_len
+                # end_tokens=kept 末端：锚定末端与输出末端重合（回退量已含在 vis_len 里）
                 guide = _tail_keyframe(video_t, audio_t, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
-                                       back_tokens=back // 17 * 5,
-                                       back_audio=round(back * 5.0 / 3.0),
-                                       full_bridge=full_bridge)
+                                       end_tokens=end_t, full_bridge=full_bridge)
 
             if use_ckpt and not replay:
                 done = g + 1

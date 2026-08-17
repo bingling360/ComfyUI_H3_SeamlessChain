@@ -39,6 +39,20 @@ def test_token_frame_roundtrip():
     assert video_latent_t(22) == 7
 
 
+def test_frames_to_latent_t():
+    from grid import frames_to_latent_t
+    # 严格递增 -> 网格点上的逆映射唯一（up/down 同值）
+    for t in range(2, 95):
+        f = latent_t_to_frames(t)
+        assert frames_to_latent_t(f, up=True) == t
+        assert frames_to_latent_t(f, up=False) == t
+    # 非网格点：up=最小可覆盖（不丢帧），down=最大不超出
+    assert frames_to_latent_t(296, up=True) == 88 and latent_t_to_frames(88) == 298
+    assert frames_to_latent_t(296, up=False) == 87 and latent_t_to_frames(87) == 294
+    assert frames_to_latent_t(240, up=True) == 72 and latent_t_to_frames(72) == 243
+    assert frames_to_latent_t(0) == 0 and frames_to_latent_t(-3) == 0
+
+
 def test_valid_context_slices():
     # 尾部 N 帧 guide 的 token 切片必须整 token 覆盖且恰好 N 帧
     for ctx in [5, 22, 39, 56]:

@@ -262,8 +262,8 @@ def test_tail_keyframe_slices():
     assert kf39["latent"].shape[2] == 12 and kf39["audio_latent"].shape[-1] == 65
     kf_noaudio = plugin_nodes._tail_keyframe(video, audio, 22, False)
     assert "audio_latent" not in kf_noaudio
-    # 桥帧门控回退：偏移 5 token（=17 帧）+ 对应音频 token，切片长度不变
-    kfb = plugin_nodes._tail_keyframe(video, audio, 22, True, back_tokens=5, back_audio=28)
+    # 末端对齐：end_tokens=30（=102 帧边界）时锚定窗末端与 kept 末端重合，窗宽不变
+    kfb = plugin_nodes._tail_keyframe(video, audio, 22, True, end_tokens=30)
     assert kfb["latent"].shape[2] == 7 and kfb["audio_latent"].shape[-1] == 37
     print("PASS test_tail_keyframe_slices")
 
