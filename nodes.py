@@ -193,7 +193,11 @@ def _autosave_final(root, frames, wav, sample_rate, fps=24):
         dst_dir = _autosave_dir(root)
         os.makedirs(dst_dir, exist_ok=True)
         path = os.path.join(dst_dir, f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
-        return path if save_av_mp4(path, frames, wav, sample_rate, fps) else None
+        print(f"[H3自动保存] 编码完整成片：{int(frames.shape[0])} 帧 → {path}（编码期间 CPU 升高属正常）")
+        t0 = time.time()
+        ok = save_av_mp4(path, frames, wav, sample_rate, fps)
+        print(f"[H3自动保存] 成片编码{'完成' if ok else '失败'}：{time.time() - t0:.0f}s")
+        return path if ok else None
     except Exception:
         return None
 

@@ -8,11 +8,15 @@ PyAV 是 ComfyUI 新视频栈（CreateVideo/SaveVideo）的既有依赖，无新
 import os
 
 
-def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20):
+def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
     """可见帧 + 音轨 -> mp4（H.264 + AAC），成功返回 True。
 
     先写 .part 再原子改名：失败不留半成品、不破坏已有文件。编码失败
     （或 PyAV 缺失）返回 False，调用方降级（缩略图 / 空串），不影响主流程。
+
+    内存与 CPU 约束：分块（32 帧）搬运到 CPU，峰值内存 ~160MB 而非整链
+    float32（长链数 GB，曾致内存耗尽假死）；threads 限 4（x264 默认
+    线程=核数×1.5，会打满 CPU 导致整机卡顿）。
     """
     try:
         import av
@@ -21,10 +25,9 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20):
         return False
     tmp = path + ".part"
     try:
-        arr = (frames.detach().float().clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8")
-        h, w = arr.shape[1], arr.shape[2]
+        n = int(frames.shape[0])
+        h, w = int(frames.shape[1]), int(frames.shape[2])
         h, w = h - h % 2, w - w % 2  # yuv420p 要求偶数尺寸
-        arr = numpy.ascontiguousarray(arr[:, :h, :w, :3])
         pcm = numpy.ascontiguousarray(wav.detach().float().cpu().clamp(-1.0, 1.0).numpy())
         ch = int(pcm.shape[0])
         layout = "stereo" if ch >= 2 else "mono"
@@ -34,12 +37,18 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20):
             vstream = container.add_stream("libx264", rate=fps)
             vstream.width, vstream.height = w, h
             vstream.pix_fmt = "yuv420p"
-            vstream.options = {"crf": str(int(crf)), "preset": "veryfast"}
+            vstream.options = {"crf": str(int(crf)), "preset": "veryfast",
+                               "threads": str(max(1, int(threads)))}
             astream = container.add_stream("aac", rate=int(sample_rate), layout=layout)
 
-            for i in range(arr.shape[0]):
-                for packet in vstream.encode(av.VideoFrame.from_ndarray(arr[i], format="rgb24")):
-                    container.mux(packet)
+            for start in range(0, n, 32):
+                block = (frames[start:start + 32].detach().float().clamp(0.0, 1.0)
+                         .cpu().numpy()[:, :h, :w, :3] * 255.0).astype("uint8")
+                for i in range(block.shape[0]):
+                    frame = av.VideoFrame.from_ndarray(
+                        numpy.ascontiguousarray(block[i]), format="rgb24")
+                    for packet in vstream.encode(frame):
+                        container.mux(packet)
             if ch > 2:
                 pcm = pcm[:2]
             for start in range(0, pcm.shape[1], 1024):
