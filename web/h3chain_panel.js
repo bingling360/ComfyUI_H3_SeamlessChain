@@ -199,12 +199,49 @@ function newProject() {
     const t = new Date();
     const pad = (x) => String(x).padStart(2, "0");
     const def = `h3chain_${t.getFullYear()}${pad(t.getMonth() + 1)}${pad(t.getDate())}_${pad(t.getHours())}${pad(t.getMinutes())}${pad(t.getSeconds())}`;
-    const name = prompt("新项目断点目录名（新目录 = 空白链，上一条的尾帧引导不会带入）：", def);
-    if (!name || !name.trim()) return;
-    setWidgetValue(node, W_DIR, name.trim());
-    setWidgetValue(node, W_REROLL, 0);
-    pendingReset = false;
-    scheduleRefresh();
+    promptDialog({
+        title: "新建项目",
+        label: "新项目断点目录名（新目录 = 空白链，上一条的尾帧引导不会带入）：",
+        default: def,
+        confirmText: "新建并应用",
+        onConfirm: (name) => {
+            if (!name || !name.trim()) return;
+            setWidgetValue(node, W_DIR, name.trim());
+            setWidgetValue(node, W_REROLL, 0);
+            pendingReset = false;
+            scheduleRefresh();
+        },
+    });
+}
+
+/** 自定义模态输入框（ComfyUI 新前端下 window.prompt 不可见/被拦时的稳妥替代）。 */
+function promptDialog({ title, label, default: def, confirmText = "确定", onConfirm }) {
+    // 已有同名弹层先关掉
+    document.querySelectorAll(".h3c-dialog-overlay").forEach((e) => e.remove());
+    const overlay = el("div", "h3c-dialog-overlay");
+    const dlg = el("div", "h3c-dialog");
+    dlg.innerHTML = `
+        <div class="h3c-dialog-title">${escapeHtml(title || "")}</div>
+        ${label ? `<label class="h3c-dialog-label">${escapeHtml(label)}</label>` : ""}
+        <input class="h3c-dialog-input" type="text" value="${escapeHtml(def ?? "")}">
+        <div class="h3c-dialog-row">
+            <button class="h3c-btn h3c-dialog-cancel">取消</button>
+            <button class="h3c-btn h3c-btn-primary h3c-dialog-ok">${escapeHtml(confirmText)}</button>
+        </div>`;
+    overlay.append(dlg);
+    document.body.append(overlay);
+    const input = dlg.querySelector(".h3c-dialog-input");
+    const close = () => overlay.remove();
+    const submit = () => { const v = input.value; close(); onConfirm && onConfirm(v); };
+    dlg.querySelector(".h3c-dialog-cancel").onclick = close;
+    dlg.querySelector(".h3c-dialog-ok").onclick = submit;
+    input.onkeydown = (e) => {
+        if (e.key === "Enter") { e.preventDefault(); submit(); }
+        if (e.key === "Escape") { e.preventDefault(); close(); }
+    };
+    overlay.onclick = (e) => { if (e.target === overlay) close(); };
+    input.focus();
+    input.select();
 }
 
 function openEditor(card, genIdx, text) {
@@ -336,6 +373,13 @@ const CSS = `
 .h3c-report pre { white-space:pre-wrap; font-size:11px; max-height:280px; overflow:auto; opacity:.85; }
 .h3c-foot { opacity:.55; font-size:10px; word-break:break-all; }
 .h3c-fab { position:fixed; right:16px; top:120px; z-index:80; width:44px; height:44px; border-radius:50%; border:1px solid rgba(80,150,255,.5); background:rgba(40,70,110,.85); color:#fff; cursor:pointer; font-size:18px; }
+.h3c-dialog-overlay { position:fixed; inset:0; z-index:9999; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; }
+.h3c-dialog { width:min(420px,92vw); background:#2a2a2a; color:#eee; border:1px solid #555; border-radius:10px; padding:16px; display:flex; flex-direction:column; gap:10px; box-shadow:0 8px 32px rgba(0,0,0,.5); }
+.h3c-dialog-title { font-weight:600; font-size:14px; }
+.h3c-dialog-label { font-size:12px; opacity:.85; line-height:1.5; }
+.h3c-dialog-input { font:inherit; font-size:13px; padding:7px 9px; border-radius:6px; border:1px solid #666; background:#1a1a1a; color:#eee; width:100%; box-sizing:border-box; }
+.h3c-dialog-input:focus { outline:none; border-color:rgba(80,150,255,.7); }
+.h3c-dialog-row { display:flex; gap:8px; justify-content:flex-end; }
 `;
 
 const ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>`;
