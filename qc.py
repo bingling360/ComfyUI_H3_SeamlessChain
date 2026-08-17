@@ -80,20 +80,12 @@ def smoothstep_blend_head(frames, anchor_frame, span):
 
 
 def smoothstep_fade_head(wav, anchor_wav):
-    """接缝音频兜底：新段头部从上一段尾音 smoothstep 渐入本段声音。
-
-    与视频首帧混合同构（缝点连续、窗口内平滑接管、时长不变）：
-    wav: [C,T]（任意设备）；anchor_wav: [C,n] 上一段最后约 0.25s 可见音频。
+    """已弃用：接缝两侧音频是不同内容（上段尾音 vs 本段新音频），拼接期叠加
+    会双声部重叠（用户实测"声音重叠"）。音频连贯由生成期桥锚定 + 裁剪对齐负责，
+    与 H3-Motion-Context（坐标改写）/ 一体化总控台（音频不混合）的共识一致。
+    保留函数仅为旧引用兼容，直接原样返回。
     """
-    n = min(int(anchor_wav.shape[-1]), int(wav.shape[-1]))
-    if n < 2:
-        return wav
-    w = torch.linspace(0.0, 1.0, n, device=wav.device, dtype=wav.dtype)
-    w = w * w * (3.0 - 2.0 * w)
-    a = anchor_wav[..., :n].to(device=wav.device, dtype=wav.dtype)
-    out = wav.clone()
-    out[..., :n] = a * (1.0 - w) + out[..., :n] * w
-    return out
+    return wav
 
 
 def seam_metrics(prev_frame, head_frame, prev_wav=None, head_wav=None, rate=44100, tail_s=0.25):
