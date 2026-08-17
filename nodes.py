@@ -466,14 +466,21 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         first_frame=首帧图片 if i == 0 else None)
 
                 cond, latent = out[0], out[1]
+                neg = negative
                 if guide is not None:
-                    cond = cls._apply_guide(
-                        cond, guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]))
+                    fc = latent_t_to_frames(latent["samples"].tensors[0].shape[2])
+                    cond = cls._apply_guide(cond, guide, fc)
+                    # keyframe 带 audio_latent 时，PackedLayout 会声明 cond_audio 段；
+                    # positive/negative 的 layout signature 不含 keyframes，会被复用，
+                    # 故 negative 必须注入同样的 keyframe，否则 cond_audio_latents 为空、
+                    # audio_embed 行数不足导致形状错位（ComfyUI 0.33+ H3 PackedLayout）
+                    if "audio_latent" in guide:
+                        neg = cls._apply_guide(neg, guide, fc)
 
                 t0 = time.perf_counter()
                 sampled = nodes.common_ksampler(
                     模型, cur_seed, 步数, CFG,
-                    采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
+                    采样器, 调度器, cond, neg, latent, denoise=1.0)[0]
                 dt = time.perf_counter() - t0
                 video_t, audio_t = sampled["samples"].unbind()
                 # 维持不变量 seeds[g] = 该段种子（段文件缺失导致 done 回退时，
