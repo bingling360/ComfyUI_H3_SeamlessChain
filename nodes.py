@@ -477,10 +477,30 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     if "audio_latent" in guide:
                         neg = cls._apply_guide(neg, guide, fc)
 
+                # === DEBUG: 临时排查 cond_audio_latents 为何为空 ===
+                _orig_forward = 模型.model.diffusion_model.forward
+                def _debug_forward(x, timestep, context, transformer_options={}, **kw):
+                    payload = kw.get("minimax_payload")
+                    if payload is not None:
+                        pv = payload.value if hasattr(payload, "value") else payload
+                        kfs = pv.get("keyframes")
+                        cal = pv.get("cond_audio_latents")
+                        cvl = pv.get("cond_video_latents")
+                        lay = pv.get("layout")
+                        print(f"[H3-DEBUG] keyframes={'有' if kfs else '无'} "
+                              f"kf_keys={[list(k.keys()) for k in kfs] if kfs else '-'} "
+                              f"cond_audio_latents={len(cal) if cal else 0} "
+                              f"cond_video_latents={len(cvl) if cvl else 0} "
+                              f"layout={'有' if lay else '无'}")
+                    return _orig_forward(x, timestep, context, transformer_options, **kw)
+                模型.model.diffusion_model.forward = _debug_forward
+                # === DEBUG END ===
+
                 t0 = time.perf_counter()
                 sampled = nodes.common_ksampler(
                     模型, cur_seed, 步数, CFG,
                     采样器, 调度器, cond, neg, latent, denoise=1.0)[0]
+                模型.model.diffusion_model.forward = _orig_forward  # 还原
                 dt = time.perf_counter() - t0
                 video_t, audio_t = sampled["samples"].unbind()
                 # 维持不变量 seeds[g] = 该段种子（段文件缺失导致 done 回退时，
