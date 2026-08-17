@@ -526,7 +526,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 原生支持 cond 噪声增强（extra_conds 从 cond dict 任意键取参），
                     # aug=1.0 即不加噪；值越小锚定越「软」，缓解段首刹车/内容重演
                     if aug > 0.0:
-                        cond = cls._apply_anchor_noise(cond, aug)
+                        cond = _apply_anchor_noise(cond, aug)
 
                 # 共存 H3 插件可能丢 keyframe/refs 音频导致 cond_audio 行数错位，
                 # 采样期挂模型层兜底（见 cond_audio_rows_guard），完成后恢复
