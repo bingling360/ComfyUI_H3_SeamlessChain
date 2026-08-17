@@ -1,16 +1,26 @@
 import traceback
 
-WEB_DIRECTORY = "./web"  # 审片面板（h3chain_panel.js）随插件分发，走 ComfyUI 自带 /extensions 加载
+WEB_DIRECTORY = "./web"  # 控制台/成片画廊 JS（h3chain_console.js / h3chain_saver.js）随插件分发
 
 try:
     from comfy_api.latest import ComfyExtension
 
     from .nodes import H3SeamlessChainSampler
     from .storyboard import H3StoryboardChain
+    from .console import H3ChainConsole
+    from .saver import H3ChainSaver
 
     class H3SeamlessChainExtension(ComfyExtension):
         async def get_node_list(self):
-            return [H3SeamlessChainSampler, H3StoryboardChain]
+            return [H3SeamlessChainSampler, H3StoryboardChain, H3ChainConsole, H3ChainSaver]
+
+        async def add_routes(self, routes):
+            try:
+                from .routes import add_routes
+                add_routes(routes)
+            except Exception:
+                print("[ComfyUI_H3_SeamlessChain] 路由注册失败（控制台降级：手输存档名 + 单链浏览）。详细错误：")
+                traceback.print_exc()
 
     async def comfy_entrypoint() -> H3SeamlessChainExtension:
         return H3SeamlessChainExtension()
