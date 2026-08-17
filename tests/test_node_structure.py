@@ -149,16 +149,18 @@ def test_structure():
     ids = [inp.id for inp in schema.inputs]
     for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽度", "高度",
                 "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
-                "断点续拍", "断点目录", "桥帧门控", "清晰度阈值", "回退上限",
+                "自动存档", "存档目录", "桥帧门控", "清晰度阈值", "回退上限",
                 "接缝混合", "混合帧数",
                 "审片模式", "重跑起始段",
                 "首帧图片", "起始视频", "起始视频音轨",
-                "提示词组", "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
+                "提示词组", "提示词清单",
+                "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
         assert key in ids, f"missing input: {key}"
     by_id = {inp.id: inp for inp in schema.inputs}
     assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
     assert by_id["种子"].kwargs.get("control_after_generate") is True
-    assert by_id["断点续拍"].kwargs.get("options") == ["关闭", "自动续跑"]
+    assert by_id["自动存档"].kwargs.get("options") == ["关闭", "自动存档"]
+    assert by_id["提示词清单"].kwargs.get("force_input") is True
     assert by_id["桥帧门控"].kwargs.get("options") == ["关闭", "标注", "自动回退"]
     assert by_id["接缝混合"].kwargs.get("options") == ["关闭", "smoothstep"]
     assert by_id["接缝混合"].kwargs.get("default") == "smoothstep"
@@ -242,8 +244,9 @@ def test_is_changed():
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
     cls = plugin_nodes.H3SeamlessChainSampler
     assert math.isnan(cls.IS_CHANGED(审片模式="逐段确认"))         # 审片激活 -> 强制执行
-    assert math.isnan(cls.IS_CHANGED(断点续拍="自动续跑"))         # 断点激活 -> 强制执行
-    assert cls.IS_CHANGED(审片模式="关闭", 断点续拍="关闭") == ""  # 默认 -> 可缓存
+    assert math.isnan(cls.IS_CHANGED(自动存档="自动存档"))         # 存档激活 -> 强制执行
+    assert math.isnan(cls.IS_CHANGED(自动存档="自动续跑"))         # 旧工作流遗留值仍激活
+    assert cls.IS_CHANGED(审片模式="关闭", 自动存档="关闭") == ""  # 默认 -> 可缓存
     assert cls.IS_CHANGED() == ""                                  # 无参调用兜底
     print("PASS test_is_changed")
 
