@@ -189,6 +189,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                tooltip="桥帧总分阈值，低于判定为坏尾。建议先跑「标注」档看报告里的分数分布再定"),
                 io.Int.Input("回退上限", default=34, min=0, max=68, step=17,
                              tooltip="自动回退最多向前多少帧（17 的倍数，踩 17k+5 网格）"),
+                io.Combo.Input("接缝混合", options=["关闭", "smoothstep"], default="smoothstep",
+                               tooltip="拼接点像素级兜底（一体化总控台同款机制）：上一段最后可见帧硬锁为本段首帧"
+                                       "（逐像素一致），smoothstep 权重窗把本段前「混合帧数」帧的偏差平滑吸收，"
+                                       "音频同步从上一段尾音渐入。仅作用于生成段头部；插入段/序章完整保留。"
+                                       "报告中的接缝帧差仍为混合前的模型偏差（诊断用）"),
+                io.Int.Input("混合帧数", default=6, min=1, max=24,
+                             tooltip="smoothstep 混合窗帧数，两端权重导数为 0、中段过渡。"
+                                     "运动越快窗应越短（6帧≈0.25s）；主体位移差大时长窗会拉长叠影"),
                 io.Combo.Input("审片模式", options=["关闭", "逐段确认"], default="关闭",
                                tooltip="逐段确认：每次运行只生成一个新的段落即返回，预览「分段图像」后重新运行继续下一段；"
                                        "不满意可改该段提示词（自动从该段重跑）或设「重跑起始段」重摇。开启后断点自动启用"),
@@ -246,6 +254,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 提示词组=None,
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
                 断点续拍="关闭", 断点目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
+                接缝混合="smoothstep", 混合帧数=6,
                 审片模式="关闭", 重跑起始段=0):
         prompts = _autogrow_items(提示词组, "p")
         seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
@@ -519,6 +528,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 seams.append([round(d, 4), None if db is None else round(db, 2)])
             else:
                 seams.append(None)
+
+            # 接缝像素级兜底（生成后、拼接前）：锚帧硬锁 + smoothstep 窗吸收。
+            # 与生成前 latent 引导互补——引导管"画得像"，混合管"拼得上"；
+            # 纯像素后处理，不进断点指纹（改此参数不触发重跑，replay 段结果仍一致）
+            if 接缝混合 != "关闭" and (i > 0 or off) and prev_tail_frame is not None:
+                span = min(max(1, int(混合帧数)), frames.shape[0])
+                frames = qc.smoothstep_blend_head(frames, prev_tail_frame, span)
+                if prev_tail_wav is not None:
+                    wav = qc.smoothstep_fade_head(wav, prev_tail_wav)
+                report.append(f"段{g + 1} 接缝平滑：首帧硬锁锚帧 + smoothstep {span} 帧过渡（音频同步渐入）")
 
             all_frames.append(frames.cpu())
             seg_frames.append(frames.cpu())

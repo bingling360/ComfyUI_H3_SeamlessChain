@@ -56,6 +56,46 @@ def pick_backtrack(score, limit: int, threshold: float):
     return 0, tail
 
 
+def smoothstep_blend_head(frames, anchor_frame, span):
+    """接缝像素级兜底：锚帧硬锁为新段首帧 + smoothstep 窗吸收前 span 帧偏差。
+
+    与 LtoJ_H3ContinuityOpeningLock（一体化总控台 3.2）同算法：
+    w(t) = t²(3−2t)，两端导数为 0（无可见速度突变）；输出第 0 帧与锚帧
+    逐像素一致。frames: [F,H,W,C] 0-1（任意设备）；anchor_frame: [H,W,C]。
+    """
+    out = frames.clone()
+    anchor = anchor_frame.to(device=out.device, dtype=out.dtype)[None]
+    if anchor.shape[-1] != out.shape[-1]:
+        anchor = anchor[..., : out.shape[-1]]
+    n = min(max(1, int(span)), out.shape[0])
+    if n == 1:
+        out[0:1] = anchor
+        return out.clamp(0.0, 1.0)
+    w = torch.linspace(0.0, 1.0, n, device=out.device, dtype=out.dtype)
+    # linspace 端点精确落在 0/1，故 w(0)=0、w(n-1)=1；reshape 后广播一次混合
+    w = (w * w * (3.0 - 2.0 * w)).view(n, 1, 1, 1)
+    out[:n] = anchor * (1.0 - w) + out[:n] * w
+    out[0:1] = anchor                              # 浮点路径防御：无条件逐像素硬锁
+    return out.clamp(0.0, 1.0)
+
+
+def smoothstep_fade_head(wav, anchor_wav):
+    """接缝音频兜底：新段头部从上一段尾音 smoothstep 渐入本段声音。
+
+    与视频首帧混合同构（缝点连续、窗口内平滑接管、时长不变）：
+    wav: [C,T]（任意设备）；anchor_wav: [C,n] 上一段最后约 0.25s 可见音频。
+    """
+    n = min(int(anchor_wav.shape[-1]), int(wav.shape[-1]))
+    if n < 2:
+        return wav
+    w = torch.linspace(0.0, 1.0, n, device=wav.device, dtype=wav.dtype)
+    w = w * w * (3.0 - 2.0 * w)
+    a = anchor_wav[..., :n].to(device=wav.device, dtype=wav.dtype)
+    out = wav.clone()
+    out[..., :n] = a * (1.0 - w) + out[..., :n] * w
+    return out
+
+
 def seam_metrics(prev_frame, head_frame, prev_wav=None, head_wav=None, rate=44100, tail_s=0.25):
     """接缝后验测量（测而不干预）：上一段最后可见帧 vs 本段首帧。
 

@@ -150,6 +150,7 @@ def test_structure():
     for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽度", "高度",
                 "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
                 "断点续拍", "断点目录", "桥帧门控", "清晰度阈值", "回退上限",
+                "接缝混合", "混合帧数",
                 "审片模式", "重跑起始段",
                 "首帧图片", "起始视频", "起始视频音轨",
                 "提示词组", "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
@@ -159,6 +160,10 @@ def test_structure():
     assert by_id["种子"].kwargs.get("control_after_generate") is True
     assert by_id["断点续拍"].kwargs.get("options") == ["关闭", "自动续跑"]
     assert by_id["桥帧门控"].kwargs.get("options") == ["关闭", "标注", "自动回退"]
+    assert by_id["接缝混合"].kwargs.get("options") == ["关闭", "smoothstep"]
+    assert by_id["接缝混合"].kwargs.get("default") == "smoothstep"
+    assert by_id["混合帧数"].kwargs.get("default") == 6
+    assert by_id["混合帧数"].kwargs.get("min") == 1 and by_id["混合帧数"].kwargs.get("max") == 24
     assert by_id["审片模式"].kwargs.get("options") == ["关闭", "逐段确认"]
     assert by_id["审片模式"].kwargs.get("default") == "关闭"
     assert by_id["重跑起始段"].kwargs.get("default") == 0
