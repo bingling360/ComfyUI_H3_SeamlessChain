@@ -430,7 +430,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             prev_tail_frame = pframes[-1].cpu()
             seam_n0 = max(1, int(sample_rate * 0.25))
             prev_tail_wav = pwav.cpu()[..., -seam_n0:]
-            guide = _tail_keyframe(pv, pa, ctx, False,  # ComfyUI 0.33+ H3 模型音频 token 计算变更，keyframe 带音频会形状错位；音频接缝改由 smoothstep_fade_head 兜底
+            guide = _tail_keyframe(pv, pa, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
                                    full_bridge=full_bridge)
             report.append(f"段1/{total}：{prologue_origin} 序章 留{pframes.shape[0]}帧 · 种子 — | guide=无（序章）")
 
@@ -566,7 +566,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
             if i + 1 < len(seg_prompts):
                 back = length - vis_len
-                guide = _tail_keyframe(video_t, audio_t, ctx, False,  # 同上：ComfyUI 0.33+ 关闭 keyframe 音频
+                guide = _tail_keyframe(video_t, audio_t, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
                                        back_tokens=back // 17 * 5,
                                        back_audio=round(back * 5.0 / 3.0),
                                        full_bridge=full_bridge)
