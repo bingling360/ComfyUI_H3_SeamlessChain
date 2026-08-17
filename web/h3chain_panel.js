@@ -4,9 +4,14 @@
  * 数据全部来自断点目录（output/checkpoints/<链>/）：
  *   - checkpoints/h3chain_state.json ：当前链指针 + 上次报告
  *   - <链>/manifest.json             ：逐段种子/哈希/接缝/桥分/缩略图/提示词
+ *   - <链>/keyframes/kf_NNN.png      ：分镜链关键帧副本（时间线显示）
  * 经 ComfyUI 自带 /api/view 端点读取，零自建路由、零外部依赖。
  *
- * 面板操作（改的是画布上 H3SeamlessChainSampler 节点的控件，然后排队运行）：
+ * 续拍链（H3SeamlessChainSampler）与分镜链（H3StoryboardChain）共用本面板：
+ * 分镜链（manifest.params.mode === "storyboard"）额外渲染关键帧时间线，
+ * 段卡片显示「转场帧差 / 尾锚达成度」替代「接缝 / 桥分」。
+ *
+ * 面板操作（改的是画布上链节点的控件，然后排队运行）：
  *   ▶ 继续下一段：直接 Queue（断点自动续接）
  *   🎲 重摇此段：设「重跑起始段」=该段 + 随机种子 → Queue；运行成功后自动复位为 0
  *   ✏ 改词重跑：面板内编辑该段提示词，写回图上提示词输入 → Queue（哈希变化自动从该段重做）
@@ -14,7 +19,7 @@
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
-const NODE_TYPE = "H3SeamlessChainSampler";
+const NODE_TYPES = ["H3SeamlessChainSampler", "H3StoryboardChain"];
 const W_REROLL = "重跑起始段";
 const W_SEED = "种子";
 const W_DIR = "断点目录";
@@ -49,7 +54,11 @@ function escapeHtml(s) {
 
 function findNode() {
     const nodes = app.graph?._nodes || [];
-    return nodes.find((n) => n.type === NODE_TYPE) || null;
+    for (const t of NODE_TYPES) {
+        const n = nodes.find((n) => n.type === t);
+        if (n) return n;
+    }
+    return null;
 }
 
 function setWidgetValue(node, name, value) {
@@ -116,21 +125,70 @@ function badge(text, cls) {
 function statusLine(state, mf) {
     const done = state.done ?? (mf?.done ?? 0);
     const total = state.total ?? (mf?.total ?? 0);
+    const storyboard = mf?.params?.mode === "storyboard";
     if (!total) return "尚未运行：先在画布上排队一次工作流";
     if (done >= total) return `本链已全部完成（${total}/${total} 段）✓`;
+    if (storyboard) {
+        return `已载入段 1–${done}（断点回放）→ 本次将生成段 ${done + 1}（kf${done + 1} → kf${done + 2}，首尾双向锚定）`;
+    }
     const anchored = done > 0 ? `，锚定段 ${done} 尾部` : "";
     return `已载入段 1–${done}（断点回放）→ 本次将生成段 ${done + 1}${anchored}`;
+}
+
+function showLightbox(src) {
+    const ov = el("div", "h3c-dialog-overlay");
+    const img = document.createElement("img");
+    img.className = "h3c-lightbox";
+    img.src = src;
+    ov.append(img);
+    ov.onclick = () => ov.remove();
+    document.body.append(ov);
+}
+
+/** 分镜链关键帧时间线：kf1 →段1→ kf2 →段2→ kf3（点击放大；段标记绿色=已完成）。 */
+function renderKeyframeStrip(state, mf) {
+    if (mf?.params?.mode !== "storyboard") return null;
+    const total = mf?.total ?? 0;
+    const done = mf?.done ?? 0;
+    const count = (mf?.kf_hashes && mf.kf_hashes.length) || total + 1;
+    if (count < 2) return null;
+    const strip = el("div", "h3c-kfs");
+    for (let i = 0; i < count; i++) {
+        const cell = el("div", "h3c-kf");
+        const img = document.createElement("img");
+        img.loading = "lazy";
+        img.src = viewUrl(`${state.dir}/keyframes`, `kf_${String(i).padStart(3, "0")}.png`);
+        img.title = `关键帧 ${i + 1}（段 ${i} 首帧 / 段 ${i + 1} 尾锚）——在画布上换图后相邻段自动重跑`;
+        img.onclick = () => showLightbox(img.src);
+        img.onerror = () => {
+            img.replaceWith(el("div", "h3c-kf-empty", `kf${i + 1}`));
+        };
+        cell.append(img, el("div", "h3c-kf-n", `kf${i + 1}`));
+        strip.append(cell);
+        if (i + 1 < count) {
+            const segDone = i < done;
+            const link = el("div", "h3c-kf-seg" + (segDone ? " h3c-kf-seg-done" : ""), `段${i + 1}`);
+            link.title = segDone ? "已完成" : "待生成";
+            strip.append(link);
+        }
+    }
+    const wrap = el("div", "h3c-kfs-wrap");
+    wrap.append(el("div", "h3c-kfs-title", "关键帧时间线"), strip);
+    return wrap;
 }
 
 function renderCards(state, mf) {
     const total = state.total ?? (mf?.total ?? 0);
     const done = state.done ?? (mf?.done ?? 0);
     const hasPrologue = !!(mf?.has_prologue);
+    const storyboard = mf?.params?.mode === "storyboard";
+    const seamLabel = storyboard ? "转场" : "接缝";
     const thumbs = mf?.thumbs || [];
     const vids = mf?.videos || [];
     const seeds = mf?.seeds || [];
     const seams = mf?.seams || [];
     const bridges = mf?.bridge_scores || [];
+    const anchors = mf?.anchors || [];
     const prompts = mf?.prompts || [];
     const wrap = el("div", "h3c-cards");
     for (let idx = 0; idx < total; idx++) {
@@ -151,9 +209,10 @@ function renderCards(state, mf) {
         const stateBadge = !isDone ? badge("待生成", "h3c-b-todo")
             : isPrologue ? badge("序章（上传）", "h3c-b-pro") : badge("已完成", "h3c-b-ok");
         const seedTxt = isDone && seeds[idx] != null ? `种子 ${seeds[idx]}` : "";
-        const seamTxt = isDone && seams[idx] ? `接缝 ${seams[idx][0]}${seams[idx][1] == null ? "" : ` / ${seams[idx][1]}dB`}` : "";
+        const seamTxt = isDone && seams[idx] ? `${seamLabel} ${seams[idx][0]}${seams[idx][1] == null ? "" : ` / ${seams[idx][1]}dB`}` : "";
         const bridgeTxt = isDone && bridges[idx] != null ? `桥分 ${bridges[idx]}` : "";
-        const meta = [seedTxt, seamTxt, bridgeTxt].filter(Boolean).join(" · ");
+        const anchorTxt = isDone && anchors[idx] != null ? `尾锚 ${anchors[idx]}` : "";
+        const meta = [seedTxt, seamTxt, bridgeTxt, anchorTxt].filter(Boolean).join(" · ");
         const promptTxt = escapeHtml((prompts[idx] || "").slice(0, 60)) + ((prompts[idx] || "").length > 60 ? "…" : "");
         card.innerHTML = `
             <div class="h3c-thumb">${media}</div>
@@ -185,7 +244,7 @@ function renderCards(state, mf) {
 
 function doReroll(segNo) {
     const node = findNode();
-    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    if (!node) { alert("画布上未找到 H3 Seamless Chain / H3 Storyboard Chain 节点"); return; }
     const okReroll = setWidgetValue(node, W_REROLL, segNo);
     setWidgetValue(node, W_SEED, Math.floor(Math.random() * 2 ** 48));
     pendingReset = okReroll;
@@ -195,7 +254,7 @@ function doReroll(segNo) {
 
 function newProject() {
     const node = findNode();
-    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    if (!node) { alert("画布上未找到 H3 Seamless Chain / H3 Storyboard Chain 节点"); return; }
     const t = new Date();
     const pad = (x) => String(x).padStart(2, "0");
     const def = `h3chain_${t.getFullYear()}${pad(t.getMonth() + 1)}${pad(t.getDate())}_${pad(t.getHours())}${pad(t.getMinutes())}${pad(t.getSeconds())}`;
@@ -246,7 +305,7 @@ function promptDialog({ title, label, default: def, confirmText = "确定", onCo
 
 function openEditor(card, genIdx, text) {
     const node = findNode();
-    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    if (!node) { alert("画布上未找到 H3 Seamless Chain / H3 Storyboard Chain 节点"); return; }
     if (card.querySelector(".h3c-editor")) return;
     const editor = el("div", "h3c-editor");
     const ta = document.createElement("textarea");
@@ -291,7 +350,8 @@ function render(state, mf) {
     }
     const head = el("div", "h3c-head");
     const p = mf?.params || {};
-    const paramsTxt = [p.width && `${p.width}×${p.height}`, p.length && `${p.length}f/段`, p.ctx && `引导${p.ctx}帧`]
+    const paramsTxt = [p.mode === "storyboard" && "分镜模式",
+                       p.width && `${p.width}×${p.height}`, p.length && `${p.length}f/段`, p.ctx && `引导${p.ctx}帧`]
         .filter(Boolean).join(" · ");
     head.innerHTML = `
         <div class="h3c-chain">${escapeHtml(state.dir)}</div>
@@ -301,6 +361,9 @@ function render(state, mf) {
         </div>
         <div class="h3c-status">${escapeHtml(statusLine(state, mf))}</div>`;
     container.append(head);
+
+    const kfs = renderKeyframeStrip(state, mf);
+    if (kfs) container.append(kfs);
 
     const done = state.done ?? (mf?.done ?? 0);
     const total = state.total ?? (mf?.total ?? 0);
@@ -369,6 +432,16 @@ const CSS = `
 .h3c-editor { display:flex; flex-direction:column; gap:5px; margin-top:4px; }
 .h3c-editor textarea { width:100%; box-sizing:border-box; font:inherit; border-radius:6px; border:1px solid rgba(128,128,128,.4); background:rgba(0,0,0,.35); color:inherit; padding:5px; resize:vertical; }
 .h3c-editor-row { display:flex; gap:6px; }
+.h3c-kfs-wrap { display:flex; flex-direction:column; gap:4px; }
+.h3c-kfs-title { font-size:11px; opacity:.7; }
+.h3c-kfs { display:flex; align-items:center; gap:3px; overflow-x:auto; padding:6px; border-radius:8px; background:rgba(0,0,0,.25); }
+.h3c-kf { display:flex; flex-direction:column; align-items:center; gap:2px; flex-shrink:0; }
+.h3c-kf img { width:72px; aspect-ratio:16/9; object-fit:cover; border-radius:4px; cursor:zoom-in; border:1px solid rgba(128,128,128,.35); display:block; }
+.h3c-kf-empty { width:72px; aspect-ratio:16/9; border-radius:4px; border:1px dashed rgba(128,128,128,.4); display:flex; align-items:center; justify-content:center; font-size:10px; opacity:.55; }
+.h3c-kf-n { font-size:10px; opacity:.75; }
+.h3c-kf-seg { font-size:10px; opacity:.55; white-space:nowrap; padding:0 2px; flex-shrink:0; }
+.h3c-kf-seg-done { color:#7fd699; opacity:1; }
+.h3c-lightbox { max-width:92vw; max-height:88vh; border-radius:8px; }
 .h3c-report summary { cursor:pointer; opacity:.85; }
 .h3c-report pre { white-space:pre-wrap; font-size:11px; max-height:280px; overflow:auto; opacity:.85; }
 .h3c-foot { opacity:.55; font-size:10px; word-break:break-all; }
@@ -425,7 +498,7 @@ app.registerExtension({
                 // docs.comfy.org → 侧边栏标签页；传 SVG 源码不会渲染
                 icon: "pi pi-video",
                 title: "长片审片",
-                tooltip: "H3 Seamless Chain：逐段播放分段视频，一键继续 / 重摇 / 改词重跑",
+                tooltip: "H3 Seamless Chain / Storyboard Chain：逐段播放分段视频，一键继续 / 重摇 / 改词重跑",
                 type: "custom",
                 render: (elTarget) => mount(elTarget),
             });

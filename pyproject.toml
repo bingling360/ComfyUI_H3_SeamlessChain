@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI_H3_SeamlessChain"
-description = "MiniMax H3 多段视频段间引导（无缝续拍）单节点：上段尾帧 latent 直切钉入下段，官方原生协议，零 monkey-patch，零额外依赖。"
-version = "0.1.0"
+description = "MiniMax H3 长视频双节点：段间引导无缝续拍（上段尾帧 latent 直切钉入下段）+ 分镜模式（关键帧首尾双向锚定，误差不沿链传播），官方原生协议，零 monkey-patch，零额外依赖。"
+version = "0.2.0"
 license = { text = "Apache-2.0" }
 dependencies = []
 

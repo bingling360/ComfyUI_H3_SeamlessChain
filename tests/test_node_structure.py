@@ -221,6 +221,22 @@ def test_bridge_fallback_probe():
     print("PASS test_bridge_fallback_probe")
 
 
+def test_anchor_noise():
+    from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
+    cls = plugin_nodes.H3SeamlessChainSampler
+    cond = ("t", {"k": 1})
+    out0 = plugin_nodes._apply_anchor_noise(cond, 0.0)
+    assert out0[1] == {"k": 1}                          # 0 = 关闭，cond 原样
+    out = plugin_nodes._apply_anchor_noise(cond, 0.2)
+    assert out[1]["minimax_visual_cond_noise_aug"] == 0.8   # SkyReels 同值
+    assert out[1]["minimax_audio_cond_noise_aug"] == 0.9    # 音频加噪减半
+    assert out[1]["k"] == 1                                 # 原键保留
+    schema = cls.define_schema()
+    aug_input = {inp.id: inp for inp in schema.inputs}["锚定加噪"]
+    assert aug_input.kwargs.get("default") == 0.0 and aug_input.kwargs.get("max") == 0.5
+    print("PASS test_anchor_noise")
+
+
 def test_is_changed():
     import math
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
@@ -293,6 +309,7 @@ if __name__ == "__main__":
     test_structure()
     test_capability_probe()
     test_bridge_fallback_probe()
+    test_anchor_noise()
     test_is_changed()
     test_tail_keyframe_slices()
     test_run_validation()

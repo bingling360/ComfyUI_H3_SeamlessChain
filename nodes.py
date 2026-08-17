@@ -51,6 +51,34 @@ except Exception:
 _full_bridge_cache = None
 
 
+def cond_audio_rows_guard(dit):
+    """安装 _cond_audio_rows 兜底 patch，返回恢复函数（try/finally 调用）。
+
+    ComfyUI 0.33+ 的 PackedLayout 按 keyframe 的 audio_latent 声明 cond_audio
+    段；共存 H3 插件（如 H3-Motion-Context 的 keyframe/ref 共存 patch）会
+    重建 payload 并丢弃 keyframe 音频，导致 audio_embed 行数不足形状错位。
+    行数与 keyframes+refs 声明不符时用 payload 里完好的素材在线重建
+    （layout 段顺序：kf 音频在前、refs 音频在后）。续拍/分镜两节点共用。
+    """
+    orig = dit._cond_audio_rows
+
+    def fixed(payload, device, _orig=orig):
+        rows = _orig(payload, device)
+        want = [z for z in (kf.get("audio_latent")
+                            for kf in (payload.get("keyframes") or [])) if z is not None]
+        want += [z for z in (r.get("audio_latent")
+                             for r in (payload.get("refs") or [])) if z is not None]
+        expected = sum(int(z.shape[-1]) * 2 for z in want)
+        if want and (0 if rows is None else int(rows.shape[0])) != expected:
+            rows = _orig({"cond_audio_latents": want,
+                          "audio_cond_noise_aug": payload.get("audio_cond_noise_aug"),
+                          "seed": payload.get("seed")}, device)
+        return rows
+
+    dit._cond_audio_rows = fixed
+    return lambda: setattr(dit, "_cond_audio_rows", orig)
+
+
 def full_bridge_supported():
     """多 token keyframe 探测（进程内缓存一次）。
 
@@ -75,6 +103,21 @@ def full_bridge_supported():
             ok = False
     _full_bridge_cache = ok
     return ok
+
+
+def _apply_anchor_noise(cond, aug):
+    """锚定加噪：写入 H3 cond 噪声增强 kwargs（模型侧 aug<1 时按比例混噪）。
+
+    SkyReels-V2 addnoise_condition 思路：干净锚定帧让模型逐帧复现（段首刹车/
+    内容重演），加噪后锚定退化为软参考。音频加噪减半（音频桥窗口短，过噪伤听感）。
+    续拍（桥锚定）与分镜（首尾帧锚定）两节点共用。
+    """
+    if aug <= 0.0:
+        return cond
+    return node_helpers.conditioning_set_values(cond, {
+        "minimax_visual_cond_noise_aug": round(1.0 - aug, 4),
+        "minimax_audio_cond_noise_aug": round(1.0 - aug * 0.5, 4),
+    })
 
 
 def _decode_audio(audio_vae, audio_latent):
@@ -198,6 +241,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Int.Input("混合帧数", default=6, min=1, max=24,
                              tooltip="smoothstep 混合窗帧数，两端权重导数为 0、中段过渡。"
                                      "运动越快窗应越短（6帧≈0.25s）；主体位移差大时长窗会拉长叠影"),
+                io.Float.Input("锚定加噪", default=0.0, min=0.0, max=0.5, step=0.05,
+                               tooltip="对桥锚定帧注入噪声的比例（SkyReels-V2 addnoise_condition 思路）："
+                                       "干净锚定帧会让模型起步「刹车」并在可见部分重演锚定内容；加噪让模型"
+                                       "把锚定当「参考」而非「必须逐帧复现」。0=关闭（默认，保持现状）；"
+                                       "0.1 微调；0.2 标准（SkyReels 同值）；0.3+ 干预强但画面细节会变软。"
+                                       "仅影响带引导桥的段；不进断点指纹，改参数不触发重跑"),
                 io.Combo.Input("审片模式", options=["关闭", "逐段确认"], default="关闭",
                                tooltip="逐段确认：每次运行只生成一个新的段落即返回，预览「分段图像」后重新运行继续下一段；"
                                        "不满意可改该段提示词（自动从该段重跑）或设「重跑起始段」重摇。开启后断点自动启用"),
@@ -255,7 +304,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 提示词组=None,
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
                 断点续拍="关闭", 断点目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
-                接缝混合="smoothstep", 混合帧数=6,
+                接缝混合="smoothstep", 混合帧数=6, 锚定加噪=0.0,
                 审片模式="关闭", 重跑起始段=0):
         prompts = _autogrow_items(提示词组, "p")
         seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
@@ -299,6 +348,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if not full_bridge:
             report.append("注意：当前 ComfyUI 的 keyframe 协议仅支持单帧锚定，段间引导已自动降级为单帧桥，"
                           "接缝质量受限；升级 ComfyUI 后无需改参数即自动恢复完整引导帧数")
+        aug = min(max(float(锚定加噪), 0.0), 0.5)
+        if aug > 0.0:
+            report.append(f"锚定加噪 {aug:.2f}：桥锚定帧按参考而非逐帧复现注入（视觉 {1.0 - aug:.2f} / 音频 {1.0 - aug * 0.5:.2f} 保真）")
 
         # 断点指纹只覆盖共享参数（不含提示词、不含种子）：改某段提示词仍指向同一条链，
         # 重跑起点由逐段提示词哈希比对定位；种子控件开着 control_after_generate 每次运行
@@ -470,34 +522,22 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if guide is not None:
                     cond = cls._apply_guide(
                         cond, guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]))
+                    # 锚定加噪（SkyReels-V2 addnoise_condition 思路）：H3 模型 payload
+                    # 原生支持 cond 噪声增强（extra_conds 从 cond dict 任意键取参），
+                    # aug=1.0 即不加噪；值越小锚定越「软」，缓解段首刹车/内容重演
+                    if aug > 0.0:
+                        cond = cls._apply_anchor_noise(cond, aug)
 
-                # ComfyUI 0.33+ 的 PackedLayout 按 keyframe 的 audio_latent 声明 cond_audio
-                # 段；共存 H3 插件（如 H3-Motion-Context 的 keyframe/ref 共存 patch）会
-                # 重建 payload 并丢弃 keyframe 音频，导致 audio_embed 行数不足形状错位。
-                # 这里在模型层兜底：行数与 keyframes+refs 声明不符时用 payload 里完好的
-                # keyframes/refs 在线重建（layout 段顺序：kf 音频在前、refs 音频在后）。
-                dit = 模型.model.diffusion_model
-                orig_car = dit._cond_audio_rows
-
-                def cond_audio_rows_fix(payload, device, _orig=orig_car):
-                    rows = _orig(payload, device)
-                    want = [z for z in (kf.get("audio_latent")
-                                        for kf in (payload.get("keyframes") or [])) if z is not None]
-                    want += [z for z in (r.get("audio_latent")
-                                         for r in (payload.get("refs") or [])) if z is not None]
-                    expected = sum(int(z.shape[-1]) * 2 for z in want)
-                    if want and (0 if rows is None else int(rows.shape[0])) != expected:
-                        rows = _orig({"cond_audio_latents": want,
-                                      "audio_cond_noise_aug": payload.get("audio_cond_noise_aug"),
-                                      "seed": payload.get("seed")}, device)
-                    return rows
-
-                dit._cond_audio_rows = cond_audio_rows_fix
-                t0 = time.perf_counter()
-                sampled = nodes.common_ksampler(
-                    模型, cur_seed, 步数, CFG,
-                    采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
-                dit._cond_audio_rows = orig_car
+                # 共存 H3 插件可能丢 keyframe/refs 音频导致 cond_audio 行数错位，
+                # 采样期挂模型层兜底（见 cond_audio_rows_guard），完成后恢复
+                restore_audio_rows = cond_audio_rows_guard(模型.model.diffusion_model)
+                try:
+                    t0 = time.perf_counter()
+                    sampled = nodes.common_ksampler(
+                        模型, cur_seed, 步数, CFG,
+                        采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
+                finally:
+                    restore_audio_rows()
                 dt = time.perf_counter() - t0
                 video_t, audio_t = sampled["samples"].unbind()
                 # 维持不变量 seeds[g] = 该段种子（段文件缺失导致 done 回退时，
@@ -636,6 +676,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                    "report": "\n".join(report), "updated_at": time.time()})
 
         images = torch.cat(all_frames, dim=0)
+        # 链路总结：接缝指标一览（seams[i] = [帧差, 响度dB] 或 None）
+        measured = [(g, s[0], s[1]) for g, s in enumerate(seams) if s]
+        if measured:
+            avg_d = sum(m[1] for m in measured) / len(measured)
+            worst = max(measured, key=lambda m: m[1])
+            line = f"链路完成：{total} 段 · 接缝平均帧差 {avg_d:.3f} · 最差接缝 段{worst[0] + 1}（{worst[1]:.3f}"
+            if worst[2] is not None:
+                line += f"，{worst[2]:+.1f} dB"
+            report.append(line + "）")
         return io.NodeOutput(
             images,
             {"waveform": all_wav, "sample_rate": sample_rate},

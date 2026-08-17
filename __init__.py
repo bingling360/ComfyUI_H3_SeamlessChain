@@ -6,10 +6,11 @@ try:
     from comfy_api.latest import ComfyExtension
 
     from .nodes import H3SeamlessChainSampler
+    from .storyboard import H3StoryboardChain
 
     class H3SeamlessChainExtension(ComfyExtension):
         async def get_node_list(self):
-            return [H3SeamlessChainSampler]
+            return [H3SeamlessChainSampler, H3StoryboardChain]
 
     async def comfy_entrypoint() -> H3SeamlessChainExtension:
         return H3SeamlessChainExtension()

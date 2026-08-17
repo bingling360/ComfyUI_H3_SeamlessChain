@@ -92,6 +92,30 @@ def smoothstep_fade_head(wav, anchor_wav):
     return wav
 
 
+def loudness_align_head(wav, prev_wav, rate=44100, max_db=6.0, fade_s=1.0):
+    """段首响度对齐：增益匹配上段尾部 RMS（±max_db 钳制），fade_s 内线性渐出回 1。
+
+    分镜段间是镜头切换，画面允许跳变，但响度跳变听感突兀；对齐只作用于段首
+    fade_s 窗（之后恢复段自身动态），且增益不沿链累积（每段独立相对上段计算）。
+    返回 (wav, 实际增益 dB 或 None——上段静音/样本过短时不干预)。
+    """
+    tail = prev_wav[..., -max(1, int(rate * 0.25)):]
+    n = min(tail.shape[-1], wav.shape[-1])
+    if n < 32:
+        return wav, None
+    ra = float(tail[..., :n].pow(2).mean().sqrt())
+    rb = float(wav[..., :n].pow(2).mean().sqrt())
+    if ra < 1e-6 or rb < 1e-6:
+        return wav, None
+    db = max(-max_db, min(max_db, 20.0 * math.log10(ra / rb)))
+    fade = min(wav.shape[-1], max(1, int(rate * fade_s)))
+    ramp = torch.linspace(0.0, 1.0, fade, device=wav.device, dtype=wav.dtype)
+    gain = (10.0 ** (db / 20.0)) * (1.0 - ramp) + ramp
+    out = wav.clone()
+    out[..., :fade] = wav[..., :fade] * gain
+    return out, db
+
+
 def seam_metrics(prev_frame, head_frame, prev_wav=None, head_wav=None, rate=44100, tail_s=0.25):
     """接缝后验测量（测而不干预）：上一段最后可见帧 vs 本段首帧。
 

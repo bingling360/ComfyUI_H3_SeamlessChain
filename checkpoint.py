@@ -34,6 +34,38 @@ def prompt_hash(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8]
 
 
+def image_hash(frame) -> str:
+    """单帧图 [H,W,3] 0-1 tensor -> 8 位十六进制像素哈希（分镜关键帧失效判定用）。
+
+    uint8 量化后哈希：VAE 解码的微小浮点抖动（<1/255）不改变哈希，
+    断点续跑重解码同一 latent 不会误触发重跑。
+    """
+    import torch
+
+    arr = (frame.detach().float().clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8")
+    return hashlib.sha1(arr.tobytes()).hexdigest()[:8]
+
+
+def save_keyframe(root: str, idx: int, frame) -> str:
+    """分镜关键帧原图副本 -> keyframes/kf_NNN.png（长边 512，断点自包含、面板可显示）。"""
+    name = f"kf_{idx:03d}.png"
+    try:
+        from PIL import Image
+
+        arr = (frame.detach().float().clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8")
+        img = Image.fromarray(arr)
+        w, h = img.size
+        scale = 512.0 / max(w, h)
+        if scale < 1.0:
+            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+        kdir = os.path.join(root, "keyframes")
+        os.makedirs(kdir, exist_ok=True)
+        img.save(os.path.join(kdir, name))
+        return name
+    except Exception:
+        return ""
+
+
 def reroll_start(old_hashes: list, new_hashes: list, done: int) -> int:
     """已完成段的提示词哈希 vs 当前提示词哈希 -> 应重做的首段下标。
 
@@ -56,7 +88,8 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
     """
     out = dict(manifest)
     out["done"] = start
-    for key in ("seeds", "trims", "prompt_hashes", "thumbs", "videos", "prompts", "seams", "bridge_scores"):
+    for key in ("seeds", "trims", "prompt_hashes", "thumbs", "videos", "prompts",
+                "seams", "bridge_scores", "anchors"):
         if key in out:
             out[key] = list(out[key])[:start]
     save_manifest(root, out)

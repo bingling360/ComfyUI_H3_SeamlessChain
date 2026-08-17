@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import torch
     from qc import (frame_scores, pick_backtrack, seam_metrics,
-                    smoothstep_blend_head, smoothstep_fade_head)
+                    smoothstep_blend_head, smoothstep_fade_head, loudness_align_head)
 except ImportError:
     torch = None
 
@@ -96,18 +96,36 @@ def test_smoothstep_blend_head():
 def test_smoothstep_fade_head():
     if torch is None:
         return print("SKIP test_smoothstep_fade_head (no torch)")
-    wav = torch.zeros(2, 100)
-    anchor = torch.ones(2, 41)                             # 奇数长 -> 中点 t=0.5 精确
+    # 已弃用（拼接期音频叠加导致双声部重叠）：任何输入都应原样返回、零干预
+    wav = torch.randn(2, 100)
+    anchor = torch.randn(2, 41)
     out = smoothstep_fade_head(wav, anchor)
-    assert out.shape == wav.shape                          # 时长不变
-    assert torch.allclose(out[..., 0], anchor[..., 0], atol=1e-6)  # w(0)=0 -> 锚音
-    assert torch.allclose(out[..., -1], wav[..., -1])      # 窗外原样
-    mid = 1.0 * (1 - 0.5) + 0.0 * 0.5                      # t=0.5：锚1.0 + 本段0
-    assert torch.allclose(out[..., 20], torch.full((2,), mid), atol=1e-6)
-    out_short = smoothstep_fade_head(torch.zeros(1, 10), torch.ones(1, 40))
-    assert out_short.shape[-1] == 10                       # n 取较小者
-    assert torch.allclose(out_short[..., 0], torch.ones(1))  # 首样本=锚首样本
-    assert torch.equal(smoothstep_fade_head(wav, torch.ones(1, 1)), wav)  # n<2 -> 原样
+    assert out.shape == wav.shape
+    assert torch.equal(out, wav)
+    assert torch.equal(smoothstep_fade_head(wav, None), wav)
+
+
+def test_loudness_align_head():
+    if torch is None:
+        return print("SKIP test_loudness_align_head (no torch)")
+    rate, n = 1000, 2000
+    prev = torch.full((1, int(rate * 0.25)), 0.4)          # 上段尾 RMS 0.4
+    quiet = torch.full((1, n), 0.2)                        # 本段 RMS 0.2 -> +6.02dB
+    out, db = loudness_align_head(quiet, prev, rate=rate, fade_s=1.0)
+    assert abs(db - 6.0) < 0.01                            # 钳制在 +6dB
+    assert torch.allclose(out[..., 0], quiet[..., 0] * 10 ** (6.0 / 20.0), rtol=1e-4)
+    assert torch.equal(out[..., -1], quiet[..., -1])       # 渐出末端 gain=1
+    loud = torch.full((1, n), 0.8)                         # 本段 RMS 0.8 -> -6.02dB
+    out2, db2 = loudness_align_head(loud, prev, rate=rate, fade_s=1.0)
+    assert abs(db2 - (-6.0)) < 0.01                        # 钳制在 -6dB
+    same = torch.full((1, n), 0.4)
+    _, db_same = loudness_align_head(same, prev, rate=rate)
+    assert abs(db_same) < 0.05                             # 同响度 -> ≈0dB 微干预
+    silent = torch.zeros(1, n)
+    out3, db3 = loudness_align_head(silent, prev, rate=rate)
+    assert db3 is None and torch.equal(out3, silent)       # 本段静音 -> 不干预
+    out4, db4 = loudness_align_head(quiet, torch.zeros(1, 100), rate=rate)
+    assert db4 is None and torch.equal(out4, quiet)        # 上段静音 -> 不干预
 
 
 if __name__ == "__main__":
