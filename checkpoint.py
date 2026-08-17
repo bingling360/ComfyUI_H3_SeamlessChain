@@ -141,13 +141,13 @@ def load_manifest(root: str):
 
 
 def assert_match(old: dict, new: dict):
-    """严格校验断点参数；不一致直接报错（种子例外，由调用方以断点为准）。"""
+    """严格校验存档参数；不一致直接报错（种子例外，由调用方以存档为准）。"""
     diffs = [k for k in new if old.get(k) != new[k]]
     if diffs:
-        detail = "; ".join(f"{k}: 断点={old.get(k)!r} 当前={new[k]!r}" for k in diffs)
+        detail = "; ".join(f"{k}: 存档={old.get(k)!r} 当前={new[k]!r}" for k in diffs)
         raise ValueError(
-            f"断点目录参数与当前不一致（{detail}）。续拍必须沿用原参数原提示词；"
-            "要开新链请清空断点目录，或在「断点目录」里填一个新名字")
+            f"存档参数与当前不一致（{detail}）。续拍必须沿用原参数原提示词；"
+            "要开新链请在「存档目录」里填一个新名字（控制台可一键新建）")
 
 
 def seg_path(root: str, idx: int) -> str:
@@ -233,58 +233,17 @@ def save_thumb(seg_dir: str, idx: int, frame) -> str:
 
 def save_segment_mp4(seg_dir: str, idx: int, frames, wav, sample_rate: int,
                      fps: int = 24, fresh: bool = True) -> str:
-    """段可见帧 + 音轨 -> seg_NNN.mp4（H.264 + AAC，PyAV）。审片面板据此直接播放每段。
+    """段可见帧 + 音轨 -> seg_NNN.mp4（编码实现在 media.save_av_mp4，与成片保存共用）。
 
-    PyAV 是 ComfyUI 新视频栈（CreateVideo/SaveVideo）的既有依赖，此处仅复用；
-    缺失或编码失败返回空串并清理半成品（面板回退为缩略图，不影响主流程）。
-    fresh=False（断点回放）且文件已存在时直接沿用，避免每次续跑全链重编码。
+    缺失或编码失败返回空串（控制台回退为缩略图，不影响主流程）。
+    fresh=False（存档回放）且文件已存在时直接沿用，避免每次续跑全链重编码。
     """
     name = f"seg_{idx:03d}.mp4"
     path = os.path.join(seg_dir, name)
     if not fresh and os.path.exists(path):
         return name
     try:
-        import av
-        import numpy
-
-        arr = (frames.detach().float().clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8")
-        h, w = arr.shape[1], arr.shape[2]
-        h, w = h - h % 2, w - w % 2  # yuv420p 要求偶数尺寸
-        arr = numpy.ascontiguousarray(arr[:, :h, :w, :3])
-        pcm = numpy.ascontiguousarray(wav.detach().float().cpu().clamp(-1.0, 1.0).numpy())
-        ch = int(pcm.shape[0])
-        layout = "stereo" if ch >= 2 else "mono"
-
-        container = av.open(path, mode="w")
-        try:
-            vstream = container.add_stream("libx264", rate=fps)
-            vstream.width, vstream.height = w, h
-            vstream.pix_fmt = "yuv420p"
-            vstream.options = {"crf": "20", "preset": "veryfast"}
-            astream = container.add_stream("aac", rate=int(sample_rate), layout=layout)
-
-            for i in range(arr.shape[0]):
-                for packet in vstream.encode(av.VideoFrame.from_ndarray(arr[i], format="rgb24")):
-                    container.mux(packet)
-            if ch > 2:
-                pcm = pcm[:2]
-            for start in range(0, pcm.shape[1], 1024):
-                aframe = av.AudioFrame.from_ndarray(
-                    pcm[:, start:start + 1024], format="fltp", layout=layout)
-                aframe.sample_rate = int(sample_rate)
-                for packet in astream.encode(aframe):
-                    container.mux(packet)
-            for packet in vstream.encode():
-                container.mux(packet)
-            for packet in astream.encode():
-                container.mux(packet)
-        finally:
-            container.close()
-        return name
-    except Exception:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError:
-            pass
-        return ""
+        from .media import save_av_mp4    # 包内（ComfyUI 运行时）
+    except ImportError:
+        from media import save_av_mp4     # 顶层导入（无 ComfyUI 的单测环境）
+    return name if save_av_mp4(path, frames, wav, sample_rate, fps) else ""
