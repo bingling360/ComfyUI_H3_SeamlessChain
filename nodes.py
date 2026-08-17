@@ -466,55 +466,37 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         first_frame=首帧图片 if i == 0 else None)
 
                 cond, latent = out[0], out[1]
-                neg = negative
                 if guide is not None:
-                    fc = latent_t_to_frames(latent["samples"].tensors[0].shape[2])
-                    cond = cls._apply_guide(cond, guide, fc)
-                    # keyframe 带 audio_latent 时，PackedLayout 会声明 cond_audio 段；
-                    # positive/negative 的 layout signature 不含 keyframes，会被复用，
-                    # 故 negative 必须注入同样的 keyframe，否则 cond_audio_latents 为空、
-                    # audio_embed 行数不足导致形状错位（ComfyUI 0.33+ H3 PackedLayout）
-                    if "audio_latent" in guide:
-                        neg = cls._apply_guide(neg, guide, fc)
+                    cond = cls._apply_guide(
+                        cond, guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]))
 
-                # === DEBUG: 临时排查 cond_audio_latents 为何为空 ===
-                _orig_extra_conds = type(模型.model).extra_conds
-                def _debug_extra_conds(self, **kwargs):
-                    kfs = kwargs.get("minimax_keyframes")
-                    if kfs is not None:
-                        for idx, kf in enumerate(kfs):
-                            al = kf.get("audio_latent")
-                            print(f"[H3-DEBUG-EC] kf[{idx}] keys={list(kf.keys())} "
-                                  f"audio_latent={'None' if al is None else str(al.shape)} "
-                                  f"latent={'None' if kf.get('latent') is None else str(kf['latent'].shape)}")
-                    out = _orig_extra_conds(self, **kwargs)
-                    return out
-                type(模型.model).extra_conds = _debug_extra_conds
+                # ComfyUI 0.33+ 的 PackedLayout 按 keyframe 的 audio_latent 声明 cond_audio
+                # 段；共存 H3 插件（如 H3-Motion-Context 的 keyframe/ref 共存 patch）会
+                # 重建 payload 并丢弃 keyframe 音频，导致 audio_embed 行数不足形状错位。
+                # 这里在模型层兜底：行数与 keyframes+refs 声明不符时用 payload 里完好的
+                # keyframes/refs 在线重建（layout 段顺序：kf 音频在前、refs 音频在后）。
+                dit = 模型.model.diffusion_model
+                orig_car = dit._cond_audio_rows
 
-                _orig_forward = 模型.model.diffusion_model.forward
-                def _debug_forward(x, timestep, context, transformer_options={}, **kw):
-                    payload = kw.get("minimax_payload")
-                    if payload is not None:
-                        pv = payload.value if hasattr(payload, "value") else payload
-                        kfs = pv.get("keyframes")
-                        cal = pv.get("cond_audio_latents")
-                        cvl = pv.get("cond_video_latents")
-                        lay = pv.get("layout")
-                        print(f"[H3-DEBUG-FWD] keyframes={'有' if kfs else '无'} "
-                              f"kf_keys={[list(k.keys()) for k in kfs] if kfs else '-'} "
-                              f"cond_audio_latents={len(cal) if cal else 0} "
-                              f"cond_video_latents={len(cvl) if cvl else 0} "
-                              f"layout={'有' if lay else '无'}")
-                    return _orig_forward(x, timestep, context, transformer_options, **kw)
-                模型.model.diffusion_model.forward = _debug_forward
-                # === DEBUG END ===
+                def cond_audio_rows_fix(payload, device, _orig=orig_car):
+                    rows = _orig(payload, device)
+                    want = [z for z in (kf.get("audio_latent")
+                                        for kf in (payload.get("keyframes") or [])) if z is not None]
+                    want += [z for z in (r.get("audio_latent")
+                                         for r in (payload.get("refs") or [])) if z is not None]
+                    expected = sum(int(z.shape[-1]) * 2 for z in want)
+                    if want and (0 if rows is None else int(rows.shape[0])) != expected:
+                        rows = _orig({"cond_audio_latents": want,
+                                      "audio_cond_noise_aug": payload.get("audio_cond_noise_aug"),
+                                      "seed": payload.get("seed")}, device)
+                    return rows
 
+                dit._cond_audio_rows = cond_audio_rows_fix
                 t0 = time.perf_counter()
                 sampled = nodes.common_ksampler(
                     模型, cur_seed, 步数, CFG,
-                    采样器, 调度器, cond, neg, latent, denoise=1.0)[0]
-                模型.model.diffusion_model.forward = _orig_forward  # 还原
-                type(模型.model).extra_conds = _orig_extra_conds  # 还原
+                    采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
+                dit._cond_audio_rows = orig_car
                 dt = time.perf_counter() - t0
                 video_t, audio_t = sampled["samples"].unbind()
                 # 维持不变量 seeds[g] = 该段种子（段文件缺失导致 done 回退时，
