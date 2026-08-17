@@ -1,7 +1,7 @@
 """PyAV 编解码共享：mp4 落盘与上传视频解码。
 
 分镜段视频（checkpoint.save_segment_mp4）、成片保存（saver.H3ChainSaver）、
-控制台序章上传（console.H3ChainConsole）三处共用，编码逻辑只维护一份。
+采样器自动保存（nodes 自动成片）三处共用，编码逻辑只维护一份。
 PyAV 是 ComfyUI 新视频栈（CreateVideo/SaveVideo）的既有依赖，无新依赖。
 """
 
@@ -70,7 +70,7 @@ def decode_av(path):
 
     不做音频重采样：采样器 _encode_audio_latent 会按音频 VAE 采样率重采样。
     无音频轨时返回 (帧, zeros(1,0), None)。文件无视频轨或 PyAV 缺失抛
-    RuntimeError——控制台序章路径失败应明确报错而非静默降级。
+    RuntimeError——序章上传路径失败应明确报错而非静默降级。
     """
     try:
         import av

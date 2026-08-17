@@ -10,15 +10,14 @@
 进度存于 latent 存档（v2 schema：逐段种子 / 提示词哈希 / 裁剪量）。
 
 输入形态与官方 MiniMaxH3ReferenceToVideo 对齐（autogrow）：
-- 提示词_1..N：每段一个输入框（或接 PrimitiveStringMultiline / 控制台「提示词清单」）
+- 提示词_1..N：每段一个输入框（或接 PrimitiveStringMultiline）
 - 参考图片_0..9（<Picture i>）/ 参考视频_0..3（<Video k>）
 - 参考视频音轨_0..3（与同号视频配对）/ 参考音频_0..3（<Audio j>）
 - 起始视频 + 起始视频音轨：可选序章——上传视频编码为第 0 段（进存档可回放），
   成片以它开头，后续生成段从其结尾续拍（24fps 约定，经一次 VAE 重编码）
 
-配套控制台节点 H3ChainConsole（web/h3chain_console.js）：存档读档/新建/删除、
-各段提示词、首帧/序章上传、分段缩略图与重摇按钮；成片保存走 H3ChainSaver
-（web/h3chain_saver.js 画廊）。
+配套节点：成片历史画廊走 H3ChainSaver（web/h3chain_saver.js）；
+「自动保存=分段+成片」时每段 mp4 与完整成片自动落盘 output/h3_auto/<存档名>/。
 
 兼容性：不 monkey-patch；conditioning/latent 构造直接调用官方
 MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo 节点类，采样走官方
@@ -169,6 +168,36 @@ def _center_cover(frames, width, height):
     return x.movedim(1, -1)
 
 
+def _autosave_dir(root):
+    from folder_paths import get_output_directory
+    return os.path.join(get_output_directory(), "h3_auto", os.path.basename(root))
+
+
+def _autosave_copy_seg(root, idx):
+    """把存档目录里刚落盘的分段 mp4 复制到自动保存目录（不重编码，秒级）。"""
+    import shutil
+    try:
+        src = os.path.join(root, f"seg_{idx:03d}.mp4")
+        if os.path.isfile(src):
+            dst_dir = _autosave_dir(root)
+            os.makedirs(dst_dir, exist_ok=True)
+            shutil.copy2(src, os.path.join(dst_dir, f"seg_{idx:03d}.mp4"))
+    except Exception:
+        pass
+
+
+def _autosave_final(root, frames, wav, sample_rate, fps=24):
+    """完整链（或审片已确认部分）PyAV 编码成片到自动保存目录，成功返回路径。"""
+    from .media import save_av_mp4
+    try:
+        dst_dir = _autosave_dir(root)
+        os.makedirs(dst_dir, exist_ok=True)
+        path = os.path.join(dst_dir, f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
+        return path if save_av_mp4(path, frames, wav, sample_rate, fps) else None
+    except Exception:
+        return None
+
+
 def _encode_audio_latent(audio_vae, audio, tokens):
     """AUDIO dict -> [1,32,2,T] latent，裁到与画面等长的 token 数。
 
@@ -235,7 +264,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                tooltip="自动存档：每段采样后立即落盘 latent 存档（约5MB/段），中断后重跑自动跳过已完成段，结果与一次跑完一致"),
                 io.String.Input("存档目录", default="",
                                 tooltip="空=按参数指纹自动命名于 output/checkpoints/ 下；换链请填新名字或清空旧目录。"
-                                        "接控制台「存档名」输出即可在读档下拉里选择。存档为中间产物，跑完可删"),
+                                        "填了名字即固定存档：中断重跑、改词重跑都续在这个目录。存档为中间产物，跑完可删"),
                 io.Combo.Input("桥帧门控", options=["关闭", "标注", "自动回退"], default="标注",
                                tooltip="对将成为重叠桥的尾帧打分（Laplacian清晰度+曝光）：标注=只写报告；自动回退=尾帧低于阈值时向前回退17/34帧取好帧续拍（该段可见帧数随之减少）"),
                 io.Float.Input("清晰度阈值", default=30.0, min=0.0, max=100.0, step=0.5,
@@ -258,8 +287,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "0.1 微调；0.2 标准（SkyReels 同值）；0.3+ 干预强但画面细节会变软。"
                                        "仅影响带引导桥的段；不进存档指纹，改参数不触发重跑"),
                 io.Combo.Input("审片模式", options=["关闭", "逐段确认"], default="关闭",
-                               tooltip="逐段确认：每次运行只生成一个新的段落即返回，预览「分段图像」后重新运行继续下一段；"
-                                       "不满意可改该段提示词（自动从该段重跑）或设「重跑起始段」重摇。开启后存档自动启用"),
+                               tooltip="逐段确认：每次运行只生成一个新的段落即返回，预览「分段图像」或自动保存目录里的"
+                                       "分段视频后重新运行继续下一段；不满意可改该段提示词（自动从该段重跑）或设「重跑起始段」重摇。"
+                                       "开启后存档自动启用"),
+                io.Combo.Input("自动保存", options=["关闭", "分段+成片"], default="分段+成片",
+                               tooltip="开启后无需任何下游接线：每段生成完自动存 mp4、链（或审片已确认部分）自动拼成"
+                                       "完整成片，全部落在 output/h3_auto/<存档名>/ 下，报告注明路径。开启后存档自动启用"),
                 io.Int.Input("重跑起始段", default=0, min=0, max=63,
                              tooltip="0=自动（沿用存档进度，改过提示词的段自动重做）；N=从第 N 段起丢弃存档重新生成"
                                      "（有序章时序章为第 1 段），配合改「种子」即可重摇该段及之后。用完记得改回 0"),
@@ -275,9 +308,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                       input=io.String.Input("提示词", multiline=True,
                                                             placeholder="这一段的画面描述，第 N 段会顺着第 N-1 段结尾继续"),
                                       prefix="提示词_", min=1, max=64)),
-                io.String.Input("提示词清单", default="", optional=True, force_input=True,
-                                tooltip="接控制台「提示词清单」输出（一行一段，空行剔除）；"
-                                        "非空时优先生效，此时「提示词组」输入忽略"),
                 io.Autogrow.Input("参考图片组", optional=True,
                                   template=io.Autogrow.TemplatePrefix(
                                       input=io.Image.Input("参考图片",
@@ -314,18 +344,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
     @classmethod
     def execute(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽度, 高度, 每段帧数, 引导帧数,
                 种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 起始视频=None, 起始视频音轨=None,
-                提示词组=None, 提示词清单=None,
+                提示词组=None,
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
                 自动存档="关闭", 存档目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
                 接缝混合="smoothstep", 混合帧数=6, 锚定加噪=0.0,
-                审片模式="关闭", 重跑起始段=0):
+                审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0):
         prompts = _autogrow_items(提示词组, "p")
         seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
-        if str(提示词清单 or "").strip():
-            # 控制台「提示词清单」：一行一段（与 console.split_prompts 同规则）
-            seg_prompts = [ln.strip() for ln in str(提示词清单).splitlines() if ln.strip()]
         if not seg_prompts:
-            raise ValueError("提示词不能为空：请在「提示词组」里每段添加一个输入框并填写内容，或接控制台「提示词清单」")
+            raise ValueError("提示词不能为空：请在「提示词组」里每段添加一个输入框并填写内容")
 
         refs = {
             "ref_images": _autogrow_items(参考图片组, "ref_image_"),
@@ -373,11 +400,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 自动 +1，真正的种子序列由 manifest 权威记录（见下方续跑载入逻辑）
         resume = 自动存档 in ("自动存档", "自动续跑")  # 自动续跑=旧版工作流里的值，读档兼容
         review = 审片模式 == "逐段确认"
+        autosave = 自动保存 == "分段+成片"
         reroll = max(0, int(重跑起始段))
-        use_ckpt = resume or review          # 审片必须落盘才能跨次运行续接
-        if review and not resume:
+        use_ckpt = resume or review or autosave   # 审片须落盘续接；自动保存须段落盘 mp4
+        if review and not (resume or autosave):
             report.append("审片模式：存档自动启用（每段落盘 latent，跨次运行续接）")
-        elif reroll > 0:
+        if autosave and not (resume or review):
+            report.append("自动保存：存档自动启用（分段视频每段落盘）")
+        elif reroll > 0 and not use_ckpt:
             report.append("注意：「重跑起始段」仅在自动存档/审片模式下生效，本次已忽略")
         ckpt_params = {
             "width": width, "height": height,
@@ -428,9 +458,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if reroll == 0 and seeds:
                     report.append("控件种子仅在「重跑起始段」> 0 时生效，当前沿用存档种子序列")
         full_hashes = ([prologue_hash] if off else []) + seg_hashes
-        if review:
-            report.append("控制台：H3ChainConsole 节点面板可读档/新建/删除存档、改各段提示词、"
-                          "逐段播放分段视频并一键继续 / 重摇 / 改词重跑")
+        if review and autosave:
+            report.append(f"审片：分段视频每段落盘 → output/h3_auto/{os.path.basename(root) or '…'}/seg_XXX.mp4，"
+                          "成片为运行结束时的已确认部分")
 
         pbar = comfy.utils.ProgressBar(len(seg_prompts))
         total = len(seg_prompts) + off
@@ -642,6 +672,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 thumbs.append(checkpoint.save_thumb(root, g, frames[0]))
                 videos.append(checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate,
                                                           fresh=not replay))
+                if autosave:
+                    _autosave_copy_seg(root, g)
             else:
                 thumbs.append("")
                 videos.append("")
@@ -676,14 +708,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
             pbar.update(1)
 
             if review and not replay and i + 1 < len(seg_prompts):
-                report.append(f"审片：段 {g + 1} 已完成并落盘 → 在控制台节点面板预览分段视频；"
-                              f"满意请直接重新运行继续段 {g + 2}；不满意：改控制台里该段提示词后运行（自动从本段重跑），"
-                              f"或点卡片「重摇此段」")
+                report.append(f"审片：段 {g + 1} 已完成并落盘 → 看自动保存目录里的 seg_{g:03d}.mp4；"
+                              f"满意请直接重新运行继续段 {g + 2}；不满意：改该段提示词后运行（自动从本段重跑），"
+                              f"或设「重跑起始段={g + 1}」+ 换种子重摇")
                 break
 
         if use_ckpt:
             # 兜底回写：纯回放运行（无新段）也会重解码全部段，把缩略图/分段视频/指标
-            # 等增量键补齐——旧版本存档的 manifest 缺这些键时由此自愈，控制台无需重跑整链
+            # 等增量键补齐——旧版本存档的 manifest 缺这些键时由此自愈，无需重跑整链
             checkpoint.save_manifest(root, {
                 "schema": checkpoint.SCHEMA, "done": done, "has_prologue": bool(off),
                 "seeds": list(seeds[:done]), "trims": list(trims[:done]),
@@ -697,13 +729,21 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if len(seg_frames) == total:
                     report.append("审片：本链已全部完成")
                 if reroll > 0:
-                    report.append(f"注意：「重跑起始段」={reroll} 已生效，确认无误后请改回 0（控制台会在重摇成功后自动复位）")
+                    report.append(f"注意：「重跑起始段」={reroll} 已生效，确认无误后请改回 0")
             report.append(f"存档目录（含中间 latent，跑完可删）：{root}")
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
                                    "review": bool(review), "reroll": reroll,
                                    "report": "\n".join(report), "updated_at": time.time()})
 
         images = torch.cat(all_frames, dim=0)
+        # 自动保存：完整链（或审片已确认部分）编码成片到 output/h3_auto/<存档名>/
+        if autosave and use_ckpt:
+            final_name = _autosave_final(root, images, all_wav, sample_rate)
+            if final_name:
+                report.append(f"自动保存：分段与成片已就绪 → output/h3_auto/{os.path.basename(root)}/"
+                              f"（seg_XXX.mp4 逐段，{os.path.basename(final_name)} 完整成片）")
+            else:
+                report.append("自动保存：成片编码失败（缺 PyAV 或编码异常），分段 mp4 不受影响")
         # 链路总结：接缝指标一览（seams[i] = [帧差, 响度dB] 或 None）
         measured = [(g, s[0], s[1]) for g, s in enumerate(seams) if s]
         if measured:
@@ -723,9 +763,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         )
 
     @classmethod
-    def IS_CHANGED(cls, 审片模式="关闭", 自动存档="关闭", **kwargs):
-        if 审片模式 == "逐段确认" or 自动存档 in ("自动存档", "自动续跑"):
-            return float("nan")   # 存档/审片激活时输入不变也强制真正执行（重读最新 manifest）
+    def IS_CHANGED(cls, 审片模式="关闭", 自动存档="关闭", 自动保存="分段+成片", **kwargs):
+        if 审片模式 == "逐段确认" or 自动存档 in ("自动存档", "自动续跑") or 自动保存 == "分段+成片":
+            return float("nan")   # 存档/审片/自动保存激活时输入不变也强制真正执行（重读最新 manifest）
         return ""
 
     @staticmethod

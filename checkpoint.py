@@ -147,7 +147,7 @@ def assert_match(old: dict, new: dict):
         detail = "; ".join(f"{k}: 存档={old.get(k)!r} 当前={new[k]!r}" for k in diffs)
         raise ValueError(
             f"存档参数与当前不一致（{detail}）。续拍必须沿用原参数原提示词；"
-            "要开新链请在「存档目录」里填一个新名字（控制台可一键新建）")
+            "要开新链请在「存档目录」里填一个新名字")
 
 
 def seg_path(root: str, idx: int) -> str:
@@ -235,7 +235,7 @@ def save_segment_mp4(seg_dir: str, idx: int, frames, wav, sample_rate: int,
                      fps: int = 24, fresh: bool = True) -> str:
     """段可见帧 + 音轨 -> seg_NNN.mp4（编码实现在 media.save_av_mp4，与成片保存共用）。
 
-    缺失或编码失败返回空串（控制台回退为缩略图，不影响主流程）。
+    缺失或编码失败返回空串（上游回退为缩略图，不影响主流程）。
     fresh=False（存档回放）且文件已存在时直接沿用，避免每次续跑全链重编码。
     """
     name = f"seg_{idx:03d}.mp4"

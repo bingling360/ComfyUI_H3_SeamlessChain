@@ -208,7 +208,8 @@ class H3StoryboardChain(io.ComfyNode):
                 raise ValueError("关键帧来源=从断点导入 时，「断点导入目录」不能为空："
                                  "填续拍链断点目录名（相对 output/checkpoints/）或绝对路径")
             kf_imgs = keyframes_from_ckpt(src, video_vae)
-            kf_origin = f"从断点导入（{os.path.basename(src.rstrip('/\\'))}，{len(kf_imgs) - 1} 段）"
+            base = os.path.basename(src.rstrip("/\\"))
+            kf_origin = f"从断点导入（{base}，{len(kf_imgs) - 1} 段）"
         else:
             kf_imgs = [v for v in _autogrow_items(分镜图组, "kf").values() if v is not None]
             kf_imgs = [img[0] if img.dim() == 4 else img for img in kf_imgs]
