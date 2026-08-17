@@ -478,6 +478,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         neg = cls._apply_guide(neg, guide, fc)
 
                 # === DEBUG: 临时排查 cond_audio_latents 为何为空 ===
+                _orig_extra_conds = type(模型.model).extra_conds
+                def _debug_extra_conds(self, **kwargs):
+                    kfs = kwargs.get("minimax_keyframes")
+                    if kfs is not None:
+                        for idx, kf in enumerate(kfs):
+                            al = kf.get("audio_latent")
+                            print(f"[H3-DEBUG-EC] kf[{idx}] keys={list(kf.keys())} "
+                                  f"audio_latent={'None' if al is None else str(al.shape)} "
+                                  f"latent={'None' if kf.get('latent') is None else str(kf['latent'].shape)}")
+                    out = _orig_extra_conds(self, **kwargs)
+                    return out
+                type(模型.model).extra_conds = _debug_extra_conds
+
                 _orig_forward = 模型.model.diffusion_model.forward
                 def _debug_forward(x, timestep, context, transformer_options={}, **kw):
                     payload = kw.get("minimax_payload")
@@ -487,7 +500,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         cal = pv.get("cond_audio_latents")
                         cvl = pv.get("cond_video_latents")
                         lay = pv.get("layout")
-                        print(f"[H3-DEBUG] keyframes={'有' if kfs else '无'} "
+                        print(f"[H3-DEBUG-FWD] keyframes={'有' if kfs else '无'} "
                               f"kf_keys={[list(k.keys()) for k in kfs] if kfs else '-'} "
                               f"cond_audio_latents={len(cal) if cal else 0} "
                               f"cond_video_latents={len(cvl) if cvl else 0} "
@@ -501,6 +514,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     模型, cur_seed, 步数, CFG,
                     采样器, 调度器, cond, neg, latent, denoise=1.0)[0]
                 模型.model.diffusion_model.forward = _orig_forward  # 还原
+                type(模型.model).extra_conds = _orig_extra_conds  # 还原
                 dt = time.perf_counter() - t0
                 video_t, audio_t = sampled["samples"].unbind()
                 # 维持不变量 seeds[g] = 该段种子（段文件缺失导致 done 回退时，
