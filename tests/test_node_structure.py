@@ -159,8 +159,9 @@ def test_structure():
     for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽度", "高度",
                 "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
                 "自动存档", "存档目录", "桥帧门控", "清晰度阈值", "回退上限",
-                "接缝混合", "混合帧数",
+                "接缝处理", "混合帧数",
                 "审片模式", "自动保存", "重跑起始段",
+                "精修强度", "精修窗口", "接缝重摇", "重摇阈值", "重摇上限",
                 "首帧图片", "起始视频", "起始视频音轨",
                 "提示词组",
                 "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
@@ -172,11 +173,22 @@ def test_structure():
     assert by_id["自动保存"].kwargs.get("options") == ["关闭", "分段+成片"]
     assert by_id["自动保存"].kwargs.get("default") == "分段+成片"
     assert "提示词清单" not in ids                   # 控制台已回退，清单输入随之移除
+    assert "接缝混合" not in ids                     # 旧控件已被「接缝处理」取代
     assert by_id["桥帧门控"].kwargs.get("options") == ["关闭", "标注", "自动回退"]
-    assert by_id["接缝混合"].kwargs.get("options") == ["关闭", "smoothstep"]
-    assert by_id["接缝混合"].kwargs.get("default") == "smoothstep"
+    assert by_id["接缝处理"].kwargs.get("options") == ["潜空间精修", "smoothstep像素混合", "关闭"]
+    assert by_id["接缝处理"].kwargs.get("default") == "潜空间精修"
     assert by_id["混合帧数"].kwargs.get("default") == 6
     assert by_id["混合帧数"].kwargs.get("min") == 1 and by_id["混合帧数"].kwargs.get("max") == 24
+    # 接缝根治新控件（全部追加在既有控件之后，旧工作流 JSON 兼容）
+    assert by_id["精修强度"].kwargs.get("default") == 0.45
+    assert by_id["精修强度"].kwargs.get("min") == 0.2 and by_id["精修强度"].kwargs.get("max") == 0.7
+    assert by_id["精修窗口"].kwargs.get("options") == ["22", "39", "56"]
+    assert by_id["精修窗口"].kwargs.get("default") == "39"
+    assert by_id["接缝重摇"].kwargs.get("options") == ["关闭", "自动"]
+    assert by_id["接缝重摇"].kwargs.get("default") == "自动"
+    assert by_id["重摇阈值"].kwargs.get("default") == 0.06
+    assert by_id["重摇上限"].kwargs.get("default") == 1
+    assert by_id["重摇上限"].kwargs.get("min") == 0 and by_id["重摇上限"].kwargs.get("max") == 3
     assert by_id["审片模式"].kwargs.get("options") == ["关闭", "逐段确认"]
     assert by_id["审片模式"].kwargs.get("default") == "关闭"
     assert by_id["重跑起始段"].kwargs.get("default") == 0

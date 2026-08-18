@@ -60,6 +60,16 @@ def pick_backtrack(score, limit: int, threshold: float):
     return 0, tail
 
 
+def smoothstep_weights(n, device=None, dtype=None):
+    """smoothstep 权重向量 w(t)=t²(3−2t)，端点导数为 0（无可见速度突变）。
+
+    linspace 端点精确落在 0/1，故 w(0)=0、w(n-1)=1。接缝像素混合与
+    精修区尾羽化共用（后者见 refine.py）。
+    """
+    w = torch.linspace(0.0, 1.0, n, device=device, dtype=dtype)
+    return w * w * (3.0 - 2.0 * w)
+
+
 def smoothstep_blend_head(frames, anchor_frame, span):
     """接缝像素级兜底：锚帧硬锁为新段首帧 + smoothstep 窗吸收前 span 帧偏差。
 
@@ -75,9 +85,7 @@ def smoothstep_blend_head(frames, anchor_frame, span):
     if n == 1:
         out[0:1] = anchor
         return out.clamp(0.0, 1.0)
-    w = torch.linspace(0.0, 1.0, n, device=out.device, dtype=out.dtype)
-    # linspace 端点精确落在 0/1，故 w(0)=0、w(n-1)=1；reshape 后广播一次混合
-    w = (w * w * (3.0 - 2.0 * w)).view(n, 1, 1, 1)
+    w = smoothstep_weights(n, device=out.device, dtype=out.dtype).view(n, 1, 1, 1)
     out[:n] = anchor * (1.0 - w) + out[:n] * w
     out[0:1] = anchor                              # 浮点路径防御：无条件逐像素硬锁
     return out.clamp(0.0, 1.0)
