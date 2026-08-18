@@ -323,6 +323,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                              tooltip="自动重摇的额外尝试次数（0=等于关闭重摇）"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
+                io.Image.Input("尾帧锚定", optional=True,
+                               tooltip="身份锚定帧（last_frame keyframe）：注入每段末尾位置作为人物/场景参考，"
+                                       "与段首引导桥形成「隧道」——模型去噪全程被首尾双锚点约束，过了桥窗口"
+                                       "（约2秒）也不会漂移。建议用角色正面清晰帧。不传则不锚定尾帧（保持现状）"),
                 io.Image.Input("起始视频", optional=True,
                                tooltip="序章：上传视频（≥5 帧、24fps，超长只取前「每段帧数」内）编码为第 1 段存入存档，"
                                        "成片以它开头，生成段从其结尾续拍；经一次 VAE 重编码，不能与首帧图片同用"),
@@ -368,7 +372,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
     @classmethod
     def execute(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽度, 高度, 每段帧数, 引导帧数,
-                种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 起始视频=None, 起始视频音轨=None,
+                种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 尾帧锚定=None, 起始视频=None, 起始视频音轨=None,
                 提示词组=None,
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
                 自动存档="关闭", 存档目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
@@ -422,6 +426,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(f"锚定加噪 {aug:.2f}：桥锚定帧按参考而非逐帧复现注入（视觉 {1.0 - aug:.2f} / 音频 {1.0 - aug * 0.5:.2f} 保真）")
             if aug > 0.25:
                 report.append(f"注意：锚定加噪 {aug:.2f} 偏高（>0.25 锚定偏软，段首偏差方差增大，建议 0.15-0.20）")
+
+        tail_anchor_latent = None
+        if 尾帧锚定 is not None:
+            tail_anchor_latent = video_vae.encode(_center_cover(尾帧锚定[:1], width, height))
+            report.append(f"尾帧锚定：身份锚点注入末帧 keyframe（{'视觉保真 ' + format(1.0 - aug, '.2f') if aug > 0 else '硬锚定'}）")
         if 接缝处理 not in ("潜空间精修", "smoothstep像素混合", "关闭"):
             # 旧工作流按控件位存的是「接缝混合」时代的值，按位回填
             接缝处理 = "关闭" if 接缝处理 == "关闭" else (
@@ -651,9 +660,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         first_frame=首帧图片 if i == 0 else None)
 
                 cond, latent = out[0], out[1]
-                if guide is not None:
+                if guide is not None or tail_anchor_latent is not None:
                     cond = cls._apply_guide(
-                        cond, guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]))
+                        cond, guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]),
+                        tail_kf_latent=tail_anchor_latent)
                     # 锚定加噪（SkyReels-V2 addnoise_condition 思路）：H3 模型 payload
                     # 原生支持 cond 噪声增强（extra_conds 从 cond dict 任意键取参），
                     # aug=1.0 即不加噪；值越小锚定越「软」，缓解段首刹车/内容重演
@@ -908,9 +918,24 @@ class H3SeamlessChainSampler(io.ComfyNode):
         return ""
 
     @staticmethod
-    def _apply_guide(cond, guide, sampled_fc):
-        """把上段尾帧 keyframe 注入 conditioning（官方 minimax_keyframes 协议）。"""
+    def _apply_guide(cond, guide, sampled_fc, tail_kf_latent=None):
+        """把 keyframe 注入 conditioning（官方 minimax_keyframes 协议）。
+
+        guide: 首帧引导桥 keyframe（上段尾 latent 切片），None=首段无桥。
+        tail_kf_latent: 尾帧身份锚定的 VAE latent，注入到 resolved_frame_index=
+        sampled_fc-1 位置——与首帧桥形成「隧道」，模型去噪全程被首尾双锚点约束。
+        合并 cond 里已有的 keyframes（如 i2v 首帧图片的 first_frame keyframe）。
+        """
+        existing = cond[0][1].get("minimax_keyframes", [])
+        keyframes = list(existing)
+        if guide is not None:
+            keyframes.append(guide)
+        if tail_kf_latent is not None:
+            keyframes.append({"resolved_frame_index": sampled_fc - 1,
+                              "latent": tail_kf_latent})
+        if not keyframes:
+            return cond
         return node_helpers.conditioning_set_values(cond, {
-            "minimax_keyframes": [guide],
+            "minimax_keyframes": keyframes,
             "minimax_frame_count": sampled_fc,
         })
