@@ -7,21 +7,26 @@ PyAV 是 ComfyUI 新视频栈（CreateVideo/SaveVideo）的既有依赖，无新
 
 import os
 
+last_error = None
+
 
 def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
     """可见帧 + 音轨 -> mp4（H.264 + AAC），成功返回 True。
 
     先写 .part 再原子改名：失败不留半成品、不破坏已有文件。编码失败
     （或 PyAV 缺失）返回 False，调用方降级（缩略图 / 空串），不影响主流程。
+    失败原因存入 media.last_error 供调用方读取（报告/日志）。
 
     内存与 CPU 约束：分块（32 帧）搬运到 CPU，峰值内存 ~160MB 而非整链
     float32（长链数 GB，曾致内存耗尽假死）；threads 限 4（x264 默认
     线程=核数×1.5，会打满 CPU 导致整机卡顿）。
     """
+    global last_error
     try:
         import av
         import numpy
-    except Exception:
+    except Exception as e:
+        last_error = f"PyAV/numpy 导入失败：{type(e).__name__}: {e}"
         return False
     tmp = path + ".part"
     try:
@@ -66,9 +71,11 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
         finally:
             container.close()
         os.replace(tmp, path)
+        last_error = None
         return True
     except Exception as e:
-        print(f"[save_av_mp4] 编码异常：{type(e).__name__}: {e}")
+        last_error = f"{type(e).__name__}: {e}"
+        print(f"[save_av_mp4] 编码异常：{last_error}")
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)

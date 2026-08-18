@@ -223,20 +223,24 @@ def _autosave_copy_seg(root, idx):
 
 
 def _autosave_final(root, frames, wav, sample_rate, fps=24):
-    """完整链（或审片已确认部分）PyAV 编码成片到自动保存目录，成功返回路径。"""
-    from .media import save_av_mp4
+    """完整链（或审片已确认部分）PyAV 编码成片到自动保存目录，成功返回路径。
+
+    失败时返回 (None, error_msg) 供调用方写入报告；成功返回 (path, None)。
+    """
+    from . import media
     try:
         dst_dir = _autosave_dir(root)
         os.makedirs(dst_dir, exist_ok=True)
         path = os.path.join(dst_dir, f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
         print(f"[H3自动保存] 编码完整成片：{int(frames.shape[0])} 帧 → {path}（编码期间 CPU 升高属正常）")
         t0 = time.time()
-        ok = save_av_mp4(path, frames, wav, sample_rate, fps)
+        ok = media.save_av_mp4(path, frames, wav, sample_rate, fps)
         print(f"[H3自动保存] 成片编码{'完成' if ok else '失败'}：{time.time() - t0:.0f}s")
-        return path if ok else None
+        return (path, None) if ok else (None, media.last_error)
     except Exception as e:
-        print(f"[H3自动保存] 成片编码异常：{type(e).__name__}: {e}")
-        return None
+        err = f"{type(e).__name__}: {e}"
+        print(f"[H3自动保存] 成片编码异常：{err}")
+        return None, err
 
 
 def _encode_audio_latent(audio_vae, audio, tokens):
@@ -962,12 +966,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
         images = torch.cat(all_frames, dim=0)
         # 自动保存：完整链（或审片已确认部分）编码成片到 output/h3_auto/<存档名>/
         if autosave and use_ckpt:
-            final_name = _autosave_final(root, images, all_wav, sample_rate)
+            final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate)
             if final_name:
                 report.append(f"自动保存：分段与成片已就绪 → output/h3_auto/{os.path.basename(root)}/"
                               f"（seg_XXX.mp4 逐段，{os.path.basename(final_name)} 完整成片）")
             else:
-                report.append("自动保存：成片编码失败（缺 PyAV 或编码异常），分段 mp4 不受影响")
+                err_detail = f"（{enc_err}）" if enc_err else ""
+                report.append(f"自动保存：成片编码失败{err_detail}，分段 mp4 不受影响")
         # 链路总结：接缝指标一览（seams[i] = [帧差, 响度dB] 或 None）
         measured = [(g, s[0], s[1]) for g, s in enumerate(seams) if s]
         if measured:

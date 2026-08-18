@@ -102,7 +102,9 @@ class H3ChainSaver(io.ComfyNode):
         name = f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
         ok = save_av_mp4(os.path.join(dirpath, name), 图像, wav, sr, int(帧率), int(CRF))
         if not ok:
-            raise RuntimeError("成片编码失败：PyAV 缺失或编码出错（分段视频不受影响，仍会复制）")
+            from . import media
+            err = media.last_error or "未知原因"
+            raise RuntimeError(f"成片编码失败：{err}（分段视频不受影响，仍会复制）")
         segs = copy_segments(dirpath)
         append_history(dirpath, {
             "file": name,
