@@ -104,12 +104,24 @@ def test_smoothstep_weights_endpoints():
     assert torch.equal(mixed[0], refined[0]) and torch.equal(mixed[-1], origin[-1])
 
 
-def test_window_covers_refine_replacement():
-    # 窗口缝后侧帧数必须 ≥ 常用替换量（混合帧数 ≤ 24）：side=22 缝后 34 帧已足够
-    for side, expect in ((22, 34), (39, 51), (56, 68)):
+def test_adaptive_strength_mapping():
+    # 缝差分档：<0.04 轻修 0.30；0.04-0.08 标准 0.45；>0.08 强调和 0.55；None 兜底 0.45
+    assert refine.adaptive_strength(0.0) == 0.30
+    assert refine.adaptive_strength(0.0399) == 0.30
+    assert refine.adaptive_strength(0.04) == 0.45
+    assert refine.adaptive_strength(0.08) == 0.45
+    assert refine.adaptive_strength(0.0801) == 0.55
+    assert refine.adaptive_strength(None) == 0.45
+
+
+def test_tail_anchor_index_alignment():
+    # 双端锚定：尾锚=窗口末 2 token（5 帧），锚索引 = 窗口帧数 - 5，锚区恰好
+    # 覆盖窗口末帧——与 storyboard frame_keyframe（5 帧钉窗口末）同模式
+    for side in (22, 39, 56):
         vt_p, vt_c, tw, wf = refine.seam_window_tokens(side)
-        assert wf - latent_t_to_frames(vt_p) == expect
-        assert expect >= 24
+        tail_idx = wf - 5
+        assert tail_idx > latent_t_to_frames(vt_p), "尾锚必须在缝前侧（上段侧）之后"
+        assert 0 < tail_idx < wf
 
 
 if __name__ == "__main__":

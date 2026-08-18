@@ -147,18 +147,24 @@ def seam_metrics(prev_frame, head_frame, prev_wav=None, head_wav=None, rate=4410
     return diff, db
 
 
-def find_cut_point(frames, skip_f, vis_len, search_ratio=0.33, min_keep_ratio=0.5):
+def find_cut_point(frames, skip_f, vis_len, search_ratio=0.33, min_keep_ratio=0.5,
+                   max_trim_frames=None):
     """在段尾 search_ratio 范围内找最佳切镜点（运动低谷 + 高清晰度）。
 
     运动低谷 = 动作完成/暂停 = 自然切镜点（电影剪辑师在动作间歇处切镜）。
     评分 = 帧清晰度归一 − 运动量归一 × 0.5，选评分最高帧。
 
+    max_trim_frames: 单段最多丢弃帧数上限——搜索窗口下界被抬高到
+    段尾预算内，任何切点距段尾都不超过该值（None=不限制，旧行为）；
+    上限小于 17 帧时搜索窗口不足，返回 None（不裁剪）。
     frames: [N,H,W,C] 0-1 float（任意设备）；skip_f/vis_len: 保留区参数。
     返回 (cut_frame绝对索引, 运动量, 清晰度) 或 None（搜索窗口太短）。
     """
     total = int(vis_len)
     min_keep = int(total * min_keep_ratio)
     search_start = max(skip_f + min_keep, skip_f + total - int(total * search_ratio))
+    if max_trim_frames is not None:
+        search_start = max(search_start, skip_f + total - max(0, int(max_trim_frames)))
     search_end = skip_f + total
 
     if search_end - search_start < 17:

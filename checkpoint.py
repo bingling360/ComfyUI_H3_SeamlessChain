@@ -89,7 +89,7 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
     out = dict(manifest)
     out["done"] = start
     for key in ("seeds", "trims", "prompt_hashes", "thumbs", "videos", "prompts",
-                "seams", "bridge_scores", "anchors"):
+                "seams", "bridge_scores", "anchors", "seam_metrics"):
         if key in out:
             out[key] = list(out[key])[:start]
     save_manifest(root, out)
@@ -141,8 +141,12 @@ def load_manifest(root: str):
 
 
 def assert_match(old: dict, new: dict):
-    """严格校验存档参数；不一致直接报错（种子例外，由调用方以存档为准）。"""
-    diffs = [k for k in new if old.get(k) != new[k]]
+    """严格校验存档参数；不一致直接报错（种子例外，由调用方以存档为准）。
+
+    旧存档缺少的新增参数键（如 smart_cut_max/drop_budget）按"沿用当前值"
+    处理不算不一致——旧段生成时该功能不存在，当前值只影响后续段。
+    """
+    diffs = [k for k in new if old.get(k, new[k]) != new[k]]
     if diffs:
         detail = "; ".join(f"{k}: 存档={old.get(k)!r} 当前={new[k]!r}" for k in diffs)
         raise ValueError(

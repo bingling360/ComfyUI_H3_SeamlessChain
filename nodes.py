@@ -38,6 +38,7 @@ from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3Refere
 from comfy_api.latest import io
 
 from . import checkpoint
+from . import metrics
 from . import refine
 from .grid import (video_latent_t, latent_t_to_frames, frames_to_latent_t,
                    audio_tokens_for_frames, align_frame_count_down)
@@ -370,6 +371,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "→ 完全消失（自由生成）。数值=递减占总步数比例（0.3=前30%步数递减完毕）。"
                                        "开启后「锚定加噪」的值作为递减起点，终点为 0（锚定消失）。"
                                        "治本：模型自己找到逻辑断点完成切镜，而非被强行拉住整段"),
+                io.Int.Input("切镜最多丢帧", default=17, min=0, max=120,
+                             tooltip="智能切镜的单段丢帧上限（0=只标注切镜点不裁剪）。"
+                                     "此前切镜在段尾 1/3 无上限搜索，多段累计可丢数秒内容"
+                                     "（30 秒视频被删 7 秒的主因）。进存档指纹，改值触发重跑"),
+                io.Int.Input("全链丢弃预算", default=48, min=0, max=3600,
+                             tooltip="整链累计丢弃帧数预算（智能切镜+门控回退+网格对齐合计，48帧=2秒）。"
+                                     "超预算后智能切镜自动降级为只标注不裁剪，门控回退仍生效但记 WARN。"
+                                     "报告末尾有累计丢弃汇总行。进存档指纹"),
+                io.Combo.Input("自适应精修", options=["开启", "关闭"], default="开启",
+                               tooltip="按缝差分档精修强度：<0.04 轻修0.30（保细节）；0.04-0.08 标准0.45；"
+                                       ">0.08 强调和0.55。关闭=固定用「精修强度」值。固定 0.45 整窗重去噪"
+                                       "会把好缝也重新去噪一遍——接缝发糊的主因之一。不进存档指纹"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Image.Input("尾帧锚定", optional=True,
@@ -428,7 +441,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 接缝处理="潜空间精修", 混合帧数=6, 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0,
                 精修强度=0.45, 精修窗口="39", 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
-                智能切镜="关闭", 递减锚定="关闭"):
+                智能切镜="关闭", 递减锚定="关闭", 切镜最多丢帧=17, 全链丢弃预算=48,
+                自适应精修="开启"):
         prompts = _autogrow_items(提示词组, "p")
         seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
         if not seg_prompts:
@@ -511,13 +525,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
             "length": length, "ctx": ctx, "steps": int(步数), "cfg": float(CFG),
             "sampler": 采样器, "scheduler": 调度器, "chain": chain,
             "smart_cut": 智能切镜 == "自动", "fade_ratio": fade_ratio,
+            "smart_cut_max": max(0, int(切镜最多丢帧)), "drop_budget": max(0, int(全链丢弃预算)),
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
         # 纯后处理参数只记录不进指纹（改值不触发重跑；报告回看用）
         seam_refine = {"mode": 接缝处理, "strength": float(精修强度),
                        "window": str(精修窗口), "blend": int(混合帧数),
                        "reroll": 接缝重摇, "reroll_th": float(重摇阈值),
-                       "reroll_max": int(重摇上限), "anchor_aug": aug}
+                       "reroll_max": int(重摇上限), "anchor_aug": aug,
+                       "adaptive": 自适应精修}
+        if 接缝处理 == "smoothstep像素混合":
+            report.append("提示：smoothstep像素混合是加权平均（运动残影/糊感来源），建议仅调试对比用；"
+                          "正式出片建议「潜空间精修」")
         seg_hashes = [checkpoint.prompt_hash(p) for p in seg_prompts]
         prologue_hash = None
         if 起始视频 is not None:
@@ -577,8 +596,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
         guide = None
         prev_tail_frame = None
         prev_tail_wav = None
+        prev_tail_clip = None   # 上段尾 24 帧（接缝指标局部基线用）
         prev_lat = None   # 上段 (video_t, audio_t, kept t0, kept t1, audio a0, audio a1)——接缝精修窗口切片用
         sample_rate = None
+        dropped_total = 0        # 全链累计丢弃帧（切镜+门控回退+网格对齐），预算门控用
+        seam_metrics_rows = []   # 每缝五维 z-score（与 seams 列表对齐；无缝/指标不可用为 None）
 
         if use_ckpt:  # 运行起点状态（面板据此定位当前链）
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
@@ -613,7 +635,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "seeds": [0], "trims": [0], "prompt_hashes": [prologue_hash],
                         "total": total, "thumbs": [], "videos": [], "prompts": prompt_list,
                         "seams": [None], "bridge_scores": [None], "params": ckpt_params,
-                        "seam_refine": seam_refine})
+                        "seam_metrics": [None], "seam_refine": seam_refine})
                 report.append(f"序章：上传视频编码为段 1/{total}（{fc} 帧"
                               + ("，超长仅取前段" if raw_fc > fc else "")
                               + "，经一次 VAE 重编码，按 24fps 处理"
@@ -627,11 +649,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                                       fresh=prologue_fresh) if use_ckpt else "")
             seams.append(None)
             bridge_scores.append(None)
+            seam_metrics_rows.append(None)
             all_frames.append(pframes.cpu())
             seg_frames.append(pframes.cpu())
             seg_wavs.append({"waveform": pwav.cpu(), "sample_rate": sample_rate})
             all_wav = pwav.cpu()
             prev_tail_frame = pframes[-1].cpu()
+            prev_tail_clip = pframes[-24:].cpu()
             seam_n0 = max(1, int(sample_rate * 0.25))
             prev_tail_wav = pwav.cpu()[..., -seam_n0:]
             guide = _tail_keyframe(pv, pa, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
@@ -668,17 +692,33 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     back, hit = qc.pick_backtrack(score, gate_limit, float(清晰度阈值))
                     if back:
                         vis_len = length - back
+                        over = f"，超全链预算（剩余 {max(0, int(全链丢弃预算)) - dropped_total} 帧）WARN" \
+                            if back > max(0, int(全链丢弃预算)) - dropped_total else ""
                         lines.append(f"段{gi + 1} 尾帧低质（{tail_score:.1f} < {清晰度阈值:g}），"
-                                     f"回退 {back} 帧续拍（回退点 {hit:.1f}）")
+                                     f"回退 {back} 帧续拍（回退点 {hit:.1f}）{over}")
             # 智能切镜：在段尾搜索运动低谷（自然停顿点），多余帧丢弃。
             # 运动低谷 = 动作完成/暂停 = 自然切镜点；与桥帧门控互补。
+            # 丢帧止损：单段上限（切镜最多丢帧）+ 全链预算（含门控回退与网格对齐，
+            # dropped_total 在主循环逐段累计）——超预算只标注不裁剪，防"30秒删7秒"
             if 智能切镜 == "自动" and i + 1 < len(seg_prompts):
-                cut = qc.find_cut_point(frames, skip_f, vis_len)
+                cut_cap = max(0, int(切镜最多丢帧))
+                cut = qc.find_cut_point(frames, skip_f, vis_len,
+                                        max_trim_frames=cut_cap if cut_cap > 0 else None)
                 if cut is not None:
                     cut_f, cut_motion, cut_quality = cut
                     new_vis_len = cut_f - skip_f
-                    if 0 < new_vis_len < vis_len:
-                        trimmed = vis_len - new_vis_len
+                    trimmed = vis_len - new_vis_len
+                    budget_left = max(0, int(全链丢弃预算)) - dropped_total
+                    if trimmed <= 0:
+                        pass
+                    elif cut_cap == 0:
+                        lines.append(f"段{gi + 1} 智能切镜点位 @帧{cut_f}"
+                                     f"（运动 {cut_motion:.4f} 清晰 {cut_quality:.1f}）——"
+                                     f"「切镜最多丢帧=0」，仅标注不裁剪")
+                    elif trimmed > budget_left:
+                        lines.append(f"段{gi + 1} 智能切镜 @帧{cut_f} 需丢 {trimmed} 帧"
+                                     f" > 剩余预算 {budget_left} 帧，本次仅标注不裁剪")
+                    else:
                         vis_len = new_vis_len
                         lines.append(f"段{gi + 1} 智能切镜：运动低谷 @帧{cut_f}"
                                      f"（运动 {cut_motion:.4f} 清晰 {cut_quality:.1f}），"
@@ -802,6 +842,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.extend(gate_lines)
             bridge_scores.append(seg_bridge_score)
             trims.append(length - vis_len)
+            dropped_total += length - vis_len   # 切镜+门控回退+网格对齐合计，预算门控用
 
             # 段首响度对齐（与分镜链同款）：增益匹配上段尾 RMS（±6dB 钳制 + 1s 渐出），
             # 增益不沿链累积；归一化已排除锚定区，此处兜住内容本身的响度差
@@ -834,24 +875,30 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                    audio_tokens_for_frames(skip_f + vis_len))
                     win = refine.build_seam_window(prev_lat, cur_lat_ctx, int(精修窗口))
                     if win is None:
-                        report.append(f"段{g + 1} 精修窗口不足（保留区不足每侧 {精修窗口} 帧），回退像素平滑")
+                        report.append(f"段{g + 1} 精修窗口不足（保留区不足每侧 {精修窗口} 帧），本次不处理接缝")
                     else:
                         win_v, win_a, vt_p, vt_c, wf = win
                         # 缝前侧（上段尾）全部 video latent 作为 keyframe 注入 cond
                         # （与 _tail_keyframe 同模式：resolved_frame_index=0，锚定窗口
                         # 前 vt_p 帧=上段尾内容）。模型去噪时知道缝后侧应延续缝前侧，
                         # 否则只靠 prompt+refs 自由生成——段2无效(0.170→0.170)、
-                        # 段3变差(0.032→0.055)都是因为 cond 缺 keyframe 引导
+                        # 段3变差(0.032→0.055)都是因为 cond 缺 keyframe 引导。
+                        # 双端锚定：本段侧窗口末端 2 token（5 帧）锚到窗口末帧——
+                        # 模型只能改写中间区，不再自由改写无锚端后靠羽化硬接
                         seam_kf_lat = win_v[:, :, :vt_p].clone()
+                        tail_kf_lat = win_v[:, :, -2:].clone()
+                        eff_strength = refine.adaptive_strength(seam_d) \
+                            if 自适应精修 == "开启" else float(精修强度)
                         try:
                             t1 = time.perf_counter()
                             refined_v = refine.refine_seam(
                                 模型, negative, prompt, refs if has_refs else None,
                                 clip, video_vae, audio_vae, win_v, win_a, wf,
-                                width, height, 精修强度,
+                                width, height, eff_strength,
                                 (cur_seed + 1) % 0xffffffffffffffff if cur_seed is not None else 1,
                                 步数, CFG, 采样器, 调度器,
-                                seam_kf_latent=seam_kf_lat, seam_kf_index=0)
+                                seam_kf_latent=seam_kf_lat, seam_kf_index=0,
+                                tail_kf_latent=tail_kf_lat, tail_kf_index=wf - 5)
                             wframes = video_vae.decode(refined_v)
                             if len(wframes.shape) == 5:
                                 wframes = wframes.reshape(-1, wframes.shape[-3],
@@ -871,13 +918,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             refine_used = True
                             d2, _ = qc.seam_metrics(prev_tail_frame, frames[0])
                             if seam_d is not None:
+                                worse = " · 缝差略升，已保留精修结果（不再回退像素混合）" if d2 > seam_d else ""
                                 report.append(f"段{g + 1} 接缝精修：{seam_d:.3f} → {d2:.3f}"
-                                              f" · 窗口 {wf} 帧 · {time.perf_counter() - t1:.0f}s")
+                                              f" · 强度 {eff_strength:.2f}{'（自适应）' if 自适应精修 == '开启' else ''}"
+                                              f" · 双端锚定 · 窗口 {wf} 帧 · {time.perf_counter() - t1:.0f}s{worse}")
                             seam_d = d2
                         except Exception as e:
                             report.append(f"段{g + 1} 接缝精修异常（{type(e).__name__}），回退像素平滑")
-                if not refine_used:
-                    # smoothstep 像素兜底：锚帧硬锁 + 权重窗吸收（偏差大时有叠影感）
+                if not refine_used and 接缝处理 != "关闭":
+                    # smoothstep 像素兜底：仅精修模式异常时使用（加权平均有叠影/糊感）
                     span = min(max(1, int(混合帧数)), frames.shape[0])
                     frames = qc.smoothstep_blend_head(frames, prev_tail_frame, span)
                     report.append(f"段{g + 1} 接缝平滑：首帧硬锁锚帧 + smoothstep {span} 帧过渡")
@@ -885,6 +934,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 seams.append([round(seam_d, 4), None if seam_db is None else round(seam_db, 2)])
             else:
                 seams.append(None)
+            # 接缝五维 z-score（光流/加速度/LPIPS/嵌入/相机）：上段尾 24 帧 +
+            # 本段头 48 帧的局部基线评测，处理（精修/混合）后的最终成帧上测。
+            # 写入 manifest seam_metrics（tools/ab_report.py 的 A/B 对比数据源）
+            z_row = None
+            if (i > 0 or off) and prev_tail_clip is not None:
+                try:
+                    z_row = metrics.evaluate_local(prev_tail_clip, frames[:48].cpu())
+                    z_txt = metrics.fmt_seam_z(z_row)
+                    if z_txt and "无可用" not in z_txt:
+                        report.append(f"段{g + 1} 接缝基准：{z_txt}（|z|<2 合格）")
+                except Exception:
+                    z_row = None
+            seam_metrics_rows.append(z_row if (i > 0 or off) else None)
 
             all_frames.append(frames.cpu())
             seg_frames.append(frames.cpu())
@@ -892,6 +954,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seg_wavs.append({"waveform": seg_wav, "sample_rate": sample_rate})
             all_wav = seg_wav if all_wav is None else torch.cat([all_wav, seg_wav], dim=-1)
             prev_tail_frame = frames[-1].cpu()
+            prev_tail_clip = frames[-24:].cpu()
             prev_tail_wav = seg_wav[..., -seam_n:]
             prev_lat = (video_t, audio_t, video_latent_t(skip_f), end_t,
                         audio_tokens_for_frames(skip_f),
@@ -930,6 +993,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     "total": total, "thumbs": list(thumbs[:done]), "videos": list(videos[:done]),
                     "prompts": prompt_list[:done],
                     "seams": seams[:done], "bridge_scores": bridge_scores[:done],
+                    "seam_metrics": seam_metrics_rows[:done],
                     "params": ckpt_params, "seam_refine": seam_refine,
                 })
 
@@ -951,6 +1015,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 "total": total, "thumbs": list(thumbs[:done]), "videos": list(videos[:done]),
                 "prompts": prompt_list[:done],
                 "seams": seams[:done], "bridge_scores": bridge_scores[:done],
+                "seam_metrics": seam_metrics_rows[:done],
                 "params": ckpt_params, "seam_refine": seam_refine,
             })
             if review:
@@ -982,6 +1047,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if worst[2] is not None:
                 line += f"，{worst[2]:+.1f} dB"
             report.append(line + "）")
+        z_rows = [z for z in seam_metrics_rows if z]
+        if z_rows and any(v is not None for z in z_rows for v in
+                          (z.get("flow_z"), z.get("lpips_z"), z.get("emb_z"), z.get("cam_z"))):
+            fz = [z["flow_z"] for z in z_rows if z.get("flow_z") is not None]
+            if fz:
+                report.append(f"接缝基准汇总：光流 z 均值 {sum(fz) / len(fz):+.1f} · 最差 {max(fz):+.1f}σ"
+                              f"（|z|<2 合格；明细 manifest.seam_metrics）")
+        drop_total = sum(t for t in trims if t)
+        if drop_total > 0:
+            chain_frames = sum(f.shape[0] for f in all_frames)
+            share = drop_total / max(1, chain_frames + drop_total) * 100.0
+            report.append(f"累计丢弃 {drop_total} 帧（{drop_total / 24:.1f}s，约占计划时长 {share:.1f}%）"
+                          f"——含智能切镜/门控回退/网格对齐，逐段明细见 manifest trims")
         return io.NodeOutput(
             images,
             {"waveform": all_wav, "sample_rate": sample_rate},

@@ -28,6 +28,11 @@ import time
 import torch
 import torch.nn.functional as F
 
+try:
+    from . import metrics as _metrics
+except ImportError:
+    import metrics as _metrics
+
 SEP = "─" * 74
 
 
@@ -355,6 +360,10 @@ def render_seam_section(m):
                      f"（{'一致' if j0 < 1e-4 else '不一致!'}）；"
                      f"链缝后帧 vs 段首帧 Δmax={j1:.3f}"
                      f"（接缝处理{'生效' if j1 > 1e-4 else '未见改动'}）")
+    if m.get("z"):
+        ztxt = _metrics.fmt_seam_z(m["z"])
+        if "无可用" not in ztxt:
+            lines.append(f"[基准] {ztxt}（|z|<2 合格；对照段内 P95 基线）")
     if m["findings"]:
         for i, f in enumerate(m["findings"], 1):
             lines.append(f"[判定{i}] {f}")
@@ -410,6 +419,10 @@ def build_report(video, wav, sr, fps, seams, segs, used_seg, median_d, diffs, me
                     types[key] += 1
         lines.append("类型分布：" + "｜".join(f"{k} {v}" for k, v in types.items() if v)
                      if any(types.values()) else "类型分布：全部正常")
+        fz = [m["z"]["flow_z"] for m in metrics if m.get("z") and m["z"].get("flow_z") is not None]
+        if fz:
+            lines.append(f"基准汇总：光流 z 均值 {sum(fz) / len(fz):+.1f} / 最差 {max(fz):+.1f}σ"
+                         f"（|z|<2 合格；与存档 manifest.seam_metrics 同标定）")
         worst = ranked[0]
         lines.append(f"最差接缝：#{worst['idx']}（帧 {worst['c'] - 1}→{worst['c']}，"
                      f"{_tc(worst['c'] - 1, fps)}）")
@@ -537,6 +550,15 @@ def analyze(video, wav, sr, fps, segs, window, radius, kmax, ratio_th):
         m["fps"] = fps
         m["ratio_th"] = ratio_th
         metrics.append(m)
+    # 五维 z-score 基准（光流/加速度/LPIPS/嵌入/相机）：与采样器 manifest
+    # seam_metrics 同源同标定，A/B 对比时两处数字可直接对照
+    try:
+        zres = _metrics.evaluate_seams(video, seams)
+        zmap = {r["c"]: r for r in zres.get("seams", [])}
+    except Exception:
+        zmap = {}
+    for m in metrics:
+        m["z"] = zmap.get(m["c"])
     report = build_report(video, wav, sr, fps, seams, segs, used_seg, med, diffs,
                           metrics, window, radius, kmax, ratio_th)
     gallery = build_gallery(video, metrics)

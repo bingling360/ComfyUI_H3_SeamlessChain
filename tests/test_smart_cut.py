@@ -108,10 +108,45 @@ def test_prefers_low_motion():
     print(f"PASS test_prefers_low_motion (cut@{cut_f}, motion={motion:.4f})")
 
 
+def test_max_trim_frames_caps_search():
+    """单段丢帧上限：切点距段尾不得超过 max_trim_frames。"""
+    n = 100
+    skip_f = 0
+    vis_len = n
+    frames = _make_frames(n)
+
+    cut = find_cut_point(frames, skip_f, vis_len, max_trim_frames=17)
+    if cut is not None:
+        cut_f, _, _ = cut
+        assert n - cut_f <= 17, f"cut {cut_f} exceeds max_trim 17 (would drop {n - cut_f})"
+    print(f"PASS test_max_trim_frames_caps_search (cut@{cut[0] if cut else None}, cap=17)")
+
+    cut2 = find_cut_point(frames, skip_f, vis_len, max_trim_frames=5)
+    assert cut2 is None, f"cap=5 leaves search window <17 frames, expect None, got {cut2[0]}"
+    print("PASS test_max_trim_frames_caps_search (cap=5 -> None)")
+
+    cut3 = find_cut_point(frames, skip_f, vis_len, max_trim_frames=None)
+    assert cut3 is not None, "None keeps legacy unbounded behavior"
+    cut_f3, _, _ = cut3
+    assert cut_f3 >= int(n * 0.5), "legacy behavior still respects min_keep"
+    print(f"PASS test_max_trim_frames_caps_search (None legacy, cut@{cut_f3})")
+
+
+def test_budget_report_only_mode():
+    """cap=0 语义由 nodes.py 处理（传 None 仅标注）；此处验证无上限搜索可达段尾 1/3。"""
+    n = 100
+    frames = _make_frames(n)
+    cut = find_cut_point(frames, 0, n, max_trim_frames=None)
+    assert cut is not None and cut[0] >= 67  # 段尾 1/3 ≈ 67-100
+    print(f"PASS test_budget_report_only_mode (cut@{cut[0]}, search reaches tail 1/3)")
+
+
 if __name__ == "__main__":
     test_finds_motion_valley()
     test_respects_min_keep()
     test_short_window_returns_none()
     test_uniform_motion()
     test_prefers_low_motion()
+    test_max_trim_frames_caps_search()
+    test_budget_report_only_mode()
     print("all tests passed")

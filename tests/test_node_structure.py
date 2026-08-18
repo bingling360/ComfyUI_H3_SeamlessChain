@@ -196,6 +196,13 @@ def test_structure():
     assert by_id["递减锚定"].kwargs.get("options") == ["关闭", "0.3", "0.5", "0.7"]
     assert by_id["递减锚定"].kwargs.get("default") == "关闭"
     assert "段内分片" not in ids                        # 已回退
+    # 删帧止损 + 自适应精修（评测基线批次：全部追加在控件列表尾部）
+    assert by_id["切镜最多丢帧"].kwargs.get("default") == 17
+    assert by_id["切镜最多丢帧"].kwargs.get("min") == 0 and by_id["切镜最多丢帧"].kwargs.get("max") == 120
+    assert by_id["全链丢弃预算"].kwargs.get("default") == 48
+    assert by_id["自适应精修"].kwargs.get("options") == ["开启", "关闭"]
+    assert by_id["自适应精修"].kwargs.get("default") == "开启"
+    assert ids.index("自适应精修") < ids.index("首帧图片")   # 新控件在图像输入之前（widget 区尾部）
     assert by_id["审片模式"].kwargs.get("options") == ["关闭", "逐段确认"]
     assert by_id["审片模式"].kwargs.get("default") == "关闭"
     assert by_id["重跑起始段"].kwargs.get("default") == 0

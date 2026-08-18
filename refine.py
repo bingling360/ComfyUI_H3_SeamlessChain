@@ -59,18 +59,34 @@ def build_seam_window(prev_lat, cur_lat, side_frames):
     return win_v, win_a, vt_p, vt_c, wf
 
 
+def adaptive_strength(seam_diff):
+    """按缝差分档精修强度：坏缝需要更强的重去噪调和，好缝轻修保细节。
+
+    d < 0.04 → 0.30（轻调）；0.04-0.08 → 0.45（标准）；> 0.08 → 0.55（强调和）。
+    固定 0.45 整窗重去噪会把好缝也重新加噪-去噪一遍——细节软化的主因之一。
+    """
+    if seam_diff is None:
+        return 0.45
+    if seam_diff < 0.04:
+        return 0.30
+    if seam_diff <= 0.08:
+        return 0.45
+    return 0.55
+
+
 def refine_seam(模型, negative, prompt, refs, clip, video_vae, audio_vae,
                 win_video, win_audio, window_frames, width, height,
                 strength, seed, 步数, CFG, 采样器, 调度器,
-                seam_kf_latent=None, seam_kf_index=None):
+                seam_kf_latent=None, seam_kf_index=None,
+                tail_kf_latent=None, tail_kf_index=None):
     """窗口联合重去噪，返回精修后的窗口 video latent（丢弃精修音频）。
 
     cond 复用官方节点按 window_frames 构造（r2v 链带 refs 保身份连续）；
-    **缝前侧末帧 keyframe 注入 cond**（minimax_keyframes 协议），让模型
-    在去噪时锚定缝点——知道缝后侧应该延续缝前侧内容，否则模型只靠
-    prompt+refs 自由生成，会"纠正"原本已连续的缝（段3变差 0.032→0.055）
-    或不改变缝点偏差（段2无效 0.170→0.170）。初始 latent 仍为跨缝窗口
-    切片（承载两侧结构），denoise=强度 在保留大部分原结构的前提下调和。
+    **双端 keyframe 注入 cond**（minimax_keyframes 协议）：缝前侧（上段尾）
+    整段 video latent 锚 index=0，本段侧窗口末端 latent 锚窗口末帧——
+    模型只能改写中间区，两端都续得上。单侧锚定时模型会自由改写无锚端，
+    精修末端再羽化回原帧就造成二次边界（糊感来源之一）。初始 latent 仍为
+    跨缝窗口切片（承载两侧结构），denoise=强度 保留大部分原结构。
 
     音频不精修：音轨沿用现有响度对齐路径，避免重去噪改变人声/音色。
     """
@@ -92,13 +108,16 @@ def refine_seam(模型, negative, prompt, refs, clip, video_vae, audio_vae,
             clip=clip, vae=video_vae, prompt=prompt,
             width=width, height=height, length=window_frames)
     cond, latent = out[0], out[1]
-    # 注入缝前侧末帧 keyframe：锚定缝点，让模型知道缝后侧应该延续
+    keyframes = []
     if seam_kf_latent is not None and seam_kf_index is not None:
+        keyframes.append({"resolved_frame_index": seam_kf_index,
+                          "latent": seam_kf_latent.to(device=dev, dtype=torch.float32)})
+    if tail_kf_latent is not None and tail_kf_index is not None:
+        keyframes.append({"resolved_frame_index": tail_kf_index,
+                          "latent": tail_kf_latent.to(device=dev, dtype=torch.float32)})
+    if keyframes:
         cond = node_helpers.conditioning_set_values(cond, {
-            "minimax_keyframes": [{
-                "resolved_frame_index": seam_kf_index,
-                "latent": seam_kf_latent.to(device=dev, dtype=torch.float32),
-            }],
+            "minimax_keyframes": keyframes,
             "minimax_frame_count": window_frames,
         })
     latent["samples"] = comfy.nested_tensor.NestedTensor((win_v, win_a))
