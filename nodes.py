@@ -300,6 +300,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Int.Input("重跑起始段", default=0, min=0, max=63,
                              tooltip="0=自动（沿用存档进度，改过提示词的段自动重做）；N=从第 N 段起丢弃存档重新生成"
                                      "（有序章时序章为第 1 段），配合改「种子」即可重摇该段及之后。用完记得改回 0"),
+                io.Combo.Input("生成模式", options=["文生视频", "首帧视频", "多参视频"], default="文生视频",
+                               tooltip="导演台一体化控制用：文生=纯文本（fl2va UNET，不接任何图片）；"
+                                       "首帧=首帧图片起手（fl2va UNET，仅接「首帧图片」）；"
+                                       "多参=参考图片（ref2va UNET，仅接「参考图片」组）。"
+                                       "UI 据此互斥首帧/参考图；后端校验模式与素材一致性，不匹配时报错。"
+                                       "实际 UNET 由「模型」输入决定，本控件只做模式声明与素材互斥。"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Image.Input("起始视频", optional=True,
@@ -352,7 +358,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
                 自动存档="关闭", 存档目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
                 接缝混合="smoothstep", 混合帧数=6, 锚定加噪=0.0,
-                审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0):
+                审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0, 生成模式="文生视频"):
         prompts = _autogrow_items(提示词组, "p")
         seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
         if not seg_prompts:
@@ -369,6 +375,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
             raise ValueError("首帧图片（i2v，fl2va UNET）与参考素材（r2v，ref2va UNET）不能同时使用")
         if 起始视频 is not None and 首帧图片 is not None:
             raise ValueError("起始视频（序章）与首帧图片（i2v）不能同时使用：两者都定义第 1 段的视觉起点")
+        # 生成模式一致性校验：导演台据此互斥首帧/参考图，后端复验，不匹配直接报错（避免跑废）
+        _mode = str(生成模式)
+        if _mode == "文生视频" and (首帧图片 is not None or has_refs):
+            raise ValueError("「文生视频」模式下不能接首帧图片或参考素材：请在导演台切到首帧/多参模式后再接图")
+        if _mode == "首帧视频" and has_refs:
+            raise ValueError("「首帧视频」模式下不能接参考素材（首帧与多参互斥）：请切到「多参视频」模式用参考图")
+        if _mode == "多参视频" and 首帧图片 is not None:
+            raise ValueError("「多参视频」模式下不能接首帧图片（多参与首帧互斥）：请切到「首帧视频」模式用首帧")
 
         length, width, height, seed = int(每段帧数), int(宽度), int(高度), int(种子)
         ctx = int(引导帧数)
@@ -384,7 +398,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
-        report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}，上下文 {ctx} 帧"]
+        report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}，模式 {_mode}，上下文 {ctx} 帧"]
         if has_refs:
             counts = " ".join(f"{k}={len(v)}" for k, v in refs.items() if v)
             report.append(f"参考素材：{counts}")
