@@ -199,7 +199,8 @@ def _autosave_final(root, frames, wav, sample_rate, fps=24):
         ok = save_av_mp4(path, frames, wav, sample_rate, fps)
         print(f"[H3自动保存] 成片编码{'完成' if ok else '失败'}：{time.time() - t0:.0f}s")
         return path if ok else None
-    except Exception:
+    except Exception as e:
+        print(f"[H3自动保存] 成片编码异常：{type(e).__name__}: {e}")
         return None
 
 

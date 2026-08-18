@@ -67,7 +67,8 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
             container.close()
         os.replace(tmp, path)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[save_av_mp4] 编码异常：{type(e).__name__}: {e}")
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
