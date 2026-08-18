@@ -32,7 +32,9 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
         ch = int(pcm.shape[0])
         layout = "stereo" if ch >= 2 else "mono"
 
-        container = av.open(tmp, mode="w")
+        # tmp 扩展名是 .part，PyAV 按扩展名猜不出封装格式会直接抛
+        # ValueError: Could not determine output format —— 必须显式指定
+        container = av.open(tmp, mode="w", format="mp4")
         try:
             vstream = container.add_stream("libx264", rate=fps)
             vstream.width, vstream.height = w, h
