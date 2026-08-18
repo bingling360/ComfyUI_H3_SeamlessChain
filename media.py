@@ -32,8 +32,10 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
     try:
         n = int(frames.shape[0])
         h, w = int(frames.shape[1]), int(frames.shape[2])
-        h, w = h - h % 2, w - w % 2  # yuv420p 要求偶数尺寸
+        h, w = h - h % 2, w - h % 2  # yuv420p 要求偶数尺寸
         pcm = numpy.ascontiguousarray(wav.detach().float().cpu().clamp(-1.0, 1.0).numpy())
+        if pcm.ndim == 3:                    # [batch, ch, samples] → [ch, samples]
+            pcm = pcm[0]
         ch = int(pcm.shape[0])
         layout = "stereo" if ch >= 2 else "mono"
 
