@@ -79,7 +79,7 @@ class H3ChainSaver(io.ComfyNode):
             category="MiniMaxH3",
             description="一体化成片保存：最终视频 PyAV 编码落盘，分段视频从当前存档复制（不重编码），"
                         "节点面板画廊浏览成片历史/本次分段/当前成片，可删除。接采样器的 图像/音频/帧率。",
-            output_node=True,
+            is_output_node=True,
             inputs=[
                 io.Image.Input("图像", tooltip="完整链（或逐段审片时已确认部分）的可见帧"),
                 io.Audio.Input("音频", tooltip="与图像配对的音轨（采样器「音频」输出自带采样率）"),

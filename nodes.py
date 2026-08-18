@@ -26,12 +26,16 @@ common_ksampler。多 token 桥与 keyframe 音频需要 ComfyUI 含 PR #15439
 行数，钉多 token 桥会形状错位，运行时自动探测并降级为单帧桥（报告说明）。
 """
 
+import math
 import os
+import re
 import time
+import json
 
 import torch
 import nodes
 import node_helpers
+import folder_paths
 import comfy.utils
 import comfy.samplers
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo
@@ -237,6 +241,78 @@ def _autogrow_items(group, prefix):
     return {f"{prefix}{i}": v for i, v in enumerate(vals)}
 
 
+def _load_input_image(filename):
+    """从 ComfyUI input 目录加载图片为 IMAGE 张量（与 LoadImage 节点同格式：[1,H,W,C] float32 0-1）。"""
+    from PIL import Image, ImageOps
+    import numpy as np
+    image_path = folder_paths.get_annotated_filepath(str(filename))
+    img = node_helpers.pillow(Image.open, image_path)
+    img = node_helpers.pillow(ImageOps.exif_transpose, img)
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
+
+
+def _parse_director_state(raw):
+    """解析导演台状态 JSON。空/非法时返回空 dict，不影响原有画布接线工作流。"""
+    if not raw:
+        return {}
+    try:
+        d = json.loads(str(raw)) if isinstance(raw, str) else raw
+        return d if isinstance(d, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+# ---- 官方 Resolution Selector 同款画布换算 + 时长网格吸附 ----
+
+_AR_RATIO = {"21:9": 21 / 9, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4, "1:1": 1.0}
+_MP_OPTIONS = ["0.25", "0.5", "0.75", "1.0"]
+_LABEL_TOKEN = re.compile(r"\[\[([^\[\]]{1,24})\]\]")
+
+
+def _resolve_canvas(ar, mp):
+    """宽高比+百万像素 -> 32 倍数对齐画布（短边≤768、长边≤1344，H3 原生画布上限）。
+
+    16:9+1.0 → 1344×768（官方原生画布）；16:9+0.5 → 960×544；9:16+1.0 → 768×1344。
+    """
+    r = _AR_RATIO[str(ar)]
+    total = float(mp) * 1_000_000
+    w0, h0 = (total * r) ** 0.5, (total / r) ** 0.5
+    s = min(1.0, 1344 / max(w0, h0), 768 / min(w0, h0))
+    w = max(32, math.ceil(w0 * s / 32) * 32)
+    h = max(32, math.ceil(h0 * s / 32) * 32)
+    return w, h
+
+
+def _snap_seconds(seconds):
+    """秒 -> 就近的 17k+5 帧网格（@24fps，≥5 帧）。5.0s→124，与旧默认帧数一致。"""
+    f = max(5, int(round(float(seconds) * 24)))
+    k = max(0, round((f - 5) / 17))
+    return 17 * k + 5
+
+
+def _apply_label_tokens(prompt, label_order):
+    """把提示词中的 [[标签]] 替换为该段压实编号后的 <Picture k>。
+
+    label_order 为该段按序引用的标签（第 j 个 → <Picture j+1>）；长标签先替换，
+    防「角色1」吃掉「角色10」前缀；剩余未知 [[..]] 报错并列出可用标签。
+    """
+    mapping = {lbl: f"<Picture {j + 1}>" for j, lbl in enumerate(label_order)}
+    out = prompt
+    for lbl in sorted(mapping, key=len, reverse=True):
+        out = out.replace(f"[[{lbl}]]", mapping[lbl])
+    unknown = _LABEL_TOKEN.findall(out)
+    if unknown:
+        raise ValueError(f"提示词引用了未知素材标签「{unknown[0].strip()}」：可用标签 {list(label_order)}")
+    return out
+
+
+def _reference_header(label_order):
+    """段首自动注入的参考映射行（官方建议显式指派每个参考的职责）。"""
+    return "参考：" + "，".join(f"<Picture {j + 1}>={lbl}" for j, lbl in enumerate(label_order)) + "。"
+
+
 class H3SeamlessChainSampler(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -252,10 +328,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Clip.Input("文本编码器"),
                 io.Vae.Input("视频VAE"),
                 io.Vae.Input("音频VAE"),
-                io.Int.Input("宽度", default=864, min=32, max=16384, step=32),
-                io.Int.Input("高度", default=480, min=32, max=16384, step=32),
-                io.Int.Input("每段帧数", default=124, min=5, max=3600,
-                             tooltip="每段可见帧数 @24fps（124≈5秒，训练范围约 124-362）。总时长 = 段数 × 每段帧数 ÷ 24"),
+                io.Combo.Input("宽高比", options=["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"], default="16:9",
+                               tooltip="官方 Resolution Selector 同款：与「百万像素」共同换算画布，32 倍数对齐，"
+                                       "短边≤768、长边≤1344（H3 原生画布上限）。选「自定义」时直接用下方宽度/高度"),
+                io.Combo.Input("百万像素", options=_MP_OPTIONS, default="0.5",
+                               tooltip="目标总像素：0.25 草稿 / 0.5 快速预览 / 0.75 均衡 / 1.0 官方原生"
+                                       "（16:9 下即 1344×768）。超出画布上限会自动收到上限"),
+                io.Int.Input("宽度", default=864, min=32, max=16384, step=32, advanced=True,
+                             tooltip="「宽高比=自定义」时直接生效；其余模式由 宽高比+百万像素 换算覆盖"),
+                io.Int.Input("高度", default=480, min=32, max=16384, step=32, advanced=True,
+                             tooltip="「宽高比=自定义」时直接生效；其余模式由 宽高比+百万像素 换算覆盖"),
+                io.Float.Input("每段时长", default=5.0, min=0.5, max=15.0, step=0.1,
+                               tooltip="每段可见时长（秒）@24fps，内部自动吸附 H3 的 17k+5 帧网格："
+                                       "5.0s→124帧、6.0s→141帧。全链默认值，导演台每段可单独覆盖"),
                 io.Combo.Input("引导帧数", options=["5", "22", "39", "56"], default="22",
                                tooltip="段间引导重叠桥：钉入下段头部的上段尾帧数。越大衔接越顺、越慢越吃显存"),
                 io.Int.Input("种子", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True,
@@ -306,10 +391,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "多参=参考图片（ref2va UNET，仅接「参考图片」组）。"
                                        "UI 据此互斥首帧/参考图；后端校验模式与素材一致性，不匹配时报错。"
                                        "实际 UNET 由「模型」输入决定，本控件只做模式声明与素材互斥。"),
+                io.String.Input("导演台状态", multiline=True, default="", socketless=True, advanced=True,
+                               tooltip="导演台前端写入的 JSON 状态（模式/提示词/素材文件名/分段处理）。"
+                                       "有值时优先于画布接线：提示词从 JSON 读取，图片从 input 目录加载。"
+                                       "ref_assets 为标签素材池 [{file,label}]；segments 数组为每段提供 "
+                                       "scene_prompt / character_prompt / seconds（本段秒数）/"
+                                       "refs（本段引用的素材标签，缺省=全部），提示词用 [[标签]] 引用素材，"
+                                       "后端按段压实重编号为 <Picture k>。"
+                                       "空值或旧工作流走原有画布输入（向后兼容）。"
+                                       "只存相对输入文件名，不存媒体内容、密钥或绝对路径。"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Image.Input("起始视频", optional=True,
-                               tooltip="序章：上传视频（≥5 帧、24fps，超长只取前「每段帧数」内）编码为第 1 段存入存档，"
+                               tooltip="序章：上传视频（≥5 帧、24fps，超长只取前「每段时长」内）编码为第 1 段存入存档，"
                                        "成片以它开头，生成段从其结尾续拍；经一次 VAE 重编码，不能与首帧图片同用"),
                 io.Audio.Input("起始视频音轨", optional=True,
                                tooltip="序章原声（与起始视频配对，建议同源 LoadVideo 拆出；不接则序章按静音处理）"),
@@ -352,25 +446,119 @@ class H3SeamlessChainSampler(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽度, 高度, 每段帧数, 引导帧数,
+    def execute(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽高比, 百万像素, 宽度, 高度, 每段时长, 引导帧数,
                 种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 起始视频=None, 起始视频音轨=None,
                 提示词组=None,
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
                 自动存档="关闭", 存档目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
                 接缝混合="smoothstep", 混合帧数=6, 锚定加噪=0.0,
-                审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0, 生成模式="文生视频"):
-        prompts = _autogrow_items(提示词组, "p")
-        seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
+                审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0, 生成模式="文生视频",
+                导演台状态=""):
+        # ---- 导演台状态驱动：有 JSON 状态时优先于画布接线 ----
+        ds = _parse_director_state(导演台状态)
+        ds_used = bool(ds)
+        if ds.get("mode"):
+            _m = str(ds["mode"])
+            if _m not in ("文生视频", "首帧视频", "多参视频"):
+                raise ValueError(f"导演台状态中的模式「{_m}」无效：必须是「文生视频」「首帧视频」或「多参视频」")
+            生成模式 = _m
+        # 提示词：导演台 JSON 优先，空则回退画布 autogrow 输入
+        if ds.get("prompts") and isinstance(ds["prompts"], list):
+            seg_prompts = [str(p).strip() for p in ds["prompts"] if str(p).strip()]
+        else:
+            prompts = _autogrow_items(提示词组, "p")
+            seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
         if not seg_prompts:
-            raise ValueError("提示词不能为空：请在「提示词组」里每段添加一个输入框并填写内容")
+            raise ValueError("提示词不能为空：请在导演台填写提示词，或在「提示词组」里每段添加一个输入框并填写内容")
+
+        # 素材池（标签->文件）：ref_assets 为 v2 真源；旧 ref_images 自动补默认标签「图片N」
+        pool_files = []
+        if isinstance(ds.get("ref_assets"), list) and ds["ref_assets"]:
+            for item in ds["ref_assets"]:
+                if isinstance(item, dict) and item.get("file"):
+                    label = str(item.get("label") or "").strip() or f"图片{len(pool_files) + 1}"
+                    pool_files.append((label[:24], str(item["file"])))
+        elif ds.get("ref_images") and isinstance(ds["ref_images"], list):
+            pool_files = [(f"图片{i + 1}", str(fn)) for i, fn in enumerate(ds["ref_images"]) if fn]
+        _seen = set()
+        for _i, (_lbl, _fn) in enumerate(pool_files):
+            _base, _n = _lbl, 2
+            while _lbl in _seen:
+                _lbl = f"{_base}{_n}"
+                _n += 1
+            _seen.add(_lbl)
+            pool_files[_i] = (_lbl, _fn)
+        pool_labels = [lbl for lbl, _ in pool_files]
+
+        segments = ds.get("segments") if isinstance(ds.get("segments"), list) else []
+
+        # 分段处理中心：组合场景/角色提示词；[[标签]] -> <Picture k>；段首自动参考映射行
+        seg_composed = 0
+        seg_custom_refs = 0
+        seg_label_orders = [[] for _ in seg_prompts]
+        if segments:
+            composed_prompts = []
+            for i, prompt in enumerate(seg_prompts):
+                seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
+                scene = str(seg.get("scene_prompt", "")).strip()
+                char = str(seg.get("character_prompt", "")).strip()
+                parts = [p for p in (scene, char, prompt) if p]
+                full = "\n".join(parts)
+                if pool_labels:
+                    refs_sel = seg.get("refs")
+                    if isinstance(refs_sel, list) and refs_sel:
+                        order = []
+                        for r in refs_sel:
+                            lbl = str(r).strip()
+                            if lbl not in pool_labels:
+                                raise ValueError(f"段{i + 1} 引用了未知素材标签「{lbl}」：可用标签 {pool_labels}")
+                            if lbl not in order:
+                                order.append(lbl)
+                        seg_label_orders[i] = order
+                        seg_custom_refs += 1
+                    else:
+                        seg_label_orders[i] = list(pool_labels)
+                    # refs 缺省/显式空 = 引用全部素材（与旧行为一致，避免 ref2va 链空参考段）
+                    if seg_label_orders[i]:
+                        has_pic = "<Picture" in full
+                        full = _apply_label_tokens(full, seg_label_orders[i])
+                        if not has_pic:
+                            full = _reference_header(seg_label_orders[i]) + "\n" + full
+                if scene or char:
+                    seg_composed += 1
+                composed_prompts.append(full)
+            seg_prompts = composed_prompts
+
+        # 每段时长原始值：seg.seconds（None=跟随全局默认），吸附网格在 length 确定后统一做
+        seg_secs = []
+        for i in range(len(seg_prompts)):
+            seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
+            try:
+                v = seg.get("seconds")
+                seg_secs.append(None if v in (None, "") else _snap_seconds(float(v)))
+            except (TypeError, ValueError):
+                seg_secs.append(None)
+
+        # 首帧图片：导演台 JSON 优先，空则用画布连接
+        if ds.get("first_frame"):
+            首帧图片 = _load_input_image(ds["first_frame"])
+
+        # 参考图片素材池（标签->张量）：JSON 池优先，空则回退画布 autogrow（按位补默认标签）
+        if pool_files:
+            pool_tensors = {lbl: _load_input_image(fn) for lbl, fn in pool_files}
+        else:
+            _canvas_imgs = _autogrow_items(参考图片组, "ref_image_")
+            pool_tensors = {f"图片{j + 1}": v for j, v in enumerate(_canvas_imgs.values())}
+            if pool_tensors:
+                pool_labels = list(pool_tensors.keys())
+                seg_label_orders = [list(pool_labels) for _ in seg_prompts]
 
         refs = {
-            "ref_images": _autogrow_items(参考图片组, "ref_image_"),
             "ref_videos": _autogrow_items(参考视频组, "ref_video_"),
             "ref_video_audios": _autogrow_items(参考视频音轨组, "ref_video_audio_"),
             "ref_audios": _autogrow_items(参考音频组, "ref_audio_"),
         }
-        has_refs = any(refs.values())
+        has_refs = bool(pool_tensors) or any(refs.values())
         if 首帧图片 is not None and has_refs:
             raise ValueError("首帧图片（i2v，fl2va UNET）与参考素材（r2v，ref2va UNET）不能同时使用")
         if 起始视频 is not None and 首帧图片 is not None:
@@ -384,7 +572,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if _mode == "多参视频" and 首帧图片 is not None:
             raise ValueError("「多参视频」模式下不能接首帧图片（多参与首帧互斥）：请切到「首帧视频」模式用首帧")
 
-        length, width, height, seed = int(每段帧数), int(宽度), int(高度), int(种子)
+        if str(宽高比) != "自定义":
+            宽度, 高度 = _resolve_canvas(宽高比, 百万像素)
+        width, height, seed = int(宽度), int(高度), int(种子)
+        length = _snap_seconds(每段时长)
+        seg_lengths = [length if s is None else s for s in seg_secs]
         ctx = int(引导帧数)
         gate_limit = max(0, int(回退上限) // 17 * 17)
         from . import qc  # 桥帧打分 + 接缝测量共用（延迟导入：无 ComfyUI 环境下结构单测不触达）
@@ -399,9 +591,29 @@ class H3SeamlessChainSampler(io.ComfyNode):
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
         report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}，模式 {_mode}，上下文 {ctx} 帧"]
+        if str(宽高比) != "自定义":
+            report.append(f"画布：{宽高比} · {百万像素}MP → {width}×{height}（32 倍数对齐，短边≤768）")
+        else:
+            report.append(f"画布：自定义 {width}×{height}")
+        _custom_len = [i for i in range(len(seg_lengths)) if seg_lengths[i] != length]
+        if _custom_len:
+            report.append("每段时长：" + " ".join(f"段{i + 1}={seg_lengths[i] / 24:.1f}s({seg_lengths[i]}帧)" for i in _custom_len)
+                          + f"（默认 {length / 24:.1f}s={length}帧）")
+        if ds_used:
+            report.append("素材来源：导演台状态（JSON）")
+        if seg_composed:
+            report.append(f"分段处理：{seg_composed}/{len(seg_prompts)} 段含场景/角色提示词（已组合到主提示词前）")
         if has_refs:
+            _pool_names = {lbl: dict(pool_files).get(lbl, "画布") for lbl in pool_tensors}
+            _parts = []
+            if pool_tensors:
+                _parts.append("、".join(f"{lbl}（{_fn}）" for lbl, _fn in _pool_names.items()))
             counts = " ".join(f"{k}={len(v)}" for k, v in refs.items() if v)
-            report.append(f"参考素材：{counts}")
+            if counts:
+                _parts.append(counts)
+            if seg_custom_refs:
+                _parts.append(f"段级子集 {seg_custom_refs}/{len(seg_prompts)} 段自定义")
+            report.append("参考素材：" + " | ".join(_parts))
         if not KEYFRAME_AUDIO_SUPPORTED:
             report.append("注意：当前 ComfyUI 不含 PR #15439（Add Guide 协议），段间引导降级为仅视频锚定，音频不锚定"
                           + ("；r2v 链上引导会与参考素材冲突失效，强烈建议升级 ComfyUI" if has_refs else ""))
@@ -433,7 +645,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
             "sampler": 采样器, "scheduler": 调度器, "chain": chain,
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
-        seg_hashes = [checkpoint.prompt_hash(p) for p in seg_prompts]
+        # 逐段哈希：默认时长的段哈希与旧公式一致（旧存档续跑不受影响）；
+        # 改过时长的段把帧数并入哈希 → 自动从该段重做
+        seg_hashes = [
+            checkpoint.prompt_hash(p if seg_lengths[i] == length else f"{seg_lengths[i]}|{p}")
+            for i, p in enumerate(seg_prompts)
+        ]
         prologue_hash = None
         if 起始视频 is not None:
             f0 = 起始视频[0].detach().float().cpu()
@@ -570,12 +787,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 else:
                     cur_seed = (seed + i) % 0xffffffffffffffff
                 first_free = (i == 0 and off == 0)  # 无序章时首段无重叠桥
-                seg_len = length + (0 if first_free else ctx)
+                seg_len = seg_lengths[i] + (0 if first_free else ctx)
                 if has_refs:
+                    seg_refs = dict(refs)
+                    seg_refs["ref_images"] = {
+                        f"ref_image_{j}": pool_tensors[lbl]
+                        for j, lbl in enumerate(seg_label_orders[i]) if lbl in pool_tensors
+                    }
                     out = MiniMaxH3ReferenceToVideo.execute(
                         clip=clip, vae=video_vae, audio_vae=audio_vae,
                         prompt=prompt, width=width, height=height, length=seg_len,
-                        ref_image_size="match", **refs)
+                        ref_image_size="match", **seg_refs)
                 else:
                     out = MiniMaxH3ImageToVideo.execute(
                         clip=clip, vae=video_vae, prompt=prompt,
@@ -615,7 +837,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
             sampled_fc = latent_t_to_frames(video_t.shape[2])
             skip_f = 0 if (i == 0 and off == 0) else ctx
-            vis_len = length
+            vis_len = seg_lengths[i]
             frames = video_vae.decode(video_t)
             if len(frames.shape) == 5:
                 frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
@@ -634,7 +856,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 else:  # 自动回退
                     back, hit = qc.pick_backtrack(score, gate_limit, float(清晰度阈值))
                     if back:
-                        vis_len = length - back
+                        vis_len = seg_lengths[i] - back
                         report.append(f"段{g + 1} 尾帧低质（{tail_score:.1f} < {清晰度阈值:g}），"
                                       f"回退 {back} 帧续拍（回退点 {hit:.1f}）")
             bridge_scores.append(seg_bridge_score)
@@ -642,9 +864,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 取采样 latent 原始尾部（含 17k+5 网格填充帧，从未输出），下段续拍点
             # 落在本段输出末尾之后——ctx=56 时每个接缝跳过 15 帧（0.6s）内容。
             # 门控回退时向下对齐（不回吐坏帧），否则向上（不丢内容，每段至多多留几帧）
-            end_t = frames_to_latent_t(skip_f + vis_len, up=(length - vis_len) == 0)
+            end_t = frames_to_latent_t(skip_f + vis_len, up=(seg_lengths[i] - vis_len) == 0)
             vis_len = latent_t_to_frames(end_t) - skip_f
-            trims.append(length - vis_len)
+            trims.append(seg_lengths[i] - vis_len)
 
             frames = frames[skip_f:skip_f + vis_len]
             wav_total = wav.shape[-1]
@@ -703,7 +925,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 note = "guide=无（首段）"
             origin = "存档载入" if replay else f"采样{sampled_fc}帧"
             seed_txt = cur_seed if cur_seed is not None else "—"
-            report.append(f"段{g + 1}/{total}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧"
+            report.append(f"段{g + 1}/{total}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧({frames.shape[0] / 24:.1f}s)"
                           f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {dt:.0f}s") + f" | {note}")
 
             if i + 1 < len(seg_prompts):

@@ -70,6 +70,12 @@ def _install_stubs(with_audio_support=False):
     node_helpers.conditioning_set_values = conditioning_set_values
     sys.modules["node_helpers"] = node_helpers
 
+    folder_paths_mod = types.SimpleNamespace(
+        get_annotated_filepath=lambda name: name,
+        get_output_directory=lambda: "output",
+    )
+    sys.modules["folder_paths"] = folder_paths_mod
+
     comfy = types.ModuleType("comfy")
     comfy_utils = types.ModuleType("comfy.utils")
 
@@ -156,8 +162,8 @@ def test_structure():
     cls = plugin_nodes.H3SeamlessChainSampler
     schema = cls.define_schema()
     ids = [inp.id for inp in schema.inputs]
-    for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽度", "高度",
-                "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
+    for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽高比", "百万像素", "宽度", "高度",
+                "每段时长", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
                 "自动存档", "存档目录", "桥帧门控", "清晰度阈值", "回退上限",
                 "接缝混合", "混合帧数",
                 "审片模式", "自动保存", "重跑起始段",
@@ -166,6 +172,10 @@ def test_structure():
                 "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
         assert key in ids, f"missing input: {key}"
     by_id = {inp.id: inp for inp in schema.inputs}
+    assert by_id["宽高比"].kwargs.get("options") == ["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"]
+    assert by_id["宽高比"].kwargs.get("default") == "16:9"
+    assert by_id["百万像素"].kwargs.get("options") == ["0.25", "0.5", "0.75", "1.0"]
+    assert by_id["每段时长"].kwargs.get("default") == 5.0
     assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
     assert by_id["种子"].kwargs.get("control_after_generate") is True
     assert by_id["自动存档"].kwargs.get("options") == ["关闭", "自动存档"]
@@ -295,7 +305,8 @@ def test_run_validation():
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
     cls = plugin_nodes.H3SeamlessChainSampler
     common = {"模型": None, "文本编码器": _Clip(), "视频VAE": None, "音频VAE": None,
-              "宽度": 864, "高度": 480, "每段帧数": 124, "引导帧数": 22,
+              "宽高比": "自定义", "百万像素": "0.5", "宽度": 864, "高度": 480, "每段时长": 5.0,
+              "引导帧数": 22,
               "种子": 0, "步数": 25, "CFG": 1.0, "采样器": "res_multistep", "调度器": "simple"}
     try:
         cls.execute(**common, 提示词组={"提示词_1": "  ", "提示词_2": ""})

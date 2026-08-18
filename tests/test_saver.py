@@ -95,7 +95,7 @@ def test_schema():
     schema = saver.H3ChainSaver.define_schema()
     assert [inp.id for inp in schema.inputs] == ["图像", "音频", "帧率", "输出前缀", "CRF"]
     assert [o.id for o in schema.outputs] == ["成片文件名"]
-    assert schema.kwargs.get("output_node") is True           # 输出节点（无下游也执行）
+    assert schema.kwargs.get("is_output_node") is True        # 输出节点（无下游也执行）
     by_id = {inp.id: inp for inp in schema.inputs}
     assert by_id["帧率"].kwargs.get("default") == 24
     assert by_id["CRF"].kwargs.get("default") == 20 and by_id["CRF"].kwargs.get("min") == 0

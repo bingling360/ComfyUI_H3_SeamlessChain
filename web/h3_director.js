@@ -1,37 +1,33 @@
 /**
  * H3 Seamless Chain —— 「长片导演台」（全屏一体化控制台 + 侧栏迷你入口）
  *
- * 视觉参照「H3 一体化总控导演台」（深青蓝工业风暗色主题），功能为原
- * 「长片审片」侧栏面板（feature 分支）的全面升级。节点侧需「生成模式」控件
- * （nodes.py H3SeamlessChainSampler 已适配；旧引擎无该控件时降级为本会话互斥）。
+ * 参照「H3 一体化总控导演台」状态驱动架构：所有输入（模式/提示词/首帧/参考图）
+ * 存入节点「导演台状态」JSON widget，节点 execute 读取 JSON 加载素材，
+ * 不在画布上创建/连接任何辅助节点（LoadImage / PrimitiveStringMultiline）。
  *
- * 一体化闭环：模式选择 → 提示词常驻编辑 → 参考图按模式自动接线 → 参数 → 运行 → 成片，
- * 全部在导演台内完成，无需画布手工连线。
+ * 状态 JSON schema v2（存入「导演台状态」widget）：
+ *   { mode:"文生视频"|"首帧视频"|"多参视频",
+ *     prompts:["段1文本","段2文本",...],
+ *     first_frame:"input目录下的文件名",
+ *     ref_assets:[ { file:"文件名", label:"角色1" }, ... ],   // 标签素材池（真源）
+ *     ref_images:["文件名1",...],                             // 兼容保留 = ref_assets 的文件序列
+ *     segments:[
+ *       { scene_prompt:"场景描述", character_prompt:"角色描述",
+ *         seconds:6.5,        // 本段时长（秒），null=跟随节点「每段时长」默认
+ *         refs:["角色1","场景1"] },  // 本段引用的素材标签，[]=引用全部
+ *       ...
+ *     ] }
  *
- * 数据契约（全部经 ComfyUI 自带端点，零自建路由）：
- *   - checkpoints/h3chain_state.json ：当前链指针 + 上次报告（GET /api/view）
- *   - checkpoints/h3chain_index.json  ：项目索引（feature 引擎写的；404 时用
- *     localStorage 记忆 + state.dir 兜底，main 引擎也能列项目）
- *   - checkpoints/<链>/manifest.json  ：逐段种子/哈希/接缝/桥分/缩略图/提示词
- *   - output/<前缀>/h3saver_history.json ：成片历史（前缀读画布 H3ChainSaver）
- *   - 画布上 H3SeamlessChainSampler 节点：跑前读提示词组/插入视频控件，
- *     与后端 inserts.build_plan 同构地拼出统一段落计划 -> 跑前即有空卡片
+ * 标签引用：提示词写 [[角色1]]，后端按段压实重编号为 <Picture k>；
+ * 原生 <Picture N> 写法继续兼容。v1 状态（只有 ref_images）自动迁移默认标签「图片N」。
  *
- * 双分支控件名自适应（合并技术改进前后都能用）：
- *   存档目录（main）/ 断点目录（feature）；「插入视频」控件缺失时隐藏插入功能
+ * 模式互斥在 JSON 层完成：切模式即清空不相容字段，后端复验不匹配报错。
+ * 分段处理中心：segments 与 prompts 等长，每段的 scene_prompt/character_prompt
+ * 由后端组合到该段主提示词前（scene → character → 主提示词），不影响核心采样。
  *
- * 操作（改节点控件，再排队运行）：
- *   ◐ 生成模式：文生/首帧/多参三选一，写回节点「生成模式」控件；
- *      切换即自动断开不相容的图片连线（文生清空首帧+参考，首帧清空参考，多参清空首帧）
- *   ▶ 开始生成/继续下一段：Queue（存档自动续接）
- *   ＋ 新建项目：新存档目录名，提示词沿用当前内容作底稿（可勾选清空）
- *   ⇄ 项目列表：点条目把「存档目录」切到该项目
- *   ＋ 添加一段：动态加 提示词_N 输入（连 PrimitiveStringMultiline），台内常驻 textarea 直接编辑
- *   ✏ 提示词：段落卡片内常驻 textarea，输入即防抖写回节点（已连 primitive 走上游 widget）
- *   📎 插入视频：上传到 input 目录，写入「插入视频」控件 位置|文件名
- *   🎲 重摇此段：设「重跑起始段」=该段全局段号 + 随机种子 → Queue；成功后自动复位
- *   🖼 首帧/参考图：按模式上传即自动创建 LoadImage 并接线，缩略图实时回显
- *   成片历史：播放 / 下载 / 删除（POST /h3chain/delete，路由缺失自动隐藏删除）
+ * 配套工作流（web/h3_default_workflow.js）：画布无 H3 节点时可一键载入官方风格
+ * 预置工作流；「素材池 · 自动管理」组的 LoadImage 常驻预连，导演台上传素材时
+ * 点亮对应节点（mode=0），删除时隐藏（mode=2+折叠）——连线始终存在，只做显隐。
  */
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
@@ -41,8 +37,27 @@ const SAVER_TYPE = "H3ChainSaver";
 const W_REROLL = "重跑起始段";
 const W_SEED = "种子";
 const W_INSERTS = "插入视频";
-const W_DIR_NAMES = ["存档目录", "断点目录"]; // main / feature 双分支控件名
+const W_DIR_NAMES = ["存档目录", "断点目录"];
 const W_MODE = "生成模式";
+const W_DS = "导演台状态";
+const W_AR = "宽高比";
+const W_MP = "百万像素";
+const W_DUR = "每段时长";
+const W_WIDTH = "宽度";
+const W_HEIGHT = "高度";
+const AR_LIST = ["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"];
+const AR_RATIO = { "21:9": 21 / 9, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4, "1:1": 1 };
+const MP_LIST = ["0.25", "0.5", "0.75", "1.0"];
+const QUICK_LABELS = ["角色1", "角色2", "场景1", "场景2", "风格", "道具"];
+/* 引用语模板库：插入到提示词光标处，[[标签]] 由后端按段压实为 <Picture k> */
+const REF_TEMPLATES = [
+    ["插入 [[标签]]", (l) => `[[${l}]]`],
+    ["主角出场", (l) => `主角：[[${l}]] 全程出镜，保持外观与服饰一致`],
+    ["配角出场", (l) => `画面中出现的 [[${l}]] 为次要角色，保持一致`],
+    ["场景还原", (l) => `场景以 [[${l}]] 为准，延续其环境与光照`],
+    ["风格参考", (l) => `整体画风与色调参考 [[${l}]]`],
+    ["镜头参考", (l) => `运镜方式参考 [[${l}]]`],
+];
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
     ["首帧视频", "首帧", "首帧图片起手，fl2va UNET"],
@@ -52,24 +67,12 @@ const MODE_DEFAULT = "文生视频";
 const MAX_SEG = 64;
 const LS_PROJECTS = "h3d_projects";
 
-/* 提示词写回防抖：常驻 textarea 每次输入写回节点会触发 graph.change，
-   防抖合并连续键击，blur 时立即落盘。 */
-const _taTimers = new WeakMap();
-function debounceWrite(node, entry, text) {
-    const old = _taTimers.get(entry);
-    if (old) clearTimeout(old);
-    _taTimers.set(entry, setTimeout(() => {
-        _taTimers.delete(entry);
-        writePromptText(node, entry, text);
-    }, 350));
-}
-
-let miniBox = null;        // 侧栏迷你卡容器
-let desk = null;           // 全屏导演台 { page, zones, close }
-let pendingReset = false;  // 重摇后等 execution_success 自动复位重跑起始段
+let miniBox = null;
+let desk = null;
+let pendingReset = false;
 let refreshTimer = null;
-let deleteRouteOk = true;  // /h3chain/delete 路由可用性（首次失败后永久隐藏删除钮）
-let ledPhase = "idle";     // idle | running | done | error
+let deleteRouteOk = true;
+let ledPhase = "idle";
 let ledText = "待命";
 
 /* ---------- 小工具 ---------- */
@@ -115,7 +118,91 @@ function badge(text, cls) {
     return `<span class="h3d-chip ${cls || ""}">${escapeHtml(text)}</span>`;
 }
 
-/* ---------- 画布节点操作（移植自审片面板 + 双分支兼容） ---------- */
+/* ---------- 官方参数换算（与 nodes.py _resolve_canvas/_snap_seconds 同公式） ---------- */
+
+function resolveCanvas(ar, mp) {
+    const r = AR_RATIO[String(ar)];
+    if (!r) return null;
+    const total = parseFloat(mp) * 1e6;
+    if (!isFinite(total) || total <= 0) return null;
+    const w0 = Math.sqrt(total * r), h0 = Math.sqrt(total / r);
+    const s = Math.min(1, 1344 / Math.max(w0, h0), 768 / Math.min(w0, h0));
+    const w = Math.max(32, Math.ceil(w0 * s / 32) * 32);
+    const h = Math.max(32, Math.ceil(h0 * s / 32) * 32);
+    return [w, h];
+}
+
+function snapFrames(seconds) {
+    const f = Math.max(5, Math.round(Number(seconds) * 24));
+    const k = Math.max(0, Math.round((f - 5) / 17));
+    return 17 * k + 5;
+}
+
+/** 宽高比+百万像素 -> 显示徽章文案；自定义/非法返回 null */
+function canvasBadgeText(node) {
+    const ar = String(getWidgetValue(node, W_AR) ?? "");
+    if (!AR_RATIO[ar]) return null;
+    const mp = String(getWidgetValue(node, W_MP) ?? "0.5");
+    const c = resolveCanvas(ar, mp);
+    return c ? `${ar} · ${mp}MP → ${c[0]}×${c[1]}` : null;
+}
+
+/** 反推：宽高完全命中某 AR×MP 组合则返回 [ar, mp]，否则 null（旧工作流迁移用） */
+function matchCanvasCombo(w, h) {
+    for (const ar of Object.keys(AR_RATIO)) {
+        for (const mp of MP_LIST) {
+            const c = resolveCanvas(ar, mp);
+            if (c && c[0] === w && c[1] === h) return [ar, mp];
+        }
+    }
+    return null;
+}
+
+/* ---------- 素材标签工具 ---------- */
+
+function cleanLabel(text) {
+    return String(text ?? "").trim().replace(/[[\]]/g, "").slice(0, 12);
+}
+
+function uniqueLabelFrom(taken, base) {
+    if (!taken.has(base)) return base;
+    let n = 2;
+    while (taken.has(`${base}${n}`)) n += 1;
+    return `${base}${n}`;
+}
+
+/** 在 textarea 光标处插入文本（未聚焦则追加到末尾），返回新值 */
+function insertAtCursor(ta, text) {
+    if (!ta) return "";
+    const s = ta.selectionStart ?? ta.value.length;
+    const e = ta.selectionEnd ?? s;
+    ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
+    const pos = s + text.length;
+    ta.focus();
+    ta.setSelectionRange(pos, pos);
+    return ta.value;
+}
+
+function inputViewUrl(name) {
+    const norm = String(name ?? "").replaceAll("\\", "/");
+    const parts = norm.split("/");
+    const file = parts.pop() ?? "";
+    const sub = parts.join("/");
+    return `/api/view?type=input&subfolder=${encodeURIComponent(sub)}&filename=${encodeURIComponent(file)}`;
+}
+
+async function uploadToInput(file) {
+    const fd = new FormData();
+    fd.append("image", file);
+    fd.append("type", "input");
+    fd.append("overwrite", "true");
+    const r = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    return j.subfolder ? `${j.subfolder}/${j.name}` : j.name;
+}
+
+/* ---------- 画布节点操作 ---------- */
 
 function findNode() {
     const nodes = app.graph?._nodes || [];
@@ -152,48 +239,6 @@ function getDirValue(node) {
     return w ? String(w.value ?? "").trim() : "";
 }
 
-/* ---- 生成模式（驱动 UI 互斥 + 写回节点控件） ---- */
-
-function getMode(node) {
-    if (!node) return MODE_DEFAULT;
-    const w = (node.widgets || []).find((x) => x.name === W_MODE);
-    const v = w ? String(w.value ?? "") : "";
-    return MODES.some(([m]) => m === v) ? v : MODE_DEFAULT;
-}
-
-function setMode(node, mode) {
-    const ok = setWidgetValue(node, W_MODE, mode); // 旧引擎无该控件时返回 false
-    applyModeExclusivity(node, mode);               // 无论如何都应用 UI 互斥
-    return ok;
-}
-
-/** 断开所有参考图片输入（来源 LoadImage 无其他连线则一并删）。 */
-function detachAllRefImages(node) {
-    for (const s of refImageSlots(node)) {
-        if (s.linked) detachImageInput(node, s.idx);
-    }
-}
-
-/** 断开首帧图片输入。 */
-function detachFirstFrame(node) {
-    const fInp = (node.inputs || []).find((i) => i.name === "首帧图片");
-    if (fInp && fInp.link != null) detachImageInput(node, node.inputs.indexOf(fInp));
-}
-
-/** 模式互斥：切换模式时自动断开不相容的图片连线，UI 层即保证不会同时存在首帧+参考。 */
-function applyModeExclusivity(node, mode) {
-    if (!node) return;
-    if (mode === "文生视频") {
-        detachFirstFrame(node);
-        detachAllRefImages(node);
-    } else if (mode === "首帧视频") {
-        detachAllRefImages(node);
-    } else if (mode === "多参视频") {
-        detachFirstFrame(node);
-    }
-    node.graph?.change?.();
-}
-
 function setDirValue(node, value) {
     const w = node && dirWidget(node);
     if (!w) return false;
@@ -209,55 +254,391 @@ function hasInserts(node) {
     return !!(node && (node.widgets || []).some((w) => w.name === W_INSERTS));
 }
 
-/** autogrow 提示词条目：{序号 -> {name, linked}}，输入槽与节点内输入框都认。 */
-function promptEntries(node) {
-    const pat = /^(?:提示词组\.)?提示词_(\d+)$/;
-    const found = new Map();
-    for (const inp of node.inputs || []) {
-        const m = pat.exec(inp.name);
-        if (m) found.set(Number(m[1]), { name: inp.name, linked: inp.link != null });
-    }
-    for (const w of node.widgets || []) {
-        const m = pat.exec(w.name);
-        if (m && !found.has(Number(m[1]))) found.set(Number(m[1]), { name: w.name, linked: false });
-    }
-    return [...found.entries()].sort((a, b) => a[0] - b[0]);
+/* ---- 旧工作流迁移：widget 改名/新增后 widgets_values 按位错位，载入前重排 ----
+ * 老格式：[宽, 高, 每段帧数, 引导帧数, 种子, (ctrl)?, 步数, CFG, …]
+ * 新格式：[宽高比, 百万像素, 宽, 高, 每段时长, 引导帧数, 种子, ctrl, 步数, CFG, …]
+ * 识别：老格式 wv[0] 是数字（宽度）；新格式 wv[0] 是宽高比字符串 */
+const SEED_CTRL_VALUES = ["fixed", "increment", "decrement", "randomize"];
+
+function remapOldWidgetValues(wv) {
+    const [w, h, frames, guide, seed, maybeCtrl, ...rest] = wv;
+    const hasCtrl = typeof maybeCtrl === "string" && SEED_CTRL_VALUES.includes(maybeCtrl);
+    const ctrl = hasCtrl ? maybeCtrl : "fixed";
+    const tail = hasCtrl ? rest : [maybeCtrl, ...rest];
+    const combo = matchCanvasCombo(Number(w), Number(h));
+    const framesNum = Number(frames);
+    const secs = isFinite(framesNum) && framesNum > 0
+        ? Math.max(0.5, Math.min(15, Math.round((framesNum / 24) * 10) / 10)) : 5.0;
+    return [
+        combo ? combo[0] : "自定义",          // 宽高比：能命中 AR×MP 组合则迁移，否则保持自定义画幅
+        combo ? combo[1] : "0.5",            // 百万像素
+        Number(w), Number(h),                // 宽/高（自定义模式继续生效，存档指纹不变）
+        secs, guide, Number(seed), ctrl, ...tail,
+    ];
 }
 
-function readPromptText(node, entry) {
-    const inp = (node.inputs || []).find((i) => i.name === entry.name);
-    if (inp && inp.link != null) {
-        const src = node.graph.getNodeById(inp.link.origin_id);
-        const w = src && src.widgets && src.widgets[0];
-        return w ? String(w.value ?? "") : "";
+function migrateGraphWidgets(graphData) {
+    if (!graphData || !Array.isArray(graphData.nodes)) return graphData;
+    let migrated = 0;
+    for (const n of graphData.nodes) {
+        if (n.type === NODE_TYPE && Array.isArray(n.widgets_values)
+            && n.widgets_values.length && typeof n.widgets_values[0] !== "string") {
+            try {
+                n.widgets_values = remapOldWidgetValues(n.widgets_values);
+                migrated += 1;
+            } catch (e) { /* 解析失败保持原样，交给兜底修正 */ }
+        }
     }
-    const w = (node.widgets || []).find((w) => w.name === entry.name);
-    return w ? String(w.value ?? "") : "";
+    if (migrated) console.log(`[h3-director] 已迁移 ${migrated} 个旧版 H3 节点的参数（宽高/帧数 → 宽高比+百万像素+秒）`);
+    return graphData;
 }
 
-function writePromptText(node, entry, text) {
-    const inp = (node.inputs || []).find((i) => i.name === entry.name);
-    if (inp && inp.link != null) {
-        const src = node.graph.getNodeById(inp.link.origin_id);
-        const w = src && src.widgets && src.widgets[0];
-        if (!w) return false;
-        w.value = text;
-        src.setDirtyCanvas(true, true);
-    } else {
-        const w = (node.widgets || []).find((w) => w.name === entry.name);
-        if (!w) return false;
-        w.value = text;
-        node.setDirtyCanvas(true, true);
+/** 兜底：宽高比控件值非法（错位载入/手工改坏）时修正，避免后端换算报错 */
+function fixInvalidArWidget(node) {
+    const w = (node.widgets || []).find((x) => x.name === W_AR);
+    if (!w) return;
+    const v = String(w.value ?? "");
+    if (AR_LIST.includes(v)) return;
+    const width = Number(getWidgetValue(node, W_WIDTH));
+    const height = Number(getWidgetValue(node, W_HEIGHT));
+    const combo = (Number.isFinite(width) && Number.isFinite(height)) ? matchCanvasCombo(width, height) : null;
+    const fixed = combo ? combo[0] : "自定义";
+    console.warn(`[h3-director] 「宽高比」控件值「${v}」无效，已修正为「${fixed}」（旧工作流请用 Load 按钮载入以完整迁移）`);
+    setWidgetValue(node, W_AR, fixed);
+    if (combo) setWidgetValue(node, W_MP, combo[1]);
+}
+
+/* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
+
+function defaultDs() {
+    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", ref_images: [], ref_assets: [], segments: [] };
+}
+
+function defaultSegment() {
+    return { scene_prompt: "", character_prompt: "", seconds: null, refs: [] };
+}
+
+function getDs(node) {
+    if (!node) return defaultDs();
+    const w = (node.widgets || []).find((x) => x.name === W_DS);
+    if (!w) return defaultDs();
+    try {
+        const raw = w.value ? JSON.parse(w.value) : {};
+        const prompts = Array.isArray(raw.prompts) && raw.prompts.length ? raw.prompts.map(String) : [""];
+
+        /* v2 标签素材池；v1（只有 ref_images）自动迁移默认标签「图片N」 */
+        let refAssets = Array.isArray(raw.ref_assets)
+            ? raw.ref_assets.filter((a) => a && typeof a === "object" && a.file)
+                .map((a) => ({ file: String(a.file), label: cleanLabel(a.label) || "" }))
+            : null;
+        if (!refAssets) {
+            const legacy = Array.isArray(raw.ref_images) ? raw.ref_images.filter(String).map(String) : [];
+            refAssets = legacy.map((file, i) => ({ file, label: `图片${i + 1}` }));
+        }
+        const taken = new Set();
+        refAssets.forEach((a) => {
+            a.label = cleanLabel(a.label) || `图片${taken.size + 1}`;
+            a.label = uniqueLabelFrom(taken, a.label);
+            taken.add(a.label);
+        });
+
+        let segments = Array.isArray(raw.segments) ? raw.segments : [];
+        while (segments.length < prompts.length) segments.push(defaultSegment());
+        if (segments.length > prompts.length) segments = segments.slice(0, prompts.length);
+        const validLabels = new Set(refAssets.map((a) => a.label));
+        segments = segments.map((s) => {
+            const sec = Number(s?.seconds);
+            return {
+                scene_prompt: typeof s?.scene_prompt === "string" ? s.scene_prompt : "",
+                character_prompt: typeof s?.character_prompt === "string" ? s.character_prompt : "",
+                seconds: (isFinite(sec) && sec > 0) ? Math.min(15, Math.max(0.5, sec)) : null,
+                refs: Array.isArray(s?.refs) ? s.refs.map(String).filter((l) => validLabels.has(l)) : [],
+            };
+        });
+        return {
+            mode: MODES.some(([m]) => m === raw.mode) ? raw.mode : MODE_DEFAULT,
+            prompts,
+            first_frame: typeof raw.first_frame === "string" ? raw.first_frame : "",
+            ref_images: refAssets.map((a) => a.file),
+            ref_assets: refAssets,
+            segments,
+        };
+    } catch (e) {
+        return defaultDs();
     }
-    node.graph.change();
+}
+
+function setDs(node, ds) {
+    const w = (node.widgets || []).find((x) => x.name === W_DS);
+    if (!w) return false;
+    /* ref_images 兼容字段 = ref_assets 文件序列（旧版前端/后端仍可读） */
+    if (Array.isArray(ds.ref_assets)) {
+        ds.ref_assets = ds.ref_assets.filter((a) => a && a.file);
+        ds.ref_images = ds.ref_assets.map((a) => String(a.file));
+    }
+    w.value = JSON.stringify(ds);
+    if (typeof w.callback === "function") {
+        try { w.callback(w.value); } catch (e) { /* callback 可选 */ }
+    }
+    node.setDirtyCanvas(true, true);
+    node.graph?.change?.();
     return true;
 }
 
-function clearPrompts(node) {
-    for (const [, entry] of promptEntries(node)) writePromptText(node, entry, "");
+/** 写回模式控件（combo widget 同步，便于画布侧也能看到） */
+function syncModeWidget(node, mode) {
+    setWidgetValue(node, W_MODE, mode);
 }
 
-/** 「插入视频」控件文本 -> {items:[[pos,file]], bad:[坏行]}（容错版后端 parse_inserts）。 */
+/** 模式互斥：在 JSON 状态层清空不相容字段 */
+function applyModeDs(ds, mode) {
+    if (mode === "文生视频") {
+        ds.first_frame = "";
+        ds.ref_assets = [];
+    } else if (mode === "首帧视频") {
+        ds.ref_assets = [];
+    } else if (mode === "多参视频") {
+        ds.first_frame = "";
+    }
+    ds.mode = mode;
+}
+
+function getMode(node) {
+    return getDs(node).mode;
+}
+
+function setMode(node, mode) {
+    const ds = getDs(node);
+    applyModeDs(ds, mode);
+    setDs(node, ds);
+    syncModeWidget(node, mode);
+    syncMirrors(node, ds);
+    return true;
+}
+
+/* ---- 提示词（状态驱动） ---- */
+
+function getPrompts(node) {
+    return getDs(node).prompts;
+}
+
+function setPromptText(node, idx, text) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= ds.prompts.length) return false;
+    ds.prompts[idx] = text;
+    setDs(node, ds);
+    return true;
+}
+
+function addPromptSegment(node) {
+    const ds = getDs(node);
+    if (ds.prompts.length >= MAX_SEG) { alert(`最多 ${MAX_SEG} 段提示词`); return; }
+    ds.prompts.push("");
+    if (!ds.segments) ds.segments = [];
+    ds.segments.push(defaultSegment());
+    setDs(node, ds);
+    scheduleRefresh(60);
+}
+
+function removePromptSegment(node, idx) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= ds.prompts.length) return;
+    ds.prompts.splice(idx, 1);
+    if (ds.segments) ds.segments.splice(idx, 1);
+    setDs(node, ds);
+    scheduleRefresh(60);
+}
+
+function clearPrompts(node) {
+    const ds = getDs(node);
+    ds.prompts = ds.prompts.map(() => "");
+    // 清文本但保留每段时长/素材引用（结构设置跨项目沿用）
+    if (ds.segments) ds.segments = ds.segments.map((s) => ({
+        ...defaultSegment(), seconds: s?.seconds ?? null, refs: Array.isArray(s?.refs) ? s.refs : [],
+    }));
+    setDs(node, ds);
+}
+
+/* ---- 分段处理中心：场景/角色提示词 + 每段时长 + 段级素材引用（状态驱动） ---- */
+
+function getSegment(node, idx) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= (ds.segments || []).length) return defaultSegment();
+    return ds.segments[idx];
+}
+
+function setSegmentField(node, idx, field, text) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= (ds.segments || []).length) return false;
+    ds.segments[idx][field] = text;
+    setDs(node, ds);
+    return true;
+}
+
+/** 本段时长（秒）；v=null 表示跟随节点「每段时长」默认 */
+function setSegmentSeconds(node, idx, v) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= (ds.segments || []).length) return false;
+    const num = Number(v);
+    ds.segments[idx].seconds = (v === "" || v == null || !isFinite(num) || num <= 0)
+        ? null : Math.min(15, Math.max(0.5, num));
+    setDs(node, ds);
+    return true;
+}
+
+/** 勾选/取消本段引用的素材标签；全部取消 = 引用全部（与后端约定一致） */
+function toggleSegmentRef(node, idx, label) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= (ds.segments || []).length) return;
+    const seg = ds.segments[idx];
+    if (!Array.isArray(seg.refs)) seg.refs = [];
+    const pos = seg.refs.indexOf(label);
+    if (pos >= 0) seg.refs.splice(pos, 1);
+    else seg.refs.push(label);
+    setDs(node, ds);
+}
+
+/* ---- 首帧/参考图片（状态驱动 + 配套工作流 LoadImage 镜像点亮/隐藏） ---- */
+
+function setFirstFrame(node, filename) {
+    const ds = getDs(node);
+    ds.first_frame = filename || "";
+    setDs(node, ds);
+    syncMirrors(node, ds);
+    scheduleRefresh(120);
+}
+
+function addRefImage(node, filename) {
+    const ds = getDs(node);
+    if (ds.ref_assets.length >= 9) { alert("参考图片最多 9 张"); return; }
+    const taken = new Set(ds.ref_assets.map((a) => a.label));
+    const label = uniqueLabelFrom(taken, `图片${ds.ref_assets.length + 1}`);
+    ds.ref_assets.push({ file: filename, label });
+    setDs(node, ds);
+    syncMirrors(node, ds);
+    scheduleRefresh(120);
+}
+
+function removeRefImage(node, idx) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= ds.ref_assets.length) return;
+    const gone = ds.ref_assets.splice(idx, 1)[0];
+    if (gone && gone.label) {
+        for (const s of ds.segments || []) {
+            if (Array.isArray(s.refs)) s.refs = s.refs.filter((l) => l !== gone.label);
+        }
+    }
+    setDs(node, ds);
+    syncMirrors(node, ds);
+    scheduleRefresh(120);
+}
+
+/** 重命名素材标签：唯一性自动加后缀；同步重命名所有段级引用 */
+function renameAssetLabel(node, idx, text) {
+    const ds = getDs(node);
+    const asset = ds.ref_assets[idx];
+    if (!asset) return "";
+    const clean = cleanLabel(text);
+    if (!clean) return asset.label;   // 空输入保持原标签
+    const old = asset.label;
+    const taken = new Set(ds.ref_assets.filter((_a, i) => i !== idx).map((a) => a.label));
+    asset.label = uniqueLabelFrom(taken, clean);
+    if (old !== asset.label) {
+        for (const s of ds.segments || []) {
+            if (Array.isArray(s.refs)) s.refs = s.refs.map((l) => (l === old ? asset.label : l));
+        }
+    }
+    setDs(node, ds);
+    return asset.label;
+}
+
+function removeFirstFrame(node) {
+    const ds = getDs(node);
+    ds.first_frame = "";
+    setDs(node, ds);
+    syncMirrors(node, ds);
+    scheduleRefresh(120);
+}
+
+/* ---- 配套工作流：素材节点镜像（连线常驻，仅切换 点亮/隐藏） ---- */
+
+function mirrorNodeByTitle(title) {
+    return (app.graph?._nodes || []).find((n) => n.getTitle?.() === title || n.title === title) || null;
+}
+
+/** 点亮/隐藏配套工作流的素材节点：有图=mode0+展开，无图=mode2+折叠（连线与配置保留） */
+function setMirrorImage(title, filename) {
+    const m = mirrorNodeByTitle(title);
+    if (!m) return false;
+    const w = (m.widgets || []).find((x) => x.name === "image") || (m.widgets || [])[0];
+    if (w && filename && String(w.value ?? "") !== String(filename)) {
+        w.value = filename;
+        if (typeof w.callback === "function") { try { w.callback(filename); } catch (e) { /* 可选 */ } }
+    }
+    const want = filename ? 0 : 2;
+    if (m.mode !== want) m.mode = want;
+    m.flags = m.flags || {};
+    m.flags.collapsed = !filename;
+    m.setDirtyCanvas?.(true, true);
+    return true;
+}
+
+/** 全量同步镜像：首帧图 + 参考图·1..9（仅导演台素材操作时调用，不动手摆工作流） */
+function syncMirrors(node, ds) {
+    if (!node || !ds) return;
+    setMirrorImage("首帧图", ds.mode === "首帧视频" ? (ds.first_frame || "") : "");
+    const refs = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+    for (let i = 0; i < 9; i++) {
+        const active = ds.mode === "多参视频" && refs[i] ? String(refs[i].file) : "";
+        setMirrorImage(`参考图·${i + 1}`, active);
+    }
+}
+
+/** 一键载入配套默认工作流（画布无 H3 节点时的引导入口） */
+async function loadDefaultWorkflow() {
+    if (!window.H3_DEFAULT_WORKFLOW) {
+        alert("配套工作流模板未加载：请确认插件 web/ 目录含 h3_default_workflow.js 并刷新页面");
+        return;
+    }
+    if (!confirm("将载入配套工作流并替换当前画布（未保存的画布修改会丢失），继续？")) return;
+    try {
+        await app.loadGraphData(JSON.parse(JSON.stringify(window.H3_DEFAULT_WORKFLOW)));
+    } catch (e) {
+        console.warn("[h3-director] loadGraphData 返回值非 Promise（旧版前端），忽略", e);
+    }
+    await new Promise((r) => setTimeout(r, 150));
+    const node = findNode();
+    if (node && app.canvas?.centerOnNode) { try { app.canvas.centerOnNode(node); } catch (e) { /* 可选 */ } }
+    const ds = getDs(node);
+    syncMirrors(node, ds);
+    scheduleRefresh(300);
+}
+
+async function pickImage(target) {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.onchange = async () => {
+        const f = input.files && input.files[0];
+        if (!f) return;
+        try {
+            const name = await uploadToInput(f);
+            if (target === "first") {
+                setFirstFrame(node, name);
+            } else {
+                addRefImage(node, name);
+            }
+        } catch (e) {
+            alert(`上传失败：${e}`);
+        }
+    };
+    input.click();
+}
+
+/* ---- 「插入视频」控件（不变，仍走画布控件） ---- */
+
 function parseInsertsSpec(text) {
     const items = [], bad = [];
     for (const raw of String(text ?? "").split("\n")) {
@@ -271,54 +652,6 @@ function parseInsertsSpec(text) {
     }
     items.sort((a, b) => a[0] - b[0]);
     return { items, bad };
-}
-
-/**
- * 客户端段落计划（与后端 inserts.build_plan 同构）：
- * 空提示词段被后端丢弃，此处同样不排段。返回 {plan, drafts}。
- */
-function planFromNode(node) {
-    const entries = promptEntries(node);
-    const filled = [], drafts = [];
-    for (const [n, entry] of entries) {
-        const text = readPromptText(node, entry).trim();
-        if (text) filled.push({ n, entry, text });
-        else drafts.push(entry.name);
-    }
-    const { items } = parseInsertsSpec(getWidgetValue(node, W_INSERTS));
-    const plan = [];
-    let pi = 0;
-    for (const [pos, file] of items) {
-        while (plan.length + 1 < pos) { plan.push({ kind: "prompt", ...filled[pi++] }); }
-        plan.push({ kind: "insert", pos, file });
-    }
-    while (pi < filled.length) plan.push({ kind: "prompt", ...filled[pi++] });
-    return { plan, drafts };
-}
-
-/** 添加一段：优先创建 PrimitiveStringMultiline 并连到新输入槽（与示例工作流同形态）。 */
-function addPromptSegment(node) {
-    const nums = promptEntries(node).map(([n]) => n);
-    if (nums.length >= MAX_SEG) { alert(`最多 ${MAX_SEG} 段提示词`); return; }
-    const n = (nums.length ? Math.max(...nums) : 0) + 1;
-    const iname = `提示词组.提示词_${n}`;
-    if ((node.inputs || []).some((i) => i.name === iname)) return;
-    let src = null;
-    try {
-        src = LiteGraph.createNode("PrimitiveStringMultiline");
-    } catch (e) { /* 老前端无此类型 -> 退化为节点内输入框 */ }
-    node.addInput(iname, "STRING");
-    if (src) {
-        src.title = `提示词_${n}`;
-        src.pos = [node.pos[0] - 340, node.pos[1] + 40 + n * 26];
-        node.graph.add(src);
-        src.connect(0, node, node.inputs.findIndex((i) => i.name === iname));
-    } else {
-        node.addWidget("text", iname, "", () => {});
-    }
-    node.setDirtyCanvas(true, true);
-    node.graph.change();
-    scheduleRefresh(60);
 }
 
 function insertLines(node) {
@@ -356,24 +689,67 @@ function pickInsertVideo(pos) {
     input.onchange = async () => {
         const f = input.files && input.files[0];
         if (!f) return;
-        const fd = new FormData();
-        fd.append("image", f);
-        fd.append("type", "input");
-        fd.append("overwrite", "true");
         try {
-            const r = await fetch("/upload/image", { method: "POST", body: fd });
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            const j = await r.json();
-            const name = j.subfolder ? `${j.subfolder}/${j.name}` : j.name;
+            const name = await uploadToInput(f);
             appendInsert(pos, name);
         } catch (e) {
-            alert(`上传失败：${e}\n（也可手动把视频放进 input 目录，再在「插入视频」里写 位置|文件名）`);
+            alert(`上传失败：${e}`);
         }
     };
     input.click();
 }
 
+/* ---- 提示词写回防抖 ---- */
+
+const _taTimers = new Map();
+
+function debouncePromptWrite(node, idx, text) {
+    const key = `p${idx}`;
+    const old = _taTimers.get(key);
+    if (old) clearTimeout(old);
+    _taTimers.set(key, setTimeout(() => {
+        _taTimers.delete(key);
+        setPromptText(node, idx, text);
+    }, 350));
+}
+
+function debounceSegmentWrite(node, idx, field, text) {
+    const key = `s${idx}_${field}`;
+    const old = _taTimers.get(key);
+    if (old) clearTimeout(old);
+    _taTimers.set(key, setTimeout(() => {
+        _taTimers.delete(key);
+        setSegmentField(node, idx, field, text);
+    }, 350));
+}
+
+/* ---- 段落计划（状态驱动） ---- */
+
+function planFromDs(node) {
+    const ds = getDs(node);
+    const prompts = ds.prompts.map((t, i) => ({ text: t.trim(), idx: i }));
+    const { items } = parseInsertsSpec(getWidgetValue(node, W_INSERTS));
+    const plan = [];
+    let pi = 0;
+    for (const [pos, file] of items) {
+        while (plan.length + 1 < pos) {
+            if (pi < prompts.length) plan.push({ kind: "prompt", ...prompts[pi++] });
+            else break;
+        }
+        plan.push({ kind: "insert", pos, file });
+    }
+    while (pi < prompts.length) plan.push({ kind: "prompt", ...prompts[pi++] });
+    const drafts = prompts.filter((p) => !p.text).map((p) => `段 ${p.idx + 1}`);
+    return { plan, drafts, ds };
+}
+
 function queuePrompt() {
+    const node = findNode();
+    if (node) {
+        const ds = getDs(node);
+        setDs(node, ds);
+        syncModeWidget(node, ds.mode);
+    }
     setLed("running", "已提交队列");
     app.queuePrompt();
     scheduleRefresh();
@@ -384,7 +760,7 @@ function scheduleRefresh(delay = 900) {
     refreshTimer = setTimeout(refresh, delay);
 }
 
-/* ---------- 项目记忆（localStorage，索引文件缺失时的兜底） ---------- */
+/* ---------- 项目记忆 ---------- */
 
 function lsProjects() {
     try { return JSON.parse(localStorage.getItem(LS_PROJECTS) || "[]"); } catch (e) { return []; }
@@ -449,19 +825,48 @@ function paramsSummary(node, mf) {
         const w = node && (node.widgets || []).find((x) => x.name === name);
         return w ? String(w.value ?? "").trim() : "";
     };
-    const w = p.width || gw("宽度");
-    const h = p.height || gw("高度");
-    const len = p.length || gw("每段帧数");
+    /* 画幅：优先 宽高比+百万像素 换算，自定义/非法回落 宽×高（或存档指纹） */
+    const ar = AR_RATIO[gw(W_AR)] ? gw(W_AR) : "";
+    let geo = "";
+    if (ar) {
+        const c = resolveCanvas(ar, gw(W_MP) || "0.5");
+        geo = c ? `${c[0]}×${c[1]}` : "—";
+    } else {
+        const w = p.width || gw(W_WIDTH);
+        const h = p.height || gw(W_HEIGHT);
+        geo = w && h ? `${w}×${h}` : "—";
+    }
+    const durRaw = Number(p.length ? p.length / 24 : gw(W_DUR));
+    const len = isFinite(durRaw) && durRaw > 0
+        ? `${(p.length ? p.length / 24 : durRaw).toFixed(1)}s/段${p.length ? `(${p.length}f)` : ""}` : "";
     const ctx = p.ctx || gw("引导帧数");
     return {
-        geo: w && h ? `${w}×${h}` : "—",
-        len: len ? `${len}f/段` : "",
+        geo,
+        len,
         ctx: ctx ? `引导${ctx}帧` : "",
     };
 }
 
+/** 项目总时长（秒）：生成段按 ds.segments[i].seconds（缺省=节点默认），插入段按默认估 */
+function chainSeconds(node, ds, plan) {
+    const defRaw = Number(getWidgetValue(node, W_DUR));
+    const def = isFinite(defRaw) && defRaw > 0 ? defRaw : 5.0;
+    let total = 0;
+    for (let i = 0; i < (plan || []).length; i++) {
+        const it = plan[i];
+        if (it.kind === "prompt" && it.idx !== undefined) {
+            const s = ds?.segments?.[it.idx];
+            total += s?.seconds ?? def;
+        } else {
+            total += def;   // 插入视频时长未知，按默认估
+        }
+    }
+    return total;
+}
+
 async function collectData() {
     const node = findNode();
+    if (node) fixInvalidArWidget(node);
     const state = await fetchJson("checkpoints", "h3chain_state.json");
     const idx = await fetchJson("checkpoints", "h3chain_index.json");
     let mf = null;
@@ -471,17 +876,23 @@ async function collectData() {
 
     let plan = null;
     let drafts = [];
-    if (node) ({ plan, drafts } = planFromNode(node));
-    if (!plan) {
-        // 无节点（或被删）：退化为 manifest 驱动的只读卡片
-        const total = (state && state.total) ?? (mf && mf.total) ?? 0;
-        plan = Array.from({ length: total }, (_v, i) => {
-            const ins = ((mf && mf.inserts) || []).find((x) => x.slot === i);
-            return ins ? { kind: "insert", pos: i + 1, file: ins.file || "" }
-                       : { kind: "prompt", text: ((mf && mf.prompts) || [])[i] || "", entry: null };
-        });
+    let ds = defaultDs();
+    if (node) {
+        ({ plan, drafts, ds } = planFromDs(node));
     }
-    return { node, state, idx, mf, plan, drafts, history, prefix };
+    if (!plan || !plan.length) {
+        const total = (state && state.total) ?? (mf && mf.total) ?? 0;
+        if (total) {
+            plan = Array.from({ length: total }, (_v, i) => {
+                const ins = ((mf && mf.inserts) || []).find((x) => x.slot === i);
+                return ins ? { kind: "insert", pos: i + 1, file: ins.file || "" }
+                           : { kind: "prompt", text: ((mf && mf.prompts) || [])[i] || "" };
+            });
+        } else {
+            plan = [];
+        }
+    }
+    return { node, state, idx, mf, plan, drafts, history, prefix, ds };
 }
 
 function statusLine(state, mf, plan) {
@@ -515,38 +926,39 @@ function injectStyles() {
     const style = el("style");
     style.id = STYLE_ID;
     style.textContent = `
-    :root{--h3d-ink:#0d1319;--h3d-panel:#151e27;--h3d-panel2:#1b2732;--h3d-line:#2e4252;--h3d-cyan:#65c8d8;--h3d-copper:#d18a4a;--h3d-bone:#edf2f4;--h3d-muted:#91a2ad;--h3d-ok:#6fca9a;--h3d-warn:#e9b96f;--h3d-danger:#e26d6d}
+    :root{--h3d-ink:#0b0d17;--h3d-panel:#141726;--h3d-panel2:#1a1e32;--h3d-line:#2a2f4a;--h3d-cyan:#a78bfa;--h3d-copper:#e6b566;--h3d-bone:#eef0fa;--h3d-muted:#9aa0be;--h3d-ok:#5fd4a2;--h3d-warn:#f0a35e;--h3d-danger:#f27d7d}
     .h3d-page *,.h3d-mini *,.h3d-dialog *{box-sizing:border-box}
     @keyframes h3d-blink{50%{opacity:.35}}
     .h3d-led{display:inline-flex;gap:7px;align-items:center;color:var(--h3d-muted);font-size:12px;white-space:nowrap}
-    .h3d-led i{width:8px;height:8px;border-radius:50%;background:#788995;flex:none}
-    .h3d-led.running i{background:var(--h3d-cyan);box-shadow:0 0 10px #65c8d8cc;animation:h3d-blink 1s infinite}
-    .h3d-led.done i{background:var(--h3d-ok);box-shadow:0 0 12px #6fca9a88}
-    .h3d-led.error i{background:var(--h3d-warn);box-shadow:0 0 12px #e9b96f88}
-    .h3d-btn{cursor:pointer;border:1px solid #334957;border-radius:6px;background:#16222b;color:var(--h3d-bone);padding:6px 11px;font-size:12px;font-family:inherit}
-    .h3d-btn:hover{filter:brightness(1.16)}
+    .h3d-led i{width:8px;height:8px;border-radius:50%;background:#6a6f8f;flex:none}
+    .h3d-led.running i{background:var(--h3d-cyan);box-shadow:0 0 10px #a78bfacc;animation:h3d-blink 1s infinite}
+    .h3d-led.done i{background:var(--h3d-ok);box-shadow:0 0 12px #5fd4a288}
+    .h3d-led.error i{background:var(--h3d-warn);box-shadow:0 0 12px #f0a35e88}
+    .h3d-btn{cursor:pointer;border:1px solid #343a5e;border-radius:6px;background:#171b2e;color:var(--h3d-bone);padding:6px 11px;font-size:12px;font-family:inherit;transition:border-color .12s,filter .12s}
+    .h3d-btn:hover{filter:brightness(1.18)}
     .h3d-btn:disabled{opacity:.5;cursor:not-allowed;filter:none}
-    .h3d-btn-cyan{border-color:#3f7385;background:#12313c;color:#7ce9f8}
-    .h3d-btn-danger{border-color:#6d3f43;background:#2c1c22;color:#ff9a9a}
-    .h3d-btn-cta{border:0;background:var(--h3d-copper);color:#101820;font-weight:700}
-    .h3d-chip{font-size:10.5px;padding:2px 8px;border-radius:10px;border:1px solid #405362;background:#1a2730;color:#aebdc5;white-space:nowrap}
-    .h3d-chip.ok{border-color:#3f8062;background:#18382a;color:#8ce1ad}
-    .h3d-chip.media{border-color:#765f3d;background:#352b1d;color:#e9b96f}
-    .h3d-chip.cyan{border-color:#3f7385;background:#12313c;color:#7ce9f8}
-    .h3d-chip.warn{border-color:#6d3f43;background:#4a2026;color:#ff8585}
+    .h3d-btn-cyan{border-color:#565092;background:#242045;color:#bfaeff}
+    .h3d-btn-danger{border-color:#6e3a4a;background:#2e1826;color:#ff9a9a}
+    .h3d-btn-cta{border:0;background:linear-gradient(135deg,#f0c274,#e6b566 55%,#d99e4a);color:#1a1408;font-weight:700;box-shadow:0 2px 14px #e6b56633}
+    .h3d-btn-cta:hover{filter:brightness(1.08);box-shadow:0 3px 18px #e6b56644}
+    .h3d-chip{font-size:10.5px;padding:2px 8px;border-radius:10px;border:1px solid #3a4066;background:#1d2138;color:#b6bcdc;white-space:nowrap}
+    .h3d-chip.ok{border-color:#2f6e57;background:#17342a;color:#7fe0b0}
+    .h3d-chip.media{border-color:#7a5f36;background:#352a19;color:#e9c07a}
+    .h3d-chip.cyan{border-color:#565092;background:#242045;color:#bfaeff}
+    .h3d-chip.warn{border-color:#6e3a4a;background:#45202c;color:#ff8585}
 
     /* ---- 侧栏迷你入口卡 ---- */
-    .h3d-mini{display:flex;flex-direction:column;gap:9px;padding:10px;font-size:12px;color:var(--h3d-bone);background:linear-gradient(150deg,#121b23,#182630);border:1px solid #314756;border-radius:10px}
+    .h3d-mini{display:flex;flex-direction:column;gap:9px;padding:10px;font-size:12px;color:var(--h3d-bone);background:linear-gradient(150deg,#131626,#1c2038);border:1px solid #31375a;border-radius:10px}
     .h3d-mini-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
     .h3d-mini-brand{font-weight:700;letter-spacing:.04em;min-width:0}
     .h3d-mini-brand small{display:block;margin-top:3px;color:var(--h3d-cyan);font-weight:500;font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .h3d-mini-rail{display:flex;gap:3px}
-    .h3d-mini-rail span{flex:1;height:4px;border-radius:4px;background:#304452}
+    .h3d-mini-rail span{flex:1;height:4px;border-radius:4px;background:#33385a}
     .h3d-mini-rail span.done{background:var(--h3d-cyan)}
-    .h3d-mini-rail span.next{background:#3d6b7a;animation:h3d-blink 1.2s infinite}
+    .h3d-mini-rail span.next{background:#4d4680;animation:h3d-blink 1.2s infinite}
     .h3d-mini-cards{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}
-    .h3d-mini-card{min-height:62px;padding:9px;border:1px solid #2d414f;border-radius:8px;background:#111a21;font-size:11px;color:var(--h3d-muted);line-height:1.65;overflow:hidden}
-    .h3d-mini-count{display:grid;place-items:center;padding:9px 10px;min-width:66px;border:1px solid #2d414f;border-radius:8px;background:#111a21;font:700 20px/1.15 ui-monospace,Consolas;color:var(--h3d-cyan);text-align:center}
+    .h3d-mini-card{min-height:62px;padding:9px;border:1px solid #2f3352;border-radius:8px;background:#10131f;font-size:11px;color:var(--h3d-muted);line-height:1.65;overflow:hidden}
+    .h3d-mini-count{display:grid;place-items:center;padding:9px 10px;min-width:66px;border:1px solid #2f3352;border-radius:8px;background:#10131f;font:700 20px/1.15 ui-monospace,Consolas;color:var(--h3d-cyan);text-align:center}
     .h3d-mini-count small{font-size:10px;color:var(--h3d-muted);font-weight:400}
     .h3d-mini-foot{display:flex;flex-direction:column;gap:8px}
     .h3d-mini-params{color:var(--h3d-muted);font:10.5px ui-monospace,Consolas;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -554,82 +966,130 @@ function injectStyles() {
 
     /* ---- 全屏导演台 ---- */
     .h3d-page{position:fixed;inset:0;z-index:1000000;background:var(--h3d-ink);color:var(--h3d-bone);font:13px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif;display:grid;grid-template-rows:58px 1fr 58px}
-    .h3d-topbar{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;padding:0 20px;border-bottom:1px solid var(--h3d-line);background:#0f171e}
+    .h3d-topbar{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;padding:0 20px;border-bottom:1px solid var(--h3d-line);background:linear-gradient(90deg,#10131f,#171b30)}
     .h3d-top-left{min-width:0;display:flex;gap:14px;align-items:center}
     .h3d-kicker{color:var(--h3d-copper);font:700 11px/1 ui-monospace,Consolas;letter-spacing:.18em;white-space:nowrap}
     .h3d-title{font-size:17px;font-weight:700;white-space:nowrap}
     .h3d-sub{min-width:0;color:var(--h3d-muted);font-family:ui-monospace,Consolas;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .h3d-top-right{display:flex;gap:14px;align-items:center;justify-self:end}
-    .h3d-close{width:36px;height:36px;border:1px solid var(--h3d-line);border-radius:7px;background:#18232c;color:var(--h3d-bone);cursor:pointer;font-size:15px}
+    .h3d-close{width:36px;height:36px;border:1px solid var(--h3d-line);border-radius:7px;background:#181c30;color:var(--h3d-bone);cursor:pointer;font-size:15px}
     .h3d-close:hover{filter:brightness(1.2)}
     .h3d-stage{min-height:0;display:grid;grid-template-columns:minmax(255px,300px) minmax(400px,1fr) minmax(255px,300px);gap:1px;background:var(--h3d-line)}
     .h3d-col{min-width:0;min-height:0;background:var(--h3d-panel);overflow:auto}
-    .h3d-sechead{position:sticky;top:0;z-index:3;padding:14px 16px 10px;background:#151e27ed;backdrop-filter:blur(8px);border-bottom:1px solid #283b48}
+    .h3d-sechead{position:sticky;top:0;z-index:3;padding:14px 16px 10px;background:#141726ed;backdrop-filter:blur(8px);border-bottom:1px solid #272c47}
     .h3d-sechead strong{display:block}
     .h3d-sechead small{color:var(--h3d-muted)}
 
     .h3d-projlist{display:grid;gap:7px;padding:12px}
-    .h3d-proj{display:grid;gap:3px;padding:9px 10px 9px 13px;border:1px solid #2b414f;border-radius:8px;background:#111a21;cursor:pointer;box-shadow:inset 3px 0 0 #293e4a;text-align:left;font-family:inherit;color:inherit}
-    .h3d-proj:hover{background:#16222b}
-    .h3d-proj.active{box-shadow:inset 3px 0 0 var(--h3d-cyan);border-color:#3f7385}
+    .h3d-proj{display:grid;gap:3px;padding:9px 10px 9px 13px;border:1px solid #2f3352;border-radius:8px;background:#10131f;cursor:pointer;box-shadow:inset 3px 0 0 #33385a;text-align:left;font-family:inherit;color:inherit}
+    .h3d-proj:hover{background:#151929}
+    .h3d-proj.active{box-shadow:inset 3px 0 0 var(--h3d-cyan);border-color:#565092}
     .h3d-proj-name{font-weight:700;word-break:break-all;font-size:12.5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;color:var(--h3d-bone)}
     .h3d-proj-meta{color:var(--h3d-muted);font-size:11px;font-family:ui-monospace,Consolas}
     .h3d-newrow{display:flex;gap:8px;padding:0 12px 12px;flex-wrap:wrap}
-    .h3d-meter{margin:0 12px 12px;padding:11px;border:1px solid #324957;border-radius:8px;background:#111a21}
+    .h3d-meter{margin:0 12px 12px;padding:11px;border:1px solid #343a5e;border-radius:8px;background:#10131f}
     .h3d-meter strong{display:block;color:var(--h3d-cyan);font:700 16px/1.3 ui-monospace,Consolas}
     .h3d-meter p{margin:4px 0 0;color:var(--h3d-muted);font-size:11px}
     .h3d-drafts{margin:0 12px 12px;color:var(--h3d-muted);font-size:11px;line-height:1.7}
 
     .h3d-center-pad{padding:14px 18px 20px}
-    .h3d-statusbar{display:flex;align-items:center;gap:10px;padding:10px 13px;border:1px solid #3f7385;border-radius:8px;background:#12313c;line-height:1.6}
+    .h3d-statusbar{display:flex;align-items:center;gap:10px;padding:10px 13px;border:1px solid #565092;border-radius:8px;background:linear-gradient(90deg,#242045,#1a1e32);line-height:1.6}
     .h3d-statusbar .h3d-st-text{flex:1;min-width:0}
     .h3d-statusbar .h3d-chip{align-self:center}
     .h3d-refresh{padding:4px 10px;flex:none}
     .h3d-rail{display:flex;gap:4px;margin:12px 0 14px}
-    .h3d-rail span{flex:1;height:5px;border-radius:4px;background:#304452}
+    .h3d-rail span{flex:1;height:5px;border-radius:4px;background:#33385a}
     .h3d-rail span.done{background:var(--h3d-cyan)}
-    .h3d-rail span.next{background:#3d6b7a;animation:h3d-blink 1.2s infinite}
+    .h3d-rail span.next{background:#4d4680;animation:h3d-blink 1.2s infinite}
     .h3d-cards{display:grid;gap:10px}
-    .h3d-card{display:grid;grid-template-columns:150px minmax(0,1fr);gap:11px;padding:10px;border:1px solid #2b414f;border-radius:9px;background:#111a21}
+    .h3d-card{display:grid;grid-template-columns:150px minmax(0,1fr);gap:11px;padding:10px;border:1px solid #2f3352;border-radius:9px;background:#10131f}
     .h3d-card.todo{opacity:.72}
     .h3d-card.todo:hover{opacity:1}
-    .h3d-thumb{width:150px;aspect-ratio:16/9;border-radius:6px;overflow:hidden;background:#0a1014;display:grid;place-items:center;color:#5d707c;font:700 11px ui-monospace,Consolas}
+    .h3d-thumb{width:150px;aspect-ratio:16/9;border-radius:6px;overflow:hidden;background:#080a12;display:grid;place-items:center;color:#565b78;font:700 11px ui-monospace,Consolas}
     .h3d-thumb video,.h3d-thumb img{width:100%;height:100%;object-fit:cover}
     .h3d-thumb video.h3d-segvideo{object-fit:contain;background:#000}
     .h3d-cbody{min-width:0;display:flex;flex-direction:column;gap:5px}
     .h3d-ctitle{display:flex;gap:7px;align-items:center;flex-wrap:wrap;font-weight:700}
     .h3d-cmeta{color:var(--h3d-muted);font:11px ui-monospace,Consolas;word-break:break-all}
-    .h3d-cprompt{color:#c3d0d6;font-size:12px;line-height:1.65;word-break:break-word}
-    .h3d-ta{width:100%;min-height:84px;resize:vertical;border:1px solid #314754;border-radius:6px;background:#121c24;color:var(--h3d-bone);padding:8px 9px;font:12.5px/1.65 "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none;box-sizing:border-box}
-    .h3d-ta:focus{border-color:#79e9ff;box-shadow:0 0 0 2px #65c8d833}
-    .h3d-ta:disabled{color:#5d707c;cursor:not-allowed;background:#0c1419}
+    .h3d-cprompt{color:#c6cbe4;font-size:12px;line-height:1.65;word-break:break-word}
+    .h3d-ta{width:100%;min-height:84px;resize:vertical;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:8px 9px;font:12.5px/1.65 "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none;box-sizing:border-box}
+    .h3d-ta:focus{border-color:#b3a1ff;box-shadow:0 0 0 2px #a78bfa33}
+    .h3d-ta:disabled{color:#565b78;cursor:not-allowed;background:#0d0f1a}
     .h3d-ta-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px}
     .h3d-ta-hint{color:var(--h3d-muted);font-size:10.5px}
     .h3d-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:2px}
     .h3d-hint{color:var(--h3d-muted);font-size:11px;align-self:center}
-    .h3d-editor{display:grid;gap:7px;margin-top:4px;padding:10px;border:1px solid #385162;border-radius:8px;background:#0f171d}
-    .h3d-editor textarea{width:100%;min-height:96px;resize:vertical;border:1px solid #314754;border-radius:6px;background:#121c24;color:var(--h3d-bone);padding:9px;font:13px/1.7 "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none}
-    .h3d-editor textarea:focus{border-color:#79e9ff;box-shadow:0 0 0 2px #65c8d833}
+    .h3d-editor{display:grid;gap:7px;margin-top:4px;padding:10px;border:1px solid #3a4066;border-radius:8px;background:#0f1220}
+    .h3d-editor textarea{width:100%;min-height:96px;resize:vertical;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:9px;font:13px/1.7 "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none}
+    .h3d-editor textarea:focus{border-color:#b3a1ff;box-shadow:0 0 0 2px #a78bfa33}
     .h3d-editor-row{display:flex;gap:7px;flex-wrap:wrap}
     .h3d-addrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-    .h3d-drawer{margin-top:14px;border:1px solid #2d424f;border-radius:8px;background:#111a21}
+    .h3d-drawer{margin-top:14px;border:1px solid #303656;border-radius:8px;background:#10131f}
     .h3d-drawer summary{padding:10px 12px;cursor:pointer;color:var(--h3d-cyan)}
-    .h3d-drawer pre{margin:0;padding:0 12px 12px;white-space:pre-wrap;font-size:11.5px;max-height:300px;overflow:auto;color:#b9c8cf}
+    .h3d-drawer pre{margin:0;padding:0 12px 12px;white-space:pre-wrap;font-size:11.5px;max-height:300px;overflow:auto;color:#bcc3de}
 
     .h3d-hist{padding:12px;display:grid;gap:10px;align-content:start}
-    .h3d-empty{padding:16px 10px;border:1px dashed #3a5060;border-radius:8px;color:var(--h3d-muted);text-align:center;background:#101820;line-height:1.8}
-    .h3d-result{padding:8px;border:1px solid #365161;border-radius:9px;background:#0e171d}
-    .h3d-result.current{border-color:#3f7385}
-    .h3d-result video{display:block;width:100%;max-height:230px;border-radius:6px;background:#05090c}
+    .h3d-empty{padding:16px 10px;border:1px dashed #3a4066;border-radius:8px;color:var(--h3d-muted);text-align:center;background:#10131f;line-height:1.8}
+    .h3d-result{padding:8px;border:1px solid #363c60;border-radius:9px;background:#0f1220}
+    .h3d-result.current{border-color:#565092}
+    .h3d-result video{display:block;width:100%;max-height:230px;border-radius:6px;background:#05060c}
     .h3d-result-meta{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-top:7px}
-    .h3d-result-name{min-width:0;color:#b9c8cf;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .h3d-result-name{min-width:0;color:#bcc3de;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .h3d-result-info{color:var(--h3d-muted);font:10.5px ui-monospace,Consolas;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .h3d-result-acts{display:flex;gap:6px;flex:none}
-    .h3d-dl{padding:4px 8px;border:1px solid #437386;border-radius:6px;color:#7ce9f8;text-decoration:none;background:#18303a;font-size:11px}
+    .h3d-dl{padding:4px 8px;border:1px solid #565092;border-radius:6px;color:#bfaeff;text-decoration:none;background:#242045;font-size:11px}
     .h3d-dl:hover{filter:brightness(1.15)}
     .h3d-foot{padding:2px 16px 14px;color:var(--h3d-muted);font-size:10.5px;word-break:break-all;line-height:1.8}
 
-    .h3d-footer{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 20px;border-top:1px solid var(--h3d-line);background:#0f171e}
+    /* ---- 分段处理中心面板 ---- */
+    .h3d-seg-panel{margin-top:6px;border:1px solid #303656;border-radius:7px;background:#0e1122;overflow:hidden}
+    .h3d-seg-panel summary{padding:7px 10px;cursor:pointer;color:var(--h3d-cyan);font-size:11.5px;font-weight:600;user-select:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+    .h3d-seg-panel summary::-webkit-details-marker{display:none}
+    .h3d-seg-panel summary::before{content:"▸";font-size:10px;transition:transform .15s}
+    .h3d-seg-panel[open] summary::before{transform:rotate(90deg)}
+    .h3d-seg-panel.has-content{border-color:#565092}
+    .h3d-seg-body{display:grid;gap:7px;padding:0 10px 10px}
+    .h3d-seg-label{display:block;margin-bottom:2px;color:var(--h3d-muted);font-size:10.5px;font-weight:600}
+    .h3d-seg-ta{min-height:48px !important;font-size:12px !important;line-height:1.55 !important}
+
+    /* ---- 每段时长 + 段级引用素材 ---- */
+    .h3d-secs{width:58px;border:1px solid #333a5c;border-radius:5px;background:#131626;color:var(--h3d-bone);padding:2px 4px;font:11px ui-monospace,Consolas;text-align:right;outline:none}
+    .h3d-secs:focus{border-color:#b3a1ff}
+    .h3d-secs-hint{color:var(--h3d-muted);font:10px ui-monospace,Consolas;white-space:nowrap}
+    .h3d-refrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:7px 8px;border:1px solid #303656;border-radius:7px;background:#0e1122}
+    .h3d-refrow>label{color:var(--h3d-muted);font-size:10.5px;font-weight:600;flex:none}
+    .h3d-refchip{display:inline-flex;gap:5px;align-items:center;padding:3px 8px 3px 3px;border:1px solid #343a5e;border-radius:12px;background:#171b2e;color:#9aa3c4;cursor:pointer;font-size:11px;font-family:inherit}
+    .h3d-refchip:hover{border-color:#565092}
+    .h3d-refchip.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
+    .h3d-refchip img{width:20px;height:20px;border-radius:9px;object-fit:cover;background:#080a12}
+    .h3d-reftpl{max-width:118px;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:3px 4px;font-size:11px;outline:none;margin-left:auto}
+    .h3d-reftpl:focus{border-color:#b3a1ff}
+
+    /* ---- 素材标签编辑 ---- */
+    .h3d-labelinp{width:100%;border:1px solid #333a5c;border-radius:5px;background:#131626;color:var(--h3d-bone);padding:4px 6px;font:600 12px "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none}
+    .h3d-labelinp:focus{border-color:#b3a1ff;box-shadow:0 0 0 2px #a78bfa33}
+    .h3d-quicklbl{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px}
+    .h3d-quicklbl button{padding:2px 7px;border:1px solid #343a5e;border-radius:10px;background:#171b2e;color:#9aa0be;cursor:pointer;font-size:10px;font-family:inherit}
+    .h3d-quicklbl button:hover{border-color:#565092;color:#d6dcf5}
+    .h3d-asset-usage{margin-top:5px;display:flex;gap:4px;flex-wrap:wrap}
+
+    /* ---- 链参数：换算徽章 + 高级设置折叠 ---- */
+    .h3d-convbadge{grid-column:1/-1;margin:-4px 0 0;padding:8px 10px;border:1px dashed #565092;border-radius:7px;background:#1e1c38;color:#bfaeff;font:11.5px ui-monospace,Consolas;word-break:break-all}
+    .h3d-adv{grid-column:1/-1;border:1px solid #303656;border-radius:8px;background:#0e1120;overflow:hidden}
+    .h3d-adv summary{padding:8px 10px;cursor:pointer;color:var(--h3d-muted);font-size:11.5px;font-weight:600;user-select:none}
+    .h3d-adv summary:hover{color:#d6dcf5}
+    .h3d-adv summary::-webkit-details-marker{display:none}
+    .h3d-adv summary::before{content:"⚙ ";}
+    .h3d-adv[open] summary{border-bottom:1px solid #272c47;color:var(--h3d-cyan)}
+    .h3d-adv-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px}
+    .h3d-adv .h3d-param{margin:0}
+    .h3d-param{margin:0}
+    .h3d-param .h3d-hint{display:block;margin-top:4px}
+
+    .h3d-loadwf{display:flex;flex-direction:column;gap:10px;align-items:center;padding:22px 14px;border:1px dashed #565092;border-radius:10px;background:#1e1c38;text-align:center;line-height:1.9}
+    .h3d-loadwf p{margin:0;color:var(--h3d-muted);font-size:11.5px}
+
+    .h3d-footer{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 20px;border-top:1px solid var(--h3d-line);background:#10131f}
     .h3d-footinfo{display:flex;gap:16px;color:var(--h3d-muted);flex-wrap:wrap;min-width:0;font-size:11.5px;align-items:center}
     .h3d-footinfo b{color:var(--h3d-bone)}
     .h3d-run{min-width:150px;padding:11px 18px}
@@ -637,16 +1097,16 @@ function injectStyles() {
     /* ---- 素材与参考 / 链参数 ---- */
     .h3d-lsec,.h3d-rsec{display:flex;flex-direction:column;min-height:0}
     .h3d-col.left .h3d-sechead,.h3d-col.right .h3d-sechead{position:static;backdrop-filter:none}
-    .h3d-modebar{display:flex;gap:6px;padding:10px 12px 6px;border-bottom:1px solid var(--h3d-line);background:#0c1419}
-    .h3d-mode{flex:1;min-width:0;padding:8px 4px;border:1px solid #2b414f;border-radius:7px;background:#111a21;color:#9fb3bb;cursor:pointer;font:700 12px "Microsoft YaHei UI","Segoe UI",sans-serif;transition:all .12s}
-    .h3d-mode:hover{border-color:#3f6e80;color:#cfe2e8}
-    .h3d-mode.active{color:#06141a;background:var(--h3d-cyan);border-color:var(--h3d-cyan);box-shadow:0 0 0 1px var(--h3d-cyan) inset}
+    .h3d-modebar{display:flex;gap:6px;padding:10px 12px 6px;border-bottom:1px solid var(--h3d-line);background:#0d0f1a}
+    .h3d-mode{flex:1;min-width:0;padding:8px 4px;border:1px solid #2f3352;border-radius:7px;background:#10131f;color:#9aa3c4;cursor:pointer;font:700 12px "Microsoft YaHei UI","Segoe UI",sans-serif;transition:all .12s}
+    .h3d-mode:hover{border-color:#565092;color:#d6dcf5}
+    .h3d-mode.active{color:#16102e;background:var(--h3d-cyan);border-color:var(--h3d-cyan);box-shadow:0 0 0 1px var(--h3d-cyan) inset,0 0 14px #a78bfa44}
     .h3d-mode small{display:block;font-weight:400;font-size:9.5px;opacity:.72;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .h3d-mode.active small{opacity:.85}
     .h3d-assets{display:grid;gap:8px;padding:12px}
-    .h3d-asset{display:grid;grid-template-columns:64px minmax(0,1fr) auto;gap:9px;align-items:center;padding:8px;border:1px solid #2b414f;border-radius:8px;background:#111a21;box-shadow:inset 3px 0 0 #293e4a}
+    .h3d-asset{display:grid;grid-template-columns:64px minmax(0,1fr) auto;gap:9px;align-items:center;padding:8px;border:1px solid #2f3352;border-radius:8px;background:#10131f;box-shadow:inset 3px 0 0 #33385a}
     .h3d-asset.on{box-shadow:inset 3px 0 0 var(--h3d-cyan)}
-    .h3d-asset-thumb{width:64px;height:52px;border-radius:5px;background:#202c35;display:grid;place-items:center;overflow:hidden;color:#6f818d;font:700 10px ui-monospace,Consolas}
+    .h3d-asset-thumb{width:64px;height:52px;border-radius:5px;background:#1e2238;display:grid;place-items:center;overflow:hidden;color:#6a6f8f;font:700 10px ui-monospace,Consolas}
     .h3d-asset-thumb img{width:100%;height:100%;object-fit:cover}
     .h3d-asset-copy{min-width:0}
     .h3d-asset-copy strong{display:block;font-size:12px}
@@ -656,25 +1116,25 @@ function injectStyles() {
     .h3d-addasset{justify-self:start;padding:6px 12px}
     .h3d-params{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:12px}
     .h3d-param label{display:block;margin-bottom:4px;color:var(--h3d-muted);font-size:11px}
-    .h3d-select,.h3d-seedrow input{width:100%;border:1px solid #314754;border-radius:6px;background:#121c24;color:var(--h3d-bone);padding:6px 7px;font-size:12px;outline:none;font-family:inherit}
-    .h3d-select:focus,.h3d-seedrow input:focus{border-color:#79e9ff}
+    .h3d-select,.h3d-seedrow input{width:100%;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:6px 7px;font-size:12px;outline:none;font-family:inherit}
+    .h3d-select:focus,.h3d-seedrow input:focus{border-color:#b3a1ff}
     .h3d-seedrow{display:flex;gap:5px}
     .h3d-seedrow input{flex:1;min-width:0}
     .h3d-seedrow .h3d-btn{padding:4px 8px;flex:none}
     .h3d-psec .h3d-foot,.h3d-asec .h3d-foot,.h3d-projsec .h3d-foot{padding:0 16px 14px}
 
     /* ---- 新建项目模态 ---- */
-    .h3d-overlay{position:fixed;z-index:1000003;inset:0;display:grid;place-items:center;padding:24px;background:#05090dcf;backdrop-filter:blur(10px)}
-    .h3d-dialog{width:min(470px,calc(100vw - 40px));border:1px solid #3a5464;border-radius:14px;background:linear-gradient(160deg,#17232c,#0e161c 62%);box-shadow:0 22px 64px #000b;padding:20px;color:var(--h3d-bone);font:13px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif}
+    .h3d-overlay{position:fixed;z-index:1000003;inset:0;display:grid;place-items:center;padding:24px;background:#07060fd0;backdrop-filter:blur(10px)}
+    .h3d-dialog{width:min(470px,calc(100vw - 40px));border:1px solid #3f4570;border-radius:14px;background:linear-gradient(160deg,#1c2038,#12141f 62%);box-shadow:0 22px 64px #000b;padding:20px;color:var(--h3d-bone);font:13px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif}
     .h3d-dialog h3{margin:0 0 6px;font-size:16px}
     .h3d-dialog .h3d-lead{color:var(--h3d-muted);margin:0 0 14px;line-height:1.75;font-size:12px}
-    .h3d-dialog input[type=text]{width:100%;border:1px solid #314754;border-radius:6px;background:#121c24;color:var(--h3d-bone);padding:9px 10px;font:13px ui-monospace,Consolas;outline:none;margin-bottom:6px}
-    .h3d-dialog input[type=text]:focus{border-color:#79e9ff}
+    .h3d-dialog input[type=text]{width:100%;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:9px 10px;font:13px ui-monospace,Consolas;outline:none;margin-bottom:6px}
+    .h3d-dialog input[type=text]:focus{border-color:#b3a1ff}
     .h3d-err{color:#ff8585;font-size:11px;min-height:16px;margin-bottom:6px}
     .h3d-check{display:flex;gap:8px;align-items:center;color:var(--h3d-muted);font-size:12px;margin-bottom:14px;cursor:pointer}
     .h3d-dialog-row{display:flex;gap:8px;justify-content:flex-end}
 
-    .h3d-fab{position:fixed;right:16px;top:120px;z-index:80;width:44px;height:44px;border-radius:50%;border:1px solid #3f7385;background:#18303a;color:#7ce9f8;cursor:pointer;font-size:17px}
+    .h3d-fab{position:fixed;right:16px;top:120px;z-index:80;width:44px;height:44px;border-radius:50%;border:1px solid #565092;background:#242045;color:#bfaeff;cursor:pointer;font-size:17px}
     .h3d-fab:hover{filter:brightness(1.2)}
 
     @media(max-width:1200px){.h3d-sub{display:none}}
@@ -713,8 +1173,9 @@ function renderMini(data) {
 
     const foot = el("div", "h3d-mini-foot");
     const ps = paramsSummary(node, mf);
+    const totalSec = plan?.length ? `共${chainSeconds(node, data.ds, plan).toFixed(1)}s/${plan.length}段` : "";
     foot.append(el("div", "h3d-mini-params",
-        escapeHtml([ps.geo, ps.len, ps.ctx].filter(Boolean).join(" · ") || "参数待首次运行后显示")));
+        escapeHtml([ps.geo, ps.len, ps.ctx, totalSec].filter(Boolean).join(" · ") || "参数待首次运行后显示")));
     const open = el("button", "h3d-btn h3d-btn-cta h3d-mini-open", "打开长片导演台");
     open.onclick = openDesk;
     foot.append(open);
@@ -754,7 +1215,7 @@ function openDesk() {
     const lAssets = el("section", "h3d-lsec h3d-asec");
     colL.append(lProj, lAssets);
     const colC = el("section", "h3d-col center");
-    colC.append(el("div", "h3d-sechead", "<strong>段落流水线</strong><small>卡片 = 生成顺序；✏ 改词 · 🎲 重摇 · 📎 插视频</small>"));
+    colC.append(el("div", "h3d-sechead", "<strong>段落流水线</strong><small>卡片 = 生成顺序；✏ 改词 · 🎲 重摇 · 📎 插视频 · 🎬 分段处理（场景/角色）</small>"));
     const colR = el("aside", "h3d-col right");
     const rParams = el("section", "h3d-rsec h3d-psec");
     const rHist = el("section", "h3d-rsec h3d-hsec");
@@ -799,7 +1260,7 @@ function isVideoPlaying(root) {
 }
 
 function cardsSignature(data) {
-    const { state, plan } = data;
+    const { state, plan, ds } = data;
     return JSON.stringify({
         dir: state?.dir ?? "",
         done: state?.done ?? 0,
@@ -807,6 +1268,11 @@ function cardsSignature(data) {
         review: !!state?.review,
         reroll: state?.reroll ?? 0,
         plan: (plan || []).map((it) => it.kind === "insert" ? ["i", it.pos, it.file] : ["p", it.text]),
+        segs: (ds?.segments || []).map((s) => [s.scene_prompt ?? "", s.character_prompt ?? "",
+                                               s.seconds ?? 0, (s.refs || []).join(",")]),
+        labels: (ds?.ref_assets || []).map((a) => a.label),
+        mode: ds?.mode ?? "",
+        dur: String(getWidgetValue(data.node, W_DUR) ?? ""),
     });
 }
 
@@ -820,9 +1286,11 @@ function updateDesk(data) {
     z.project.textContent = `项目 · ${dirName}`;
     paintLeds();
 
-    /* 左栏：项目与链 + 素材与参考 */
+    /* 左栏：项目与链 + 素材与参考（标签输入聚焦时跳过重渲，防丢焦） */
     renderLeftColumn(z.lProj, data);
-    renderAssetsZone(z.lAssets, data);
+    if (!z.lAssets.querySelector(".h3d-labelinp:focus")) {
+        renderAssetsZone(z.lAssets, data);
+    }
 
     /* 中栏：状态条 + 进度轨 + 段落卡片（有编辑器/播放中时跳过重渲） */
     renderCenterColumn(z.colC, data);
@@ -887,9 +1355,11 @@ function renderLeftColumn(sec, data) {
         const done = state.done ?? 0;
         const total = state.total ?? 0;
         const ps = paramsSummary(node, data.mf);
+        const totalSec = data.plan?.length
+            ? `共${chainSeconds(node, data.ds, data.plan).toFixed(1)}s` : "";
         const meter = el("div", "h3d-meter");
         meter.innerHTML = `<strong>${done}/${total || "?"} 段${state.review ? " · 审片中" : ""}</strong>
-            <p>${escapeHtml([ps.geo, ps.len, ps.ctx].filter(Boolean).join(" · ") || "参数待首次运行后显示")}</p>`;
+            <p>${escapeHtml([ps.geo, ps.len, ps.ctx, totalSec].filter(Boolean).join(" · ") || "参数待首次运行后显示")}</p>`;
         sec.append(meter);
         sec.append(el("div", "h3d-foot", `链目录：output/checkpoints/${escapeHtml(state.dir)}`));
     }
@@ -944,11 +1414,19 @@ function buildCenterBody(data) {
     bar.append(refreshBtn);
     wrap.append(bar);
 
-    /* 段落进度轨 */
+    /* 段落进度轨（按各段时长加权，宽度≈时长比例） */
     if (total > 0) {
+        const defRaw = Number(getWidgetValue(node, W_DUR));
+        const def = isFinite(defRaw) && defRaw > 0 ? defRaw : 5.0;
         const rail = el("div", "h3d-rail");
         for (let i = 0; i < Math.min(total, MAX_SEG); i++) {
-            rail.append(el("span", i < done ? "done" : i === done ? "next" : ""));
+            const it = plan[i];
+            const sec = it?.kind === "prompt" && it.idx !== undefined
+                ? (data.ds.segments[it.idx]?.seconds ?? def) : def;
+            const sp = el("span", i < done ? "done" : i === done ? "next" : "");
+            sp.style.flexGrow = String(Math.max(1, sec));
+            sp.title = `段 ${i + 1} · ${sec}s${it?.kind === "insert" ? "（插入视频，按默认估）" : ""}`;
+            rail.append(sp);
         }
         wrap.append(rail);
     }
@@ -966,7 +1444,7 @@ function buildCenterBody(data) {
     const addrow = el("div", "h3d-addrow");
     if (node) {
         const addSeg = el("button", "h3d-btn", "＋ 添加一段");
-        addSeg.title = "新增一段提示词：画布上创建 PrimitiveStringMultiline 并连到新输入槽，台内即可直接填写";
+        addSeg.title = "新增一段提示词到导演台状态";
         addSeg.onclick = () => addPromptSegment(node);
         addrow.append(addSeg);
         if (hasInserts(node)) {
@@ -976,6 +1454,11 @@ function buildCenterBody(data) {
                 addrow.append(tail);
             }
         }
+    } else if (window.H3_DEFAULT_WORKFLOW) {
+        const wf = el("button", "h3d-btn h3d-btn-cyan", "⚡ 一键载入配套工作流");
+        wf.title = "画布上还没有 H3 链节点：载入官方风格预置工作流（模型加载 + 主节点 + 常驻连线的素材池）";
+        wf.onclick = loadDefaultWorkflow;
+        addrow.append(wf);
     }
     wrap.append(addrow);
 
@@ -1000,7 +1483,7 @@ function buildCards(data) {
     if (!plan.length) {
         wrap.append(el("div", "h3d-empty",
             node
-                ? "还没有段落：点上方「＋ 添加一段」或在画布节点填写提示词组，卡片会立即出现。"
+                ? "还没有段落：点上方「＋ 添加一段」开始填写提示词。"
                 : "画布上未找到 H3 Seamless Chain 节点，且暂无历史链数据。添加节点后这里成为段落流水线。"));
         return wrap;
     }
@@ -1024,6 +1507,34 @@ function buildCards(data) {
             : isInsert ? badge("插入段", "media") : badge("已完成", "ok");
         const title = el("div", "h3d-ctitle",
             `<span>段 ${idx + 1}${isInsert ? `（位置 ${it.pos}）` : ""}</span>${stateChip}`);
+
+        /* 每段时长（秒）：留空=跟随节点默认；显示吸附后的帧数 */
+        let secsHint = null;
+        if (node && it.idx !== undefined) {
+            const segData = data.ds.segments[it.idx] || defaultSegment();
+            const defRaw = Number(getWidgetValue(node, W_DUR));
+            const defSec = isFinite(defRaw) && defRaw > 0 ? defRaw : 5.0;
+            const secsInp = document.createElement("input");
+            secsInp.type = "number";
+            secsInp.className = "h3d-secs";
+            secsInp.min = "0.5"; secsInp.max = "15"; secsInp.step = "0.1";
+            secsInp.placeholder = String(defSec);
+            secsInp.value = segData.seconds ?? "";
+            secsInp.title = "本段时长（秒）：留空=跟随右栏「每段时长」默认；内部自动吸附 17k+5 帧网格(@24fps)";
+            secsHint = el("span", "h3d-secs-hint",
+                `≈${snapFrames(segData.seconds ?? defSec)}帧`);
+            const syncHint = (v) => {
+                const num = Number(v);
+                const sec = (v === "" || !isFinite(num) || num <= 0) ? defSec : num;
+                secsHint.textContent = `≈${snapFrames(sec)}帧`;
+            };
+            secsInp.addEventListener("input", () => syncHint(secsInp.value));
+            secsInp.addEventListener("change", () => {
+                setSegmentSeconds(node, it.idx, secsInp.value);
+                syncHint(secsInp.value);
+            });
+            title.append(secsInp, secsHint, el("span", "h3d-secs-hint", "秒"));
+        }
         body.append(title);
 
         const seedTxt = isDone && !isInsert && seeds[idx] != null ? `种子 ${seeds[idx]}` : "";
@@ -1033,7 +1544,7 @@ function buildCards(data) {
         const meta = [seedTxt, seamTxt, bridgeTxt].filter(Boolean).join(" · ");
         if (meta) body.append(el("div", "h3d-cmeta", escapeHtml(meta)));
 
-        /* 提示词：常驻 textarea（插入段显示文件名只读）—— 直接在台内编辑，实时写回节点 */
+        /* 提示词：常驻 textarea（插入段显示文件名只读）—— 直接在台内编辑，实时写回 JSON 状态 */
         if (isInsert) {
             body.append(el("div", "h3d-cprompt", escapeHtml(it.file)));
         } else {
@@ -1041,19 +1552,132 @@ function buildCards(data) {
             ta.className = "h3d-ta";
             ta.rows = 4;
             ta.value = it.text || "";
-            ta.placeholder = `第 ${idx + 1} 段画面描述：顺着上一段结尾继续，或写 <Picture N> 引用参考图`;
-            if (!it.entry || !node) {
+            const pool = (data.ds.ref_assets || []);
+            const poolHint = pool.length
+                ? `用 [[${pool[0].label}]] 这样的标签引用素材，或手写 <Picture N>`
+                : "上传参考图后可用 [[标签]] 引用";
+            ta.placeholder = `第 ${idx + 1} 段画面描述：顺着上一段结尾继续；${poolHint}`;
+            if (!node || it.idx === undefined) {
                 ta.disabled = true;
-                ta.title = "历史段只读（画布上无对应提示词输入，或未找到节点）";
+                ta.title = it.idx === undefined ? "历史段只读（来自存档，非导演台状态）" : "画布上未找到节点";
             } else {
-                ta.addEventListener("input", () => debounceWrite(node, it.entry, ta.value));
+                ta.addEventListener("input", () => debouncePromptWrite(node, it.idx, ta.value));
                 ta.addEventListener("blur", () => {
-                    const t = _taTimers.get(it.entry);
-                    if (t) { clearTimeout(t); _taTimers.delete(it.entry); }
-                    writePromptText(node, it.entry, ta.value);
+                    const key = `p${it.idx}`;
+                    const t = _taTimers.get(key);
+                    if (t) { clearTimeout(t); _taTimers.delete(key); }
+                    setPromptText(node, it.idx, ta.value);
+                    scheduleRefresh(200);
                 });
             }
             body.append(ta);
+
+            /* 引用素材：勾选本段用哪些图（后端按勾选顺序压实 <Picture k>） */
+            if (node && it.idx !== undefined && data.ds.mode === "多参视频" && pool.length) {
+                const seg = data.ds.segments[it.idx] || defaultSegment();
+                const row = el("div", "h3d-refrow");
+                row.append(el("label", "", "引用素材"));
+                pool.forEach((a) => {
+                    const on = (seg.refs || []).includes(a.label);
+                    const chip = el("button", "h3d-refchip" + (on ? " on" : ""));
+                    chip.type = "button";
+                    chip.title = `勾选后本段仅引用这些图（按勾选顺序编号 <Picture k>）；提示词写 [[${a.label}]] 引用`;
+                    const im = document.createElement("img");
+                    im.loading = "lazy";
+                    im.src = inputViewUrl(a.file);
+                    im.onerror = () => im.remove();
+                    chip.append(im, document.createTextNode(a.label));
+                    chip.onclick = () => { toggleSegmentRef(node, it.idx, a.label); scheduleRefresh(80); };
+                    row.append(chip);
+                });
+                if ((seg.refs || []).length) {
+                    const reset = el("button", "h3d-btn", "↺ 全部");
+                    reset.type = "button";
+                    reset.style.padding = "3px 8px";
+                    reset.style.fontSize = "10.5px";
+                    reset.title = "清空段级选择 = 引用全部素材（与旧版行为一致）";
+                    reset.onclick = () => {
+                        const ds = getDs(node);
+                        if (ds.segments[it.idx]) ds.segments[it.idx].refs = [];
+                        setDs(node, ds);
+                        scheduleRefresh(80);
+                    };
+                    row.append(reset);
+                } else {
+                    row.insertAdjacentHTML("beforeend",
+                        '<span class="h3d-secs-hint">未勾选=引用全部</span>');
+                }
+                /* 引用语模板：把现成句式插入主提示词光标处 */
+                const tpl = document.createElement("select");
+                tpl.className = "h3d-reftpl";
+                const optEmpty = document.createElement("option");
+                optEmpty.value = "";
+                optEmpty.textContent = "引用语…";
+                tpl.append(optEmpty);
+                REF_TEMPLATES.forEach(([name, fn], ti) => {
+                    const o = document.createElement("option");
+                    o.value = String(ti);
+                    o.textContent = name;
+                    tpl.append(o);
+                });
+                tpl.onchange = () => {
+                    const ti = Number(tpl.value);
+                    tpl.value = "";
+                    if (!Number.isInteger(ti) || !REF_TEMPLATES[ti]) return;
+                    const target = (seg.refs || [])[0] || pool[0].label;
+                    const phrase = REF_TEMPLATES[ti][1](target);
+                    insertAtCursor(ta, (ta.value && !/[\s,，。;；]$/.test(ta.value.slice(-1)) ? "\n" : "") + phrase);
+                    setPromptText(node, it.idx, ta.value);
+                    scheduleRefresh(150);
+                };
+                row.append(tpl);
+                body.append(row);
+            }
+
+            /* 分段处理中心：场景/角色提示词（可展开折叠） */
+            if (node && it.idx !== undefined) {
+                const seg = (data.ds.segments && data.ds.segments[it.idx]) || defaultSegment();
+                const hasSeg = !!(seg.scene_prompt || seg.character_prompt);
+                const det = el("details", "h3d-seg-panel" + (hasSeg ? " has-content" : ""));
+                det.open = hasSeg;
+                det.innerHTML = `<summary>分段处理 · 场景 & 角色${hasSeg ? ' <span class="h3d-chip cyan">已填写</span>' : ""}</summary>`;
+                const segBody = el("div", "h3d-seg-body");
+
+                const sceneLabel = el("label", "h3d-seg-label", "场景提示词");
+                const sceneTa = document.createElement("textarea");
+                sceneTa.className = "h3d-ta h3d-seg-ta";
+                sceneTa.rows = 2;
+                sceneTa.value = seg.scene_prompt || "";
+                sceneTa.placeholder = "本段场景描述（环境、光照、氛围等），留空则不附加";
+                sceneTa.addEventListener("input", () => debounceSegmentWrite(node, it.idx, "scene_prompt", sceneTa.value));
+                sceneTa.addEventListener("blur", () => {
+                    const key = `s${it.idx}_scene_prompt`;
+                    const t = _taTimers.get(key);
+                    if (t) { clearTimeout(t); _taTimers.delete(key); }
+                    setSegmentField(node, it.idx, "scene_prompt", sceneTa.value);
+                    scheduleRefresh(200);
+                });
+                segBody.append(sceneLabel, sceneTa);
+
+                const charLabel = el("label", "h3d-seg-label", "角色提示词");
+                const charTa = document.createElement("textarea");
+                charTa.className = "h3d-ta h3d-seg-ta";
+                charTa.rows = 2;
+                charTa.value = seg.character_prompt || "";
+                charTa.placeholder = "本段角色描述（外貌、动作、表情等），留空则不附加";
+                charTa.addEventListener("input", () => debounceSegmentWrite(node, it.idx, "character_prompt", charTa.value));
+                charTa.addEventListener("blur", () => {
+                    const key = `s${it.idx}_character_prompt`;
+                    const t = _taTimers.get(key);
+                    if (t) { clearTimeout(t); _taTimers.delete(key); }
+                    setSegmentField(node, it.idx, "character_prompt", charTa.value);
+                    scheduleRefresh(200);
+                });
+                segBody.append(charLabel, charTa);
+
+                det.append(segBody);
+                body.append(det);
+            }
         }
 
         const actions = el("div", "h3d-actions");
@@ -1080,6 +1704,12 @@ function buildCards(data) {
             } else if (canInsert) {
                 actions.append(insertButton(`插视频到段 ${idx + 1} 前`, idx + 1));
             }
+            if (node && it.idx !== undefined) {
+                const rm = el("button", "h3d-btn h3d-btn-danger", "✕ 删除此段");
+                rm.title = "删除这一段提示词（其后段落自动前移）";
+                rm.onclick = () => removePromptSegment(node, it.idx);
+                actions.append(rm);
+            }
         }
         body.append(actions);
 
@@ -1096,144 +1726,9 @@ function insertButton(label, pos) {
     return b;
 }
 
-/* ---- 素材与参考（上传即自动接线 LoadImage，免画布连线） ---- */
+/* ---- 素材与参考（状态驱动：标签素材池存 JSON，缩略图直接回显；配套工作流节点做画布镜像） ---- */
 
-function inputViewUrl(name) {
-    // 与官方 LoadImage 预览同源：/view 端点 + type=input，经 api.apiURL 兼容子路径部署
-    const norm = String(name ?? "").replaceAll("\\", "/");
-    const parts = norm.split("/");
-    const file = parts.pop() ?? "";
-    const sub = parts.join("/");
-    const q = new URLSearchParams({ filename: file, subfolder: sub, type: "input" });
-    try {
-        return api.apiURL(`/view?${q.toString()}`);
-    } catch (e) {
-        return `/view?${q.toString()}`;
-    }
-}
-
-async function uploadToInput(file) {
-    const fd = new FormData();
-    fd.append("image", file);
-    fd.append("type", "input");
-    fd.append("overwrite", "true");
-    const r = await fetch("/upload/image", { method: "POST", body: fd });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json();
-    return j.subfolder ? `${j.subfolder}/${j.name}` : j.name;
-}
-
-function loadImageWidget(imgNode) {
-    return (imgNode.widgets || []).find((w) => w.name === "image") || (imgNode.widgets || [])[0] || null;
-}
-
-function linkedImageInfo(node, inp) {
-    if (inp.link == null) return { src: null, file: "" };
-    const src = node.graph.getNodeById(inp.link.origin_id);
-    const w = src && loadImageWidget(src);
-    return { src, file: w ? String(w.value ?? "") : "" };
-}
-
-/** 参考图片槽位（编号 0 起，与后端 prefix="参考图片_" min=0 一致）。 */
-function refImageSlots(node) {
-    const pat = /^(?:参考图片组\.)?参考图片_(\d+)$/;
-    const out = [];
-    for (const inp of node.inputs || []) {
-        const m = pat.exec(inp.name);
-        if (!m) continue;
-        const info = linkedImageInfo(node, inp);
-        out.push({
-            num: Number(m[1]), name: inp.name,
-            idx: node.inputs.indexOf(inp), linked: inp.link != null,
-            src: info.src, file: info.file,
-        });
-    }
-    return out.sort((a, b) => a.num - b.num);
-}
-
-function ensureRefImageSlot(node, num) {
-    const iname = `参考图片组.参考图片_${num}`;
-    let inp = (node.inputs || []).find((i) => i.name === iname);
-    if (!inp) {
-        node.addInput(iname, "IMAGE");
-        node.graph.change();
-        inp = (node.inputs || []).find((i) => i.name === iname);
-    }
-    return inp ? node.inputs.indexOf(inp) : -1;
-}
-
-/** 断开图片输入；来源若是无其他连线的 LoadImage 则一并移除。 */
-function detachImageInput(node, idx) {
-    const inp = (node.inputs || [])[idx];
-    if (!inp || inp.link == null) return;
-    const src = node.graph.getNodeById(inp.link.origin_id);
-    node.disconnectInput(idx);
-    if (src && src.type === "LoadImage" && !(src.outputs || []).some((o) => o.links && o.links.length)) {
-        node.graph.remove(src);
-    }
-    node.graph.change();
-}
-
-/** 创建 LoadImage 节点（摆到采样器左侧）并连到目标输入槽。 */
-function attachLoadImage(node, targetIdx, fileName, title) {
-    let img = null;
-    try { img = LiteGraph.createNode("LoadImage"); } catch (e) { /* 老前端 */ }
-    if (!img) { alert("当前前端无法自动创建 LoadImage 节点：请手动加载图片并连到该输入"); return false; }
-    detachImageInput(node, targetIdx);
-    img.title = title;
-    attachLoadImage.n = (attachLoadImage.n || 0) + 1;
-    img.pos = [node.pos[0] - 300, node.pos[1] - 40 + attachLoadImage.n * 110];
-    node.graph.add(img);
-    const w = loadImageWidget(img);
-    if (w) {
-        // 先回调（让 LoadImage 刷新自身预览/选项列表），再重置 value：
-        // 部分 ComfyUI 前端的 callback 会因图片列表缓存未刷新而把 value 复位成空/旧值，
-        // 重置保证导演台缩略图能读到刚上传的文件名。
-        if (typeof w.callback === "function") {
-            try { w.callback(fileName); } catch (e) { /* callback 可选 */ }
-        }
-        w.value = fileName;
-    }
-    img.connect(0, node, targetIdx);
-    node.graph.change();
-    return true;
-}
-
-function pickRefImage(kind) {
-    const node = findNode();
-    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "image/*";
-    input.onchange = async () => {
-        const f = input.files && input.files[0];
-        if (!f) return;
-        let name;
-        try { name = await uploadToInput(f); }
-        catch (e) { alert(`上传失败：${e}`); return; }
-        if (kind === "first") {
-            const idx = (node.inputs || []).findIndex((i) => i.name === "首帧图片");
-            if (idx < 0) { alert("节点上没有「首帧图片」输入（可能被隐藏：右键节点 → Inputs 勾选）"); return; }
-            attachLoadImage(node, idx, name, "首帧图片");
-        } else {
-            const slots = refImageSlots(node);
-            if (slots.filter((s) => s.linked).length >= 9) { alert("参考图片最多 9 张"); return; }
-            // used 只收已连线槽位：空槽位直接复用，无空槽时取最小未用编号（后端按编号排序压实）
-            const used = new Set(slots.filter((s) => s.linked).map((s) => s.num));
-            const free = slots.find((s) => !s.linked);
-            let num = free ? free.num : 0;
-            while (used.has(num) && num <= 9) num++;
-            if (num > 9) { alert("参考图片最多 9 张"); return; }
-            const idx = ensureRefImageSlot(node, num);
-            if (idx < 0) { alert("无法添加参考图片输入槽"); return; }
-            attachLoadImage(node, idx, name, `参考图片_${num}`);
-        }
-        scheduleRefresh(200);
-    };
-    input.click();
-}
-
-function assetCard(title, file) {
+function assetCard(title, file, onRemove) {
     const card = el("div", "h3d-asset" + (file ? " on" : ""));
     const thumb = el("div", "h3d-asset-thumb", file ? "" : "<span>IMG</span>");
     if (file) {
@@ -1247,22 +1742,89 @@ function assetCard(title, file) {
     const copy = el("div", "h3d-asset-copy");
     copy.innerHTML = `<strong>${escapeHtml(title)}</strong><small>${escapeHtml(file || "未设置")}</small>`;
     card.append(thumb, copy);
+    if (file && onRemove) {
+        const acts = el("div", "h3d-asset-acts");
+        const rm = el("button", "h3d-btn h3d-btn-danger", "✕");
+        rm.title = "移除";
+        rm.onclick = onRemove;
+        acts.append(rm);
+        card.append(acts);
+    }
+    return card;
+}
+
+/** 多参模式：带标签编辑的素材卡（重命名同步所有段级引用） */
+function labeledAssetCard(node, ds, idx) {
+    const a = ds.ref_assets[idx];
+    const file = a.file;
+    const card = el("div", "h3d-asset on");
+    const thumb = el("div", "h3d-asset-thumb");
+    const im = document.createElement("img");
+    im.loading = "lazy";
+    im.src = inputViewUrl(file);
+    im.alt = a.label;
+    im.onerror = () => { thumb.replaceChildren(el("span", "", "⚠")); };
+    thumb.append(im);
+
+    const copy = el("div", "h3d-asset-copy");
+    const labelInp = document.createElement("input");
+    labelInp.className = "h3d-labelinp";
+    labelInp.value = a.label;
+    labelInp.spellcheck = false;
+    labelInp.maxLength = 12;
+    labelInp.title = "素材标签：提示词用 [[标签]] 引用；回车或失焦提交，重名自动加后缀";
+    const commit = () => {
+        const next = renameAssetLabel(node, idx, labelInp.value);
+        if (next !== labelInp.value) labelInp.value = next;
+        scheduleRefresh(120);
+    };
+    labelInp.addEventListener("change", commit);
+    labelInp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); labelInp.blur(); } });
+    const quick = el("div", "h3d-quicklbl");
+    QUICK_LABELS.forEach((q) => {
+        const b = el("button", "", q);
+        b.type = "button";
+        b.title = `把标签设为「${q}」（被占用时自动加后缀）`;
+        b.onclick = () => {
+            const taken = new Set(ds.ref_assets.filter((_x, i) => i !== idx).map((x) => x.label));
+            const want = uniqueLabelFrom(taken, q);
+            labelInp.value = want;
+            const got = renameAssetLabel(node, idx, want);
+            labelInp.value = got;
+            scheduleRefresh(120);
+        };
+        quick.append(b);
+    });
+    const usage = el("div", "h3d-asset-usage");
+    const usedBy = (ds.segments || []).filter((s) => (s.refs || []).includes(a.label)).length;
+    const defaultAll = (ds.segments || []).every((s) => !(s.refs || []).length);
+    usage.innerHTML = `<span class="h3d-chip">全局图${idx + 1}</span>`
+        + (usedBy ? `<span class="h3d-chip ok">${usedBy} 段指定</span>` : "")
+        + (defaultAll && (ds.segments || []).length ? '<span class="h3d-chip cyan">默认全段引用</span>' : "");
+    copy.append(labelInp, quick, usage,
+        el("small", "", `${escapeHtml(file)} · 提示词写 [[${escapeHtml(a.label)}]]`));
+
+    const acts = el("div", "h3d-asset-acts");
+    const rm = el("button", "h3d-btn h3d-btn-danger", "✕");
+    rm.title = "移除该素材（画布镜像节点隐藏，连线保留）";
+    rm.onclick = () => { removeRefImage(node, idx); };
+    acts.append(rm);
+    card.append(thumb, copy, acts);
     return card;
 }
 
 function renderAssetsZone(sec, data) {
-    const { node } = data;
+    const { node, ds } = data;
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
-        "<strong>素材与参考</strong><small>按模式自动接线，无需画布连线</small>"));
+        "<strong>素材池 · 分段处理中心</strong><small>上传素材 → 打标签 → 各段卡片勾选引用</small>"));
 
-    /* 模式条：3 个按钮，读写节点「生成模式」控件，切换即互斥 */
-    const mode = getMode(node);
-    const hasModeWidget = !!(node && (node.widgets || []).find((w) => w.name === W_MODE));
+    /* 模式条 */
+    const mode = ds.mode;
     const mbar = el("div", "h3d-modebar");
     for (const [code, label, desc] of MODES) {
         const b = el("button", "h3d-mode" + (code === mode ? " active" : ""));
-        const sub = code === "多参视频" ? "ref2va · &lt;Picture N&gt;"
+        const sub = code === "多参视频" ? "ref2va · [[标签]]"
             : code === "首帧视频" ? "fl2va · 首帧" : "fl2va · 纯文本";
         b.innerHTML = `${escapeHtml(label)}<small>${sub}</small>`;
         b.title = desc;
@@ -1273,132 +1835,158 @@ function renderAssetsZone(sec, data) {
 
     const box = el("div", "h3d-assets");
     if (!node) {
-        box.append(el("div", "h3d-empty", "画布上未找到 H3 Seamless Chain 节点"));
+        if (window.H3_DEFAULT_WORKFLOW) {
+            const guide = el("div", "h3d-loadwf");
+            guide.innerHTML = "<p>画布上还没有 H3 Seamless Chain 节点</p>"
+                + "<p>一键载入配套工作流：模型加载 + 主节点 + 常驻连线的素材池<br>（素材节点默认隐藏，上传素材时自动点亮，不再动态建线）</p>";
+            const wf = el("button", "h3d-btn h3d-btn-cyan", "⚡ 一键载入配套工作流");
+            wf.onclick = loadDefaultWorkflow;
+            guide.append(wf);
+            box.append(guide);
+        } else {
+            box.append(el("div", "h3d-empty", "画布上未找到 H3 Seamless Chain 节点"));
+        }
         sec.append(box);
         return;
-    }
-    if (!hasModeWidget) {
-        box.append(el("div", "h3d-empty",
-            "当前引擎未合并「生成模式」控件：模式互斥仅在本会话生效，运行时仍由后端校验。合并节点改进后持久生效。"));
     }
 
     if (mode === "文生视频") {
         box.append(el("div", "h3d-empty",
             "文生模式：无需图片素材，提示词直接描述画面即可。<br>需要起手图请切「首帧」，需要多参考请切「多参」。"));
     } else if (mode === "首帧视频") {
-        /* 首帧图片单槽 */
-        const fInp = (node.inputs || []).find((i) => i.name === "首帧图片");
-        const fInfo = fInp ? linkedImageInfo(node, fInp) : { file: "" };
-        const fIdx = fInp ? node.inputs.indexOf(fInp) : -1;
-        const fcard = assetCard("首帧图片", fInfo.file);
-        fcard.querySelector("small").textContent = fInfo.file || "未设置（第 1 段的起始帧）";
-        const facts = el("div", "h3d-asset-acts");
-        const fup = el("button", "h3d-btn h3d-btn-cyan", fInfo.file ? "替换" : "上传");
-        fup.title = "上传图片到 input 目录并自动接线到「首帧图片」";
-        fup.onclick = () => pickRefImage("first");
-        facts.append(fup);
-        if (fInfo.file && fIdx >= 0) {
-            const frm = el("button", "h3d-btn h3d-btn-danger", "✕");
-            frm.title = "断开首帧图片（自动移除对应 LoadImage 节点）";
-            frm.onclick = () => { detachImageInput(node, fIdx); scheduleRefresh(200); };
-            facts.append(frm);
-        }
-        fcard.append(facts);
-        box.append(fcard);
+        const file = ds.first_frame;
+        const card = assetCard("首帧图片", file,
+            file ? () => { removeFirstFrame(node); } : null);
+        card.querySelector("small").textContent = file || "未设置（第 1 段的起始帧）";
+        const acts = card.querySelector(".h3d-asset-acts") || el("div", "h3d-asset-acts");
+        const up = el("button", "h3d-btn h3d-btn-cyan", file ? "替换" : "上传");
+        up.title = "上传图片到 input 目录，文件名存入导演台状态，画布「首帧图」节点同步点亮";
+        up.onclick = () => pickImage("first");
+        acts.insertBefore(up, acts.firstChild);
+        if (!card.querySelector(".h3d-asset-acts")) card.append(acts);
+        box.append(card);
     } else {
-        /* 多参：参考图片组（0 起编号，≤9 张；后端按编号排序压实，<Picture i> = 排序后第 i 张） */
-        const slots = refImageSlots(node).filter((s) => s.linked);
-        slots.forEach((s, i) => {
-            const card = assetCard(`参考图片_${s.num} → <Picture ${i + 1}>`, s.file || "已接线");
-            const acts = el("div", "h3d-asset-acts");
-            const rm = el("button", "h3d-btn h3d-btn-danger", "✕");
-            rm.title = "移除这张参考图（断线并删对应 LoadImage 节点）";
-            rm.onclick = () => { detachImageInput(node, s.idx); scheduleRefresh(200); };
-            acts.append(rm);
-            card.append(acts);
-            box.append(card);
+        /* 多参：标签素材池（状态驱动 + 画布镜像） */
+        ds.ref_assets.forEach((_a, i) => {
+            box.append(labeledAssetCard(node, ds, i));
         });
-        if (slots.length < 9) {
+        if (ds.ref_assets.length < 9) {
             const add = el("button", "h3d-btn h3d-addasset", "＋ 添加参考图片");
-            add.title = "上传图片 → 自动创建 LoadImage 并连到下一个参考图片槽";
-            add.onclick = () => pickRefImage("ref");
+            add.title = "上传图片 → 存入标签素材池（配套工作流对应节点自动点亮；手摆工作流不受影响）";
+            add.onclick = () => pickImage("ref");
             box.append(add);
         }
     }
     sec.append(box);
     sec.append(el("div", "h3d-foot",
-        "参考视频 / 参考音频仍走画布接线（LoadVideo / LoadAudio）；模式切换会自动清理不相容的图片连线"));
+        "标签素材池：每张图打标签（角色1 / 场景1…），段落卡片里勾选本段引用哪些，提示词写 [[标签]] 引用（后端按段重编号为 &lt;Picture k&gt;）。<br>"
+        + "配套工作流下素材节点由导演台点亮/隐藏——连线常驻，只是隐藏，请勿删除。"));
 }
 
-/* ---- 链参数（面板直写画布控件） ---- */
+/* ---- 链参数（面板直写画布控件）：常规五项 + 高级设置收纳其余全部 ---- */
 
-const PARAM_DEFS = ["宽度", "高度", "每段帧数", "引导帧数", "步数", "CFG", "种子", "采样器", "调度器", "审片模式", "自动保存"];
+const PRIMARY_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数"];
+const ADVANCED_DEFS = [
+    "引导帧数", "CFG", "采样器", "调度器",
+    "自动存档", "存档目录", "审片模式", "自动保存", "重跑起始段",
+    "桥帧门控", "清晰度阈值", "回退上限", "接缝混合", "混合帧数", "锚定加噪",
+    W_WIDTH, W_HEIGHT,
+];
+const PARAM_LABELS = { [W_DUR]: "每段时长(秒) · 新段默认" };
 
 function paramsSig(node) {
     if (!node) return "n";
-    return PARAM_DEFS.map((n) => {
+    return [...PRIMARY_DEFS, ...ADVANCED_DEFS].map((n) => {
         const w = (node.widgets || []).find((x) => x.name === n);
         return w ? String(w.value) : "-";
     }).join("|");
+}
+
+/** 单个节点控件的表单域（combo→select，数值→number 输入；种子带🎲） */
+function renderWidgetField(node, name, labelOverride) {
+    const w = (node.widgets || []).find((x) => x.name === name);
+    const field = el("div", "h3d-param");
+    field.append(el("label", "", escapeHtml(labelOverride || name)));
+    if (!w) {
+        field.append(el("span", "h3d-hint", "—"));
+        return field;
+    }
+    const opts = w.options && Array.isArray(w.options.values) ? w.options.values : null;
+    if (opts) {
+        const sel = document.createElement("select");
+        sel.className = "h3d-select";
+        for (const v of opts) {
+            const o = document.createElement("option");
+            o.value = v;
+            o.textContent = v;
+            if (String(v) === String(w.value)) o.selected = true;
+            sel.append(o);
+        }
+        sel.onchange = () => setWidgetValue(node, name, sel.value);
+        field.append(sel);
+    } else {
+        const row = el("div", "h3d-seedrow");
+        const inp = document.createElement("input");
+        inp.type = "number";
+        inp.value = w.value;
+        const step = w.options && w.options.step;
+        inp.step = step || (name === "CFG" || name === W_DUR ? 0.1 : 1);
+        inp.onchange = () => setWidgetValue(node, name, Number(inp.value));
+        row.append(inp);
+        if (name === W_SEED) {
+            const dice = el("button", "h3d-btn", "🎲");
+            dice.title = "随机种子";
+            dice.onclick = () => {
+                const v = Math.floor(Math.random() * 2 ** 48);
+                setWidgetValue(node, name, v);
+                inp.value = v;
+            };
+            row.append(dice);
+        }
+        field.append(row);
+    }
+    return field;
 }
 
 function renderParamsZone(sec, data) {
     const { node } = data;
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
-        "<strong>链参数</strong><small>直接写画布节点控件，随工作流保存</small>"));
+        "<strong>链参数</strong><small>常规五项直改；其余收进「高级设置」</small>"));
     if (!node) {
         sec.append(el("div", "h3d-empty", "画布上未找到节点，参数面板不可用"));
         return;
     }
     const grid = el("div", "h3d-params");
-    for (const name of PARAM_DEFS) {
-        const w = (node.widgets || []).find((x) => x.name === name);
-        const field = el("div", "h3d-param");
-        field.append(el("label", "", name));
-        if (!w) {
-            field.append(el("span", "h3d-hint", "—"));
-            grid.append(field);
-            continue;
-        }
-        const opts = w.options && Array.isArray(w.options.values) ? w.options.values : null;
-        if (opts) {
-            const sel = document.createElement("select");
-            sel.className = "h3d-select";
-            for (const v of opts) {
-                const o = document.createElement("option");
-                o.value = v;
-                o.textContent = v;
-                if (String(v) === String(w.value)) o.selected = true;
-                sel.append(o);
-            }
-            sel.onchange = () => setWidgetValue(node, name, sel.value);
-            field.append(sel);
-        } else {
-            const row = el("div", "h3d-seedrow");
-            const inp = document.createElement("input");
-            inp.type = "number";
-            inp.value = w.value;
-            inp.step = (w.options && w.options.step) || (name === "CFG" ? 0.1 : 1);
-            inp.onchange = () => setWidgetValue(node, name, Number(inp.value));
-            row.append(inp);
-            if (name === "种子") {
-                const dice = el("button", "h3d-btn", "🎲");
-                dice.title = "随机种子";
-                dice.onclick = () => {
-                    const v = Math.floor(Math.random() * 2 ** 48);
-                    setWidgetValue(node, name, v);
-                    inp.value = v;
-                };
-                row.append(dice);
-            }
-            field.append(row);
-        }
-        grid.append(field);
+    for (const name of PRIMARY_DEFS) {
+        grid.append(renderWidgetField(node, name, PARAM_LABELS[name]));
     }
+    /* 换算徽章：宽高比+百万像素 -> 实际画布；自定义模式改为显示宽/高输入 */
+    const ar = String(getWidgetValue(node, W_AR) ?? "");
+    if (AR_RATIO[ar]) {
+        const badgeTxt = canvasBadgeText(node);
+        if (badgeTxt) {
+            const b = el("div", "h3d-convbadge", `${escapeHtml(badgeTxt)} · 32倍数对齐`);
+            b.title = "官方 Resolution Selector 同款换算：短边≤768、长边≤1344（H3 原生画布上限）";
+            grid.append(b);
+        }
+    } else {
+        grid.append(renderWidgetField(node, W_WIDTH));
+        grid.append(renderWidgetField(node, W_HEIGHT));
+    }
+    /* 高级设置：其余全部参数（默认收起） */
+    const adv = el("details", "h3d-adv");
+    adv.innerHTML = "<summary>⚙ 高级设置（引导 / 采样 / 审片 / 存档 / 接缝 / 画布微调）</summary>";
+    const agrid = el("div", "h3d-adv-grid");
+    for (const name of ADVANCED_DEFS) {
+        if (ar !== "自定义" && (name === W_WIDTH || name === W_HEIGHT)) continue;
+        agrid.append(renderWidgetField(node, name));
+    }
+    adv.append(agrid);
+    grid.append(adv);
     sec.append(grid);
     sec.append(el("div", "h3d-foot",
-        "更多参数（桥帧门控 / 接缝混合 / 锚定加噪等）在画布节点上调整"));
+        "全部节点参数已收纳于此：改「高级设置」同样随工作流保存；「生成模式」由左侧模式条控制。"));
 }
 
 /* ---- 右栏 ---- */
@@ -1484,6 +2072,12 @@ function renderFooter(z, data) {
 
     const infos = [];
     infos.push(`当前 <b>${escapeHtml(state?.dir || (node ? getDirValue(node) || "未命名" : "无"))}</b>`);
+    if (node) {
+        const ps = paramsSummary(node, mf);
+        const totalSec = total ? `共${chainSeconds(node, data.ds, plan).toFixed(1)}s` : "";
+        const geoInfo = [ps.geo, totalSec].filter(Boolean).join(" · ");
+        if (geoInfo) infos.push(`<b>${escapeHtml(geoInfo)}</b>`);
+    }
     if (state?.review) infos.push("逐段审片：每次排队只生成下一段");
     if (!node) infos.push("只读模式：画布上未找到 H3 Seamless Chain 节点");
     if (node && !hasInserts(node)) infos.push("当前引擎未合并「插入视频」能力（合并插入分支后自动启用）");
@@ -1597,6 +2191,14 @@ app.registerExtension({
     name: "H3SeamlessChain.DirectorDesk",
     setup() {
         injectStyles();
+
+        /* 旧工作流迁移：widget 参数官方化后按位错位，载入画布前重排 widgets_values */
+        if (typeof app.loadGraphData === "function") {
+            const origLoadGraphData = app.loadGraphData.bind(app);
+            app.loadGraphData = function (data, ...args) {
+                return origLoadGraphData(migrateGraphWidgets(data), ...args);
+            };
+        }
 
         if (app.extensionManager && typeof app.extensionManager.registerSidebarTab === "function") {
             app.extensionManager.registerSidebarTab({

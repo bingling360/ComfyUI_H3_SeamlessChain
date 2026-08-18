@@ -493,16 +493,31 @@
         "Node name for S&R": "H3SeamlessChainSampler"
       },
       "widgets_values": [
+        "自定义",
+        "0.5",
         864,
         480,
-        124,
+        5.0,
         "22",
         0,
         "fixed",
         25,
         1.0,
         "res_multistep",
-        "simple"
+        "simple",
+        "关闭",
+        "",
+        "标注",
+        30.0,
+        34,
+        "smoothstep",
+        6,
+        0.0,
+        "关闭",
+        "分段+成片",
+        0,
+        "文生视频",
+        ""
       ]
     },
     {
