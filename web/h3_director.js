@@ -561,6 +561,29 @@ function injectStyles() {
     .h3d-footinfo b{color:var(--h3d-bone)}
     .h3d-run{min-width:150px;padding:11px 18px}
 
+    /* ---- 素材与参考 / 链参数 ---- */
+    .h3d-lsec,.h3d-rsec{display:flex;flex-direction:column;min-height:0}
+    .h3d-col.left .h3d-sechead,.h3d-col.right .h3d-sechead{position:static;backdrop-filter:none}
+    .h3d-assets{display:grid;gap:8px;padding:12px}
+    .h3d-asset{display:grid;grid-template-columns:64px minmax(0,1fr) auto;gap:9px;align-items:center;padding:8px;border:1px solid #2b414f;border-radius:8px;background:#111a21;box-shadow:inset 3px 0 0 #293e4a}
+    .h3d-asset.on{box-shadow:inset 3px 0 0 var(--h3d-cyan)}
+    .h3d-asset-thumb{width:64px;height:52px;border-radius:5px;background:#202c35;display:grid;place-items:center;overflow:hidden;color:#6f818d;font:700 10px ui-monospace,Consolas}
+    .h3d-asset-thumb img{width:100%;height:100%;object-fit:cover}
+    .h3d-asset-copy{min-width:0}
+    .h3d-asset-copy strong{display:block;font-size:12px}
+    .h3d-asset-copy small{display:block;margin-top:3px;color:var(--h3d-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .h3d-asset-acts{display:flex;gap:5px}
+    .h3d-asset-acts .h3d-btn{padding:4px 8px;font-size:11px}
+    .h3d-addasset{justify-self:start;padding:6px 12px}
+    .h3d-params{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:12px}
+    .h3d-param label{display:block;margin-bottom:4px;color:var(--h3d-muted);font-size:11px}
+    .h3d-select,.h3d-seedrow input{width:100%;border:1px solid #314754;border-radius:6px;background:#121c24;color:var(--h3d-bone);padding:6px 7px;font-size:12px;outline:none;font-family:inherit}
+    .h3d-select:focus,.h3d-seedrow input:focus{border-color:#79e9ff}
+    .h3d-seedrow{display:flex;gap:5px}
+    .h3d-seedrow input{flex:1;min-width:0}
+    .h3d-seedrow .h3d-btn{padding:4px 8px;flex:none}
+    .h3d-psec .h3d-foot,.h3d-asec .h3d-foot,.h3d-projsec .h3d-foot{padding:0 16px 14px}
+
     /* ---- 新建项目模态 ---- */
     .h3d-overlay{position:fixed;z-index:1000003;inset:0;display:grid;place-items:center;padding:24px;background:#05090dcf;backdrop-filter:blur(10px)}
     .h3d-dialog{width:min(470px,calc(100vw - 40px));border:1px solid #3a5464;border-radius:14px;background:linear-gradient(160deg,#17232c,#0e161c 62%);box-shadow:0 22px 64px #000b;padding:20px;color:var(--h3d-bone);font:13px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif}
@@ -645,14 +668,18 @@ function openDesk() {
     right.append(ledWrap, sub, close);
     topbar.append(left, right);
 
-    /* 主舞台三栏 */
+    /* 主舞台三栏（侧栏各含两个固定分区，渲染器只填充分区内容） */
     const stage = el("div", "h3d-stage");
     const colL = el("aside", "h3d-col left");
-    colL.append(el("div", "h3d-sechead", "<strong>项目与链</strong><small>切换项目 = 换存档目录，提示词自动沿用</small>"));
+    const lProj = el("section", "h3d-lsec h3d-projsec");
+    const lAssets = el("section", "h3d-lsec h3d-asec");
+    colL.append(lProj, lAssets);
     const colC = el("section", "h3d-col center");
     colC.append(el("div", "h3d-sechead", "<strong>段落流水线</strong><small>卡片 = 生成顺序；✏ 改词 · 🎲 重摇 · 📎 插视频</small>"));
     const colR = el("aside", "h3d-col right");
-    colR.append(el("div", "h3d-sechead", "<strong>成片历史</strong><small>播放 / 下载 / 删除（输出目录随前缀变化）</small>"));
+    const rParams = el("section", "h3d-rsec h3d-psec");
+    const rHist = el("section", "h3d-rsec h3d-hsec");
+    colR.append(rParams, rHist);
     stage.append(colL, colC, colR);
 
     /* 页脚 */
@@ -669,7 +696,9 @@ function openDesk() {
         page,
         zones: {
             project: sub,
-            colL, colC, colR,
+            colC,
+            lProj, lAssets,
+            rParams, rHist,
             footInfo, run,
         },
         cardsSig: "",
@@ -691,7 +720,7 @@ function isVideoPlaying(root) {
 }
 
 function cardsSignature(data) {
-    const { state, plan, history } = data;
+    const { state, plan } = data;
     return JSON.stringify({
         dir: state?.dir ?? "",
         done: state?.done ?? 0,
@@ -699,7 +728,7 @@ function cardsSignature(data) {
         review: !!state?.review,
         reroll: state?.reroll ?? 0,
         plan: (plan || []).map((it) => it.kind === "insert" ? ["i", it.pos, it.file] : ["p", it.text]),
-    }) + (history ? history.length : -1);
+    });
 }
 
 function updateDesk(data) {
@@ -712,18 +741,25 @@ function updateDesk(data) {
     z.project.textContent = `项目 · ${dirName}`;
     paintLeds();
 
-    /* 左栏：项目列表 + 参数概览 */
-    renderLeftColumn(z.colL, data);
+    /* 左栏：项目与链 + 素材与参考 */
+    renderLeftColumn(z.lProj, data);
+    renderAssetsZone(z.lAssets, data);
 
     /* 中栏：状态条 + 进度轨 + 段落卡片（有编辑器/播放中时跳过重渲） */
     renderCenterColumn(z.colC, data);
 
-    /* 右栏：成片历史（播放中时跳过重渲） */
+    /* 右栏：链参数（编辑中不重建）+ 成片历史（播放中不重建） */
+    const psig = paramsSig(node);
+    const pgrid = z.rParams.querySelector(".h3d-params");
+    if (!(pgrid && pgrid.contains(document.activeElement)) && z.rParams.dataset.sig !== psig) {
+        z.rParams.dataset.sig = psig;
+        renderParamsZone(z.rParams, data);
+    }
     const histSig = prefix + "|" + (history ? history.length + ":" + (history[0]?.file ?? "") : "-");
-    if (histSig !== desk.histSig || !z.colR.querySelector(".h3d-hist")) {
-        if (!isVideoPlaying(z.colR)) {
+    if (histSig !== desk.histSig || !z.rHist.querySelector(".h3d-hist")) {
+        if (!isVideoPlaying(z.rHist)) {
             desk.histSig = histSig;
-            renderRightColumn(z.colR, data);
+            renderHistoryZone(z.rHist, data);
         }
     }
 
@@ -733,10 +769,11 @@ function updateDesk(data) {
 
 /* ---- 左栏 ---- */
 
-function renderLeftColumn(colL, data) {
+function renderLeftColumn(sec, data) {
     const { node, state, idx } = data;
-    // 保留吸顶头，重建内容
-    [...colL.children].slice(1).forEach((n) => n.remove());
+    sec.replaceChildren();
+    sec.append(el("div", "h3d-sechead",
+        "<strong>项目与链</strong><small>切换项目 = 换存档目录，提示词自动沿用</small>"));
 
     const list = el("div", "h3d-projlist");
     const projects = mergeProjects(idx, state);
@@ -758,14 +795,14 @@ function renderLeftColumn(colL, data) {
         btn.onclick = () => switchProject(p.dir);
         list.append(btn);
     }
-    colL.append(list);
+    sec.append(list);
 
     const newrow = el("div", "h3d-newrow");
     const newBtn = el("button", "h3d-btn h3d-btn-cyan", "＋ 新建项目");
     newBtn.title = "新开一条视频链：换存档目录名，提示词沿用当前内容作底稿";
     newBtn.onclick = openNewProjectModal;
     newrow.append(newBtn);
-    colL.append(newrow);
+    sec.append(newrow);
 
     if (state?.dir) {
         const done = state.done ?? 0;
@@ -774,8 +811,8 @@ function renderLeftColumn(colL, data) {
         const meter = el("div", "h3d-meter");
         meter.innerHTML = `<strong>${done}/${total || "?"} 段${state.review ? " · 审片中" : ""}</strong>
             <p>${escapeHtml([ps.geo, ps.len, ps.ctx].filter(Boolean).join(" · ") || "参数待首次运行后显示")}</p>`;
-        colL.append(meter);
-        colL.append(el("div", "h3d-foot", `链目录：output/checkpoints/${escapeHtml(state.dir)}`));
+        sec.append(meter);
+        sec.append(el("div", "h3d-foot", `链目录：output/checkpoints/${escapeHtml(state.dir)}`));
     }
 }
 
@@ -1004,11 +1041,283 @@ function openEditor(card, entry, text, isDone) {
     ta.focus();
 }
 
+/* ---- 素材与参考（上传即自动接线 LoadImage，免画布连线） ---- */
+
+function inputViewUrl(name) {
+    const s = String(name ?? "");
+    const i = s.lastIndexOf("/");
+    const sub = i < 0 ? "" : s.slice(0, i);
+    const file = i < 0 ? s : s.slice(i + 1);
+    return `/api/view?type=input&subfolder=${encodeURIComponent(sub)}&filename=${encodeURIComponent(file)}`;
+}
+
+async function uploadToInput(file) {
+    const fd = new FormData();
+    fd.append("image", file);
+    fd.append("type", "input");
+    fd.append("overwrite", "true");
+    const r = await fetch("/upload/image", { method: "POST", body: fd });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    return j.subfolder ? `${j.subfolder}/${j.name}` : j.name;
+}
+
+function loadImageWidget(imgNode) {
+    return (imgNode.widgets || []).find((w) => w.name === "image") || (imgNode.widgets || [])[0] || null;
+}
+
+function linkedImageInfo(node, inp) {
+    if (inp.link == null) return { src: null, file: "" };
+    const src = node.graph.getNodeById(inp.link.origin_id);
+    const w = src && loadImageWidget(src);
+    return { src, file: w ? String(w.value ?? "") : "" };
+}
+
+/** 参考图片槽位（编号 0 起，与后端 prefix="参考图片_" min=0 一致）。 */
+function refImageSlots(node) {
+    const pat = /^(?:参考图片组\.)?参考图片_(\d+)$/;
+    const out = [];
+    for (const inp of node.inputs || []) {
+        const m = pat.exec(inp.name);
+        if (!m) continue;
+        const info = linkedImageInfo(node, inp);
+        out.push({
+            num: Number(m[1]), name: inp.name,
+            idx: node.inputs.indexOf(inp), linked: inp.link != null,
+            src: info.src, file: info.file,
+        });
+    }
+    return out.sort((a, b) => a.num - b.num);
+}
+
+function ensureRefImageSlot(node, num) {
+    const iname = `参考图片组.参考图片_${num}`;
+    let inp = (node.inputs || []).find((i) => i.name === iname);
+    if (!inp) {
+        node.addInput(iname, "IMAGE");
+        node.graph.change();
+        inp = (node.inputs || []).find((i) => i.name === iname);
+    }
+    return inp ? node.inputs.indexOf(inp) : -1;
+}
+
+/** 断开图片输入；来源若是无其他连线的 LoadImage 则一并移除。 */
+function detachImageInput(node, idx) {
+    const inp = (node.inputs || [])[idx];
+    if (!inp || inp.link == null) return;
+    const src = node.graph.getNodeById(inp.link.origin_id);
+    node.disconnectInput(idx);
+    if (src && src.type === "LoadImage" && !(src.outputs || []).some((o) => o.links && o.links.length)) {
+        node.graph.remove(src);
+    }
+    node.graph.change();
+}
+
+/** 创建 LoadImage 节点（摆到采样器左侧）并连到目标输入槽。 */
+function attachLoadImage(node, targetIdx, fileName, title) {
+    let img = null;
+    try { img = LiteGraph.createNode("LoadImage"); } catch (e) { /* 老前端 */ }
+    if (!img) { alert("当前前端无法自动创建 LoadImage 节点：请手动加载图片并连到该输入"); return false; }
+    detachImageInput(node, targetIdx);
+    img.title = title;
+    attachLoadImage.n = (attachLoadImage.n || 0) + 1;
+    img.pos = [node.pos[0] - 300, node.pos[1] - 40 + attachLoadImage.n * 110];
+    node.graph.add(img);
+    const w = loadImageWidget(img);
+    if (w) {
+        w.value = fileName;
+        if (typeof w.callback === "function") {
+            try { w.callback(fileName); } catch (e) { /* callback 可选 */ }
+        }
+    }
+    img.connect(0, node, targetIdx);
+    node.graph.change();
+    return true;
+}
+
+function pickRefImage(kind) {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.onchange = async () => {
+        const f = input.files && input.files[0];
+        if (!f) return;
+        let name;
+        try { name = await uploadToInput(f); }
+        catch (e) { alert(`上传失败：${e}`); return; }
+        if (kind === "first") {
+            const idx = (node.inputs || []).findIndex((i) => i.name === "首帧图片");
+            if (idx < 0) { alert("节点上没有「首帧图片」输入（可能被隐藏：右键节点 → Inputs 勾选）"); return; }
+            attachLoadImage(node, idx, name, "首帧图片");
+        } else {
+            const slots = refImageSlots(node);
+            if (slots.filter((s) => s.linked).length >= 9) { alert("参考图片最多 9 张"); return; }
+            // used 只收已连线槽位：空槽位直接复用，无空槽时取最小未用编号（后端按编号排序压实）
+            const used = new Set(slots.filter((s) => s.linked).map((s) => s.num));
+            const free = slots.find((s) => !s.linked);
+            let num = free ? free.num : 0;
+            while (used.has(num) && num <= 9) num++;
+            if (num > 9) { alert("参考图片最多 9 张"); return; }
+            const idx = ensureRefImageSlot(node, num);
+            if (idx < 0) { alert("无法添加参考图片输入槽"); return; }
+            attachLoadImage(node, idx, name, `参考图片_${num}`);
+        }
+        scheduleRefresh(200);
+    };
+    input.click();
+}
+
+function assetCard(title, file) {
+    const card = el("div", "h3d-asset" + (file ? " on" : ""));
+    const thumb = el("div", "h3d-asset-thumb", file ? "" : "<span>IMG</span>");
+    if (file) {
+        const im = document.createElement("img");
+        im.loading = "lazy";
+        im.src = inputViewUrl(file);
+        im.alt = title;
+        thumb.append(im);
+    }
+    const copy = el("div", "h3d-asset-copy");
+    copy.innerHTML = `<strong>${escapeHtml(title)}</strong><small>${escapeHtml(file || "未设置")}</small>`;
+    card.append(thumb, copy);
+    return card;
+}
+
+function renderAssetsZone(sec, data) {
+    const { node } = data;
+    sec.replaceChildren();
+    sec.append(el("div", "h3d-sechead",
+        "<strong>素材与参考</strong><small>上传即自动接线；提示词用 &lt;Picture 1..9&gt; 引用</small>"));
+    const box = el("div", "h3d-assets");
+    if (!node) {
+        box.append(el("div", "h3d-empty", "画布上未找到 H3 Seamless Chain 节点"));
+        sec.append(box);
+        return;
+    }
+
+    /* 首帧图片（单槽，与片头插入互斥） */
+    const fInp = (node.inputs || []).find((i) => i.name === "首帧图片");
+    const fInfo = fInp ? linkedImageInfo(node, fInp) : { file: "" };
+    const fIdx = fInp ? node.inputs.indexOf(fInp) : -1;
+    const fcard = assetCard("首帧图片", fInfo.file);
+    fcard.querySelector("small").textContent = fInfo.file || "未设置（可选，与片头插入互斥）";
+    const facts = el("div", "h3d-asset-acts");
+    const fup = el("button", "h3d-btn h3d-btn-cyan", fInfo.file ? "替换" : "上传");
+    fup.title = "上传图片到 input 目录并自动接线到「首帧图片」";
+    fup.onclick = () => pickRefImage("first");
+    facts.append(fup);
+    if (fInfo.file && fIdx >= 0) {
+        const frm = el("button", "h3d-btn h3d-btn-danger", "✕");
+        frm.title = "断开首帧图片（自动移除对应 LoadImage 节点）";
+        frm.onclick = () => { detachImageInput(node, fIdx); scheduleRefresh(200); };
+        facts.append(frm);
+    }
+    fcard.append(facts);
+    box.append(fcard);
+
+    /* 参考图片组（0 起编号，≤9 张；后端按编号排序压实，<Picture i> = 排序后第 i 张） */
+    const slots = refImageSlots(node).filter((s) => s.linked);
+    slots.forEach((s, i) => {
+        const card = assetCard(`参考图片_${s.num} → <Picture ${i + 1}>`, s.file || "已接线");
+        const acts = el("div", "h3d-asset-acts");
+        const rm = el("button", "h3d-btn h3d-btn-danger", "✕");
+        rm.title = "移除这张参考图（断线并删对应 LoadImage 节点）";
+        rm.onclick = () => { detachImageInput(node, s.idx); scheduleRefresh(200); };
+        acts.append(rm);
+        card.append(acts);
+        box.append(card);
+    });
+    if (slots.length < 9) {
+        const add = el("button", "h3d-btn h3d-addasset", "＋ 添加参考图片");
+        add.title = "上传图片 → 自动创建 LoadImage 并连到下一个参考图片槽";
+        add.onclick = () => pickRefImage("ref");
+        box.append(add);
+    }
+    sec.append(box);
+    sec.append(el("div", "h3d-foot",
+        "参考视频 / 参考音频仍走画布接线（LoadVideo / LoadAudio），见节点内说明"));
+}
+
+/* ---- 链参数（面板直写画布控件） ---- */
+
+const PARAM_DEFS = ["宽度", "高度", "每段帧数", "引导帧数", "步数", "CFG", "种子", "采样器", "调度器", "审片模式", "自动保存"];
+
+function paramsSig(node) {
+    if (!node) return "n";
+    return PARAM_DEFS.map((n) => {
+        const w = (node.widgets || []).find((x) => x.name === n);
+        return w ? String(w.value) : "-";
+    }).join("|");
+}
+
+function renderParamsZone(sec, data) {
+    const { node } = data;
+    sec.replaceChildren();
+    sec.append(el("div", "h3d-sechead",
+        "<strong>链参数</strong><small>直接写画布节点控件，随工作流保存</small>"));
+    if (!node) {
+        sec.append(el("div", "h3d-empty", "画布上未找到节点，参数面板不可用"));
+        return;
+    }
+    const grid = el("div", "h3d-params");
+    for (const name of PARAM_DEFS) {
+        const w = (node.widgets || []).find((x) => x.name === name);
+        const field = el("div", "h3d-param");
+        field.append(el("label", "", name));
+        if (!w) {
+            field.append(el("span", "h3d-hint", "—"));
+            grid.append(field);
+            continue;
+        }
+        const opts = w.options && Array.isArray(w.options.values) ? w.options.values : null;
+        if (opts) {
+            const sel = document.createElement("select");
+            sel.className = "h3d-select";
+            for (const v of opts) {
+                const o = document.createElement("option");
+                o.value = v;
+                o.textContent = v;
+                if (String(v) === String(w.value)) o.selected = true;
+                sel.append(o);
+            }
+            sel.onchange = () => setWidgetValue(node, name, sel.value);
+            field.append(sel);
+        } else {
+            const row = el("div", "h3d-seedrow");
+            const inp = document.createElement("input");
+            inp.type = "number";
+            inp.value = w.value;
+            inp.step = (w.options && w.options.step) || (name === "CFG" ? 0.1 : 1);
+            inp.onchange = () => setWidgetValue(node, name, Number(inp.value));
+            row.append(inp);
+            if (name === "种子") {
+                const dice = el("button", "h3d-btn", "🎲");
+                dice.title = "随机种子";
+                dice.onclick = () => {
+                    const v = Math.floor(Math.random() * 2 ** 48);
+                    setWidgetValue(node, name, v);
+                    inp.value = v;
+                };
+                row.append(dice);
+            }
+            field.append(row);
+        }
+        grid.append(field);
+    }
+    sec.append(grid);
+    sec.append(el("div", "h3d-foot",
+        "更多参数（桥帧门控 / 接缝混合 / 锚定加噪等）在画布节点上调整"));
+}
+
 /* ---- 右栏 ---- */
 
-function renderRightColumn(colR, data) {
+function renderHistoryZone(sec, data) {
     const { history, prefix, state } = data;
-    [...colR.children].slice(1).forEach((n) => n.remove());
+    sec.replaceChildren();
+    sec.append(el("div", "h3d-sechead",
+        "<strong>成片历史</strong><small>播放 / 下载 / 删除（输出目录随前缀变化）</small>"));
     const box = el("div", "h3d-hist");
     const items = (history || []).slice(0, 10);
 
@@ -1070,9 +1379,9 @@ function renderRightColumn(colR, data) {
             box.append(el("div", "h3d-foot", `仅显示最近 10 条（共 ${history.length} 条），更早在 output/${escapeHtml(prefix)}/`));
         }
     }
-    colR.append(box);
+    sec.append(box);
     if (state?.dir) {
-        colR.append(el("div", "h3d-foot", `分段存档：output/checkpoints/${escapeHtml(state.dir)}`));
+        sec.append(el("div", "h3d-foot", `分段存档：output/checkpoints/${escapeHtml(state.dir)}`));
     }
 }
 
