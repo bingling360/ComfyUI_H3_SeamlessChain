@@ -747,6 +747,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         report.append(f"段{g + 1} 精修窗口不足（保留区不足每侧 {精修窗口} 帧），回退像素平滑")
                     else:
                         win_v, win_a, vt_p, vt_c, wf = win
+                        # 缝前侧（上段尾）全部 video latent 作为 keyframe 注入 cond
+                        # （与 _tail_keyframe 同模式：resolved_frame_index=0，锚定窗口
+                        # 前 vt_p 帧=上段尾内容）。模型去噪时知道缝后侧应延续缝前侧，
+                        # 否则只靠 prompt+refs 自由生成——段2无效(0.170→0.170)、
+                        # 段3变差(0.032→0.055)都是因为 cond 缺 keyframe 引导
+                        seam_kf_lat = win_v[:, :, :vt_p].clone()
                         try:
                             t1 = time.perf_counter()
                             refined_v = refine.refine_seam(
@@ -754,7 +760,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                 clip, video_vae, audio_vae, win_v, win_a, wf,
                                 width, height, 精修强度,
                                 (cur_seed + 1) % 0xffffffffffffffff if cur_seed is not None else 1,
-                                步数, CFG, 采样器, 调度器)
+                                步数, CFG, 采样器, 调度器,
+                                seam_kf_latent=seam_kf_lat, seam_kf_index=0)
                             wframes = video_vae.decode(refined_v)
                             if len(wframes.shape) == 5:
                                 wframes = wframes.reshape(-1, wframes.shape[-3],

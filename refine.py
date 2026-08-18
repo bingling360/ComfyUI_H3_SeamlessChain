@@ -61,16 +61,22 @@ def build_seam_window(prev_lat, cur_lat, side_frames):
 
 def refine_seam(模型, negative, prompt, refs, clip, video_vae, audio_vae,
                 win_video, win_audio, window_frames, width, height,
-                strength, seed, 步数, CFG, 采样器, 调度器):
+                strength, seed, 步数, CFG, 采样器, 调度器,
+                seam_kf_latent=None, seam_kf_index=None):
     """窗口联合重去噪，返回精修后的窗口 video latent（丢弃精修音频）。
 
-    cond 复用官方节点按 window_frames 构造（r2v 链带 refs 保身份连续，
-    不带 guide——窗口结构由初始 latent 承载，无需再锚定）；零 latent 样本
-    被窗口切片整体覆写。失败抛异常，调用方回退 smoothstep。
+    cond 复用官方节点按 window_frames 构造（r2v 链带 refs 保身份连续）；
+    **缝前侧末帧 keyframe 注入 cond**（minimax_keyframes 协议），让模型
+    在去噪时锚定缝点——知道缝后侧应该延续缝前侧内容，否则模型只靠
+    prompt+refs 自由生成，会"纠正"原本已连续的缝（段3变差 0.032→0.055）
+    或不改变缝点偏差（段2无效 0.170→0.170）。初始 latent 仍为跨缝窗口
+    切片（承载两侧结构），denoise=强度 在保留大部分原结构的前提下调和。
+
     音频不精修：音轨沿用现有响度对齐路径，避免重去噪改变人声/音色。
     """
     import comfy.model_management
     import comfy.nested_tensor
+    import node_helpers
     from comfy_extras.nodes_minimax_h3 import (MiniMaxH3ImageToVideo,
                                                MiniMaxH3ReferenceToVideo)
     dev = comfy.model_management.intermediate_device()
@@ -86,6 +92,15 @@ def refine_seam(模型, negative, prompt, refs, clip, video_vae, audio_vae,
             clip=clip, vae=video_vae, prompt=prompt,
             width=width, height=height, length=window_frames)
     cond, latent = out[0], out[1]
+    # 注入缝前侧末帧 keyframe：锚定缝点，让模型知道缝后侧应该延续
+    if seam_kf_latent is not None and seam_kf_index is not None:
+        cond = node_helpers.conditioning_set_values(cond, {
+            "minimax_keyframes": [{
+                "resolved_frame_index": seam_kf_index,
+                "latent": seam_kf_latent.to(device=dev, dtype=torch.float32),
+            }],
+            "minimax_frame_count": window_frames,
+        })
     latent["samples"] = comfy.nested_tensor.NestedTensor((win_v, win_a))
     sampled = nodes_common_ksampler(
         模型, int(seed), 步数, CFG, 采样器, 调度器, cond, negative, latent,
