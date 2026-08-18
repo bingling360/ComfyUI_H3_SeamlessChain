@@ -81,6 +81,41 @@ def cond_audio_rows_guard(dit):
     return lambda: setattr(dit, "_cond_audio_rows", orig)
 
 
+def step_cond_noise_guard(dit, aug_start, aug_end, fade_ratio):
+    """递减锚定：visual_cond_noise_aug 随采样进度从强到弱递减到消失。
+
+    patch dit.forward，每步读 sigma_v 计算进度，修改 minimax_payload 里的
+    visual/audio cond_noise_aug。同时影响 _cond_video_rows（噪声混合比）和
+    _forward（seg_t["cond"] 时间步钳位）——两者都从 payload 读同一个值。
+
+    sigma_v: 1.0（采样开始）→ 0.0（采样结束）
+    progress = (1 − sigma_v) / fade_ratio，clamp [0, 1]
+    dynamic_aug = aug_start + (aug_end − aug_start) × progress
+
+    aug_start: 初始值（接近 1.0 = 硬锚定，接缝吻合）
+    aug_end: 终点值（0.0 = 纯噪声，锚定完全消失）
+    fade_ratio: 递减占总步数的比例（0.3 = 前 30% 步数内递减完毕）
+    """
+    orig_forward = dit.forward
+
+    def patched_forward(x, timestep, context, transformer_options={}, **kwargs):
+        sigma_v = float((timestep.flatten()[0] / 1000.0).clamp(min=1e-6))
+        progress = min((1.0 - sigma_v) / fade_ratio, 1.0) if fade_ratio > 0 else 1.0
+        dynamic_aug = aug_start + (aug_end - aug_start) * progress
+
+        payload = kwargs.get("minimax_payload")
+        if payload is not None:
+            payload = dict(payload)
+            payload["visual_cond_noise_aug"] = dynamic_aug
+            payload["audio_cond_noise_aug"] = max(0.0, dynamic_aug - 0.5)
+            kwargs["minimax_payload"] = payload
+
+        return orig_forward(x, timestep, context, transformer_options, **kwargs)
+
+    dit.forward = patched_forward
+    return lambda: setattr(dit, "forward", orig_forward)
+
+
 def full_bridge_supported():
     """多 token keyframe 探测（进程内缓存一次）。
 
@@ -321,10 +356,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "调低更严格但更耗时"),
                 io.Int.Input("重摇上限", default=1, min=0, max=3,
                              tooltip="自动重摇的额外尝试次数（0=等于关闭重摇）"),
-                io.Combo.Input("段内分片", options=["关闭", "2", "3", "4"], default="关闭",
-                               tooltip="段内自动分片：把每段拆成N个子片，每子片独立采样并用引导桥衔接。"
-                                       "子片只有约3秒，模型来不及漂移——根治段内身份/内容漂移。"
-                                       "代价：采样次数×N，总耗时增加约50%。子片间引导桥自动衔接，用户无感知"),
+                io.Combo.Input("智能切镜", options=["关闭", "自动"], default="关闭",
+                               tooltip="自动在段尾找运动低谷（自然停顿点）作为切镜位置，多余帧丢弃。"
+                                       "切镜发生在自然停顿处 → 观感无跳变。"
+                                       "搜索范围=段尾1/3，最少保留50%内容。"
+                                       "与桥帧门控互补：门控查尾帧是否糊，切镜找内容是否到了自然间歇"),
+                io.Combo.Input("递减锚定", options=["关闭", "0.3", "0.5", "0.7"], default="关闭",
+                               tooltip="锚定约束随采样进度递减：开始强（接缝吻合）→ 逐渐减弱（模型自然过渡）"
+                                       "→ 完全消失（自由生成）。数值=递减占总步数比例（0.3=前30%步数递减完毕）。"
+                                       "开启后「锚定加噪」的值作为递减起点，终点为 0（锚定消失）。"
+                                       "治本：模型自己找到逻辑断点完成切镜，而非被强行拉住整段"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Image.Input("尾帧锚定", optional=True,
@@ -383,7 +424,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 接缝处理="潜空间精修", 混合帧数=6, 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0,
                 精修强度=0.45, 精修窗口="39", 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
-                段内分片="关闭"):
+                智能切镜="关闭", 递减锚定="关闭"):
         prompts = _autogrow_items(提示词组, "p")
         seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
         if not seg_prompts:
@@ -441,22 +482,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             接缝处理 = "关闭" if 接缝处理 == "关闭" else (
                 "smoothstep像素混合" if 接缝处理 == "smoothstep" else "潜空间精修")
 
-        # 段内分片：把每段拆成N个子片独立采样，子片间用引导桥衔接。
-        # 子片只有约3秒，模型来不及漂移——根治段内身份/内容漂移。
-        # 实现方式：展开提示词列表（3段×3片=9段），每段长度对齐到网格。
-        # 主循环/检查点/续跑/重摇/精修全部不变——只是看到更多更短的段
-        sub_n = 0 if 段内分片 == "关闭" else int(段内分片)
-        if sub_n > 1:
-            sub_len = align_frame_count_down(length // sub_n)
-            if sub_len < 22:
-                raise ValueError(
-                    f"段内分片：每段{length}帧÷{sub_n}片={length // sub_n}帧，"
-                    f"对齐网格后仅{sub_len}帧<22帧（太小），请减少分片数或增加每段帧数")
-            orig_segs = len(seg_prompts)
-            seg_prompts = [p for p in seg_prompts for _ in range(sub_n)]
-            report.append(f"段内分片：{orig_segs}段×{sub_n}子片={len(seg_prompts)}片，"
-                          f"每片{sub_len}帧（原{length}帧/段→{sub_len * sub_n}帧/段）")
-            length = sub_len
+        fade_ratio = 0.0 if 递减锚定 == "关闭" else float(递减锚定)
+        if fade_ratio > 0:
+            aug_start = 1.0 - aug if aug > 0 else 0.999
+            report.append(f"递减锚定：前 {fade_ratio*100:.0f}% 步数内锚定 {aug_start:.2f} → 0 递减消失"
+                          + (f"（起点=锚定加噪 {aug:.2f}）" if aug > 0 else "（硬锚定起点）"))
 
         # 存档指纹只覆盖共享参数（不含提示词、不含种子）：改某段提示词仍指向同一条链，
         # 重跑起点由逐段提示词哈希比对定位；种子控件开着 control_after_generate 每次运行
@@ -465,8 +495,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
         review = 审片模式 == "逐段确认"
         autosave = 自动保存 == "分段+成片"
         reroll = max(0, int(重跑起始段))
-        if sub_n > 1 and reroll > 0:
-            reroll = (reroll - 1) * sub_n + 1
         use_ckpt = resume or review or autosave   # 审片须落盘续接；自动保存须段落盘 mp4
         if review and not (resume or autosave):
             report.append("审片模式：存档自动启用（每段落盘 latent，跨次运行续接）")
@@ -477,7 +505,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         ckpt_params = {
             "width": width, "height": height,
             "length": length, "ctx": ctx, "steps": int(步数), "cfg": float(CFG),
-            "sampler": 采样器, "scheduler": 调度器, "chain": chain, "sub_n": sub_n,
+            "sampler": 采样器, "scheduler": 调度器, "chain": chain,
+            "smart_cut": 智能切镜 == "自动", "fade_ratio": fade_ratio,
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
         # 纯后处理参数只记录不进指纹（改值不触发重跑；报告回看用）
@@ -637,6 +666,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         vis_len = length - back
                         lines.append(f"段{gi + 1} 尾帧低质（{tail_score:.1f} < {清晰度阈值:g}），"
                                      f"回退 {back} 帧续拍（回退点 {hit:.1f}）")
+            # 智能切镜：在段尾搜索运动低谷（自然停顿点），多余帧丢弃。
+            # 运动低谷 = 动作完成/暂停 = 自然切镜点；与桥帧门控互补。
+            if 智能切镜 == "自动" and i + 1 < len(seg_prompts):
+                cut = qc.find_cut_point(frames, skip_f, vis_len)
+                if cut is not None:
+                    cut_f, cut_motion, cut_quality = cut
+                    new_vis_len = cut_f - skip_f
+                    if 0 < new_vis_len < vis_len:
+                        trimmed = vis_len - new_vis_len
+                        vis_len = new_vis_len
+                        lines.append(f"段{gi + 1} 智能切镜：运动低谷 @帧{cut_f}"
+                                     f"（运动 {cut_motion:.4f} 清晰 {cut_quality:.1f}），"
+                                     f"丢弃尾部 {trimmed} 帧")
             # 尾切对齐 token 网格：kept 末端必须与 guide 锚定末端重合。此前 guide
             # 取采样 latent 原始尾部（含 17k+5 网格填充帧，从未输出），下段续拍点
             # 落在本段输出末尾之后——ctx=56 时每个接缝跳过 15 帧（0.6s）内容。
@@ -706,6 +748,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 共存 H3 插件可能丢 keyframe/refs 音频导致 cond_audio 行数错位，
                     # 采样期挂模型层兜底（见 cond_audio_rows_guard），完成后恢复
                     restore_audio_rows = cond_audio_rows_guard(模型.model.diffusion_model)
+                    # 递减锚定：visual_cond_noise_aug 随采样进度从强到弱递减到消失。
+                    # 开启时覆盖 _apply_anchor_noise 写入的固定值——每步动态计算
+                    restore_step_aug = None
+                    if fade_ratio > 0 and (guide is not None or tail_anchor_latent is not None):
+                        aug_start = 1.0 - aug if aug > 0 else 0.999
+                        restore_step_aug = step_cond_noise_guard(
+                            模型.model.diffusion_model, aug_start, 0.0, fade_ratio)
                     try:
                         t0 = time.perf_counter()
                         sampled = nodes.common_ksampler(
@@ -713,6 +762,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
                     finally:
                         restore_audio_rows()
+                        if restore_step_aug:
+                            restore_step_aug()
                     dt = time.perf_counter() - t0
                     video_t, audio_t = sampled["samples"].unbind()
                     frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, gate_lines = \

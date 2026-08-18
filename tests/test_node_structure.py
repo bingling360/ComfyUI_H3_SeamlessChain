@@ -161,7 +161,8 @@ def test_structure():
                 "自动存档", "存档目录", "桥帧门控", "清晰度阈值", "回退上限",
                 "接缝处理", "混合帧数",
                 "审片模式", "自动保存", "重跑起始段",
-                "精修强度", "精修窗口", "接缝重摇", "重摇阈值", "重摇上限", "段内分片",
+                "精修强度", "精修窗口", "接缝重摇", "重摇阈值", "重摇上限",
+                "智能切镜", "递减锚定",
                 "首帧图片", "尾帧锚定", "起始视频", "起始视频音轨",
                 "提示词组",
                 "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
@@ -189,6 +190,12 @@ def test_structure():
     assert by_id["重摇阈值"].kwargs.get("default") == 0.06
     assert by_id["重摇上限"].kwargs.get("default") == 1
     assert by_id["重摇上限"].kwargs.get("min") == 0 and by_id["重摇上限"].kwargs.get("max") == 3
+    # 智能切镜 + 递减锚定（替代已回退的段内分片）
+    assert by_id["智能切镜"].kwargs.get("options") == ["关闭", "自动"]
+    assert by_id["智能切镜"].kwargs.get("default") == "关闭"
+    assert by_id["递减锚定"].kwargs.get("options") == ["关闭", "0.3", "0.5", "0.7"]
+    assert by_id["递减锚定"].kwargs.get("default") == "关闭"
+    assert "段内分片" not in ids                        # 已回退
     assert by_id["审片模式"].kwargs.get("options") == ["关闭", "逐段确认"]
     assert by_id["审片模式"].kwargs.get("default") == "关闭"
     assert by_id["重跑起始段"].kwargs.get("default") == 0

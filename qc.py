@@ -145,3 +145,48 @@ def seam_metrics(prev_frame, head_frame, prev_wav=None, head_wav=None, rate=4410
             rb = float(pb[..., :n].pow(2).mean().sqrt())
             db = 20.0 * math.log10((ra + 1e-5) / (rb + 1e-5))
     return diff, db
+
+
+def find_cut_point(frames, skip_f, vis_len, search_ratio=0.33, min_keep_ratio=0.5):
+    """在段尾 search_ratio 范围内找最佳切镜点（运动低谷 + 高清晰度）。
+
+    运动低谷 = 动作完成/暂停 = 自然切镜点（电影剪辑师在动作间歇处切镜）。
+    评分 = 帧清晰度归一 − 运动量归一 × 0.5，选评分最高帧。
+
+    frames: [N,H,W,C] 0-1 float（任意设备）；skip_f/vis_len: 保留区参数。
+    返回 (cut_frame绝对索引, 运动量, 清晰度) 或 None（搜索窗口太短）。
+    """
+    total = int(vis_len)
+    min_keep = int(total * min_keep_ratio)
+    search_start = max(skip_f + min_keep, skip_f + total - int(total * search_ratio))
+    search_end = skip_f + total
+
+    if search_end - search_start < 17:
+        return None
+
+    search_frames = frames[search_start:search_end].float()
+
+    # 帧间运动量（像素差异均值）
+    n = search_frames.shape[0]
+    motion = torch.zeros(n, device=search_frames.device)
+    if n > 1:
+        motion[1:] = (search_frames[1:] - search_frames[:-1]).abs().mean(dim=[1, 2, 3])
+
+    # 3帧滑动平均平滑
+    if n > 3:
+        kernel = torch.ones(3, device=motion.device, dtype=motion.dtype) / 3.0
+        motion = F.conv1d(motion[None, None], kernel[None, None], padding=1)[0, 0]
+
+    # 帧清晰度（复用 frame_scores）
+    quality = frame_scores(search_frames)
+
+    # 归一化到 [0, 1]
+    m_lo, m_hi = float(motion.min()), float(motion.max())
+    q_lo, q_hi = float(quality.min()), float(quality.max())
+    motion_norm = (motion - m_lo) / (m_hi - m_lo + 1e-6)
+    quality_norm = (quality - q_lo) / (q_hi - q_lo + 1e-6)
+
+    score = quality_norm - motion_norm * 0.5
+    best_idx = int(score.argmax().item())
+
+    return search_start + best_idx, float(motion[best_idx]), float(quality[best_idx])
