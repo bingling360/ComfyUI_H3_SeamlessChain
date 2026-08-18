@@ -321,6 +321,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "调低更严格但更耗时"),
                 io.Int.Input("重摇上限", default=1, min=0, max=3,
                              tooltip="自动重摇的额外尝试次数（0=等于关闭重摇）"),
+                io.Combo.Input("段内分片", options=["关闭", "2", "3", "4"], default="关闭",
+                               tooltip="段内自动分片：把每段拆成N个子片，每子片独立采样并用引导桥衔接。"
+                                       "子片只有约3秒，模型来不及漂移——根治段内身份/内容漂移。"
+                                       "代价：采样次数×N，总耗时增加约50%。子片间引导桥自动衔接，用户无感知"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Image.Input("尾帧锚定", optional=True,
@@ -378,7 +382,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 自动存档="关闭", 存档目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
                 接缝处理="潜空间精修", 混合帧数=6, 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0,
-                精修强度=0.45, 精修窗口="39", 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1):
+                精修强度=0.45, 精修窗口="39", 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
+                段内分片="关闭"):
         prompts = _autogrow_items(提示词组, "p")
         seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
         if not seg_prompts:
@@ -436,6 +441,23 @@ class H3SeamlessChainSampler(io.ComfyNode):
             接缝处理 = "关闭" if 接缝处理 == "关闭" else (
                 "smoothstep像素混合" if 接缝处理 == "smoothstep" else "潜空间精修")
 
+        # 段内分片：把每段拆成N个子片独立采样，子片间用引导桥衔接。
+        # 子片只有约3秒，模型来不及漂移——根治段内身份/内容漂移。
+        # 实现方式：展开提示词列表（3段×3片=9段），每段长度对齐到网格。
+        # 主循环/检查点/续跑/重摇/精修全部不变——只是看到更多更短的段
+        sub_n = 0 if 段内分片 == "关闭" else int(段内分片)
+        if sub_n > 1:
+            sub_len = align_frame_count_down(length // sub_n)
+            if sub_len < 22:
+                raise ValueError(
+                    f"段内分片：每段{length}帧÷{sub_n}片={length // sub_n}帧，"
+                    f"对齐网格后仅{sub_len}帧<22帧（太小），请减少分片数或增加每段帧数")
+            orig_segs = len(seg_prompts)
+            seg_prompts = [p for p in seg_prompts for _ in range(sub_n)]
+            report.append(f"段内分片：{orig_segs}段×{sub_n}子片={len(seg_prompts)}片，"
+                          f"每片{sub_len}帧（原{length}帧/段→{sub_len * sub_n}帧/段）")
+            length = sub_len
+
         # 存档指纹只覆盖共享参数（不含提示词、不含种子）：改某段提示词仍指向同一条链，
         # 重跑起点由逐段提示词哈希比对定位；种子控件开着 control_after_generate 每次运行
         # 自动 +1，真正的种子序列由 manifest 权威记录（见下方续跑载入逻辑）
@@ -443,6 +465,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         review = 审片模式 == "逐段确认"
         autosave = 自动保存 == "分段+成片"
         reroll = max(0, int(重跑起始段))
+        if sub_n > 1 and reroll > 0:
+            reroll = (reroll - 1) * sub_n + 1
         use_ckpt = resume or review or autosave   # 审片须落盘续接；自动保存须段落盘 mp4
         if review and not (resume or autosave):
             report.append("审片模式：存档自动启用（每段落盘 latent，跨次运行续接）")
@@ -453,7 +477,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         ckpt_params = {
             "width": width, "height": height,
             "length": length, "ctx": ctx, "steps": int(步数), "cfg": float(CFG),
-            "sampler": 采样器, "scheduler": 调度器, "chain": chain,
+            "sampler": 采样器, "scheduler": 调度器, "chain": chain, "sub_n": sub_n,
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
         # 纯后处理参数只记录不进指纹（改值不触发重跑；报告回看用）
