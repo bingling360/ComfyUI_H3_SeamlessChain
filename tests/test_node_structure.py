@@ -199,7 +199,12 @@ def test_structure():
     by_id = {inp.id: inp for inp in schema.inputs}
     assert by_id["宽高比"].kwargs.get("options") == ["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"]
     assert by_id["宽高比"].kwargs.get("default") == "16:9"
-    assert by_id["百万像素"].kwargs.get("options") == ["0.25", "0.5", "0.75", "1.0"]
+    # 百万像素：官方 Resolution Selector 同款浮点箭头控件（0.1–2.0 步进 0.1，共 20 档）
+    assert by_id["百万像素"].kwargs.get("default") == 0.5
+    assert by_id["百万像素"].kwargs.get("min") == 0.1
+    assert by_id["百万像素"].kwargs.get("max") == 2.0
+    assert by_id["百万像素"].kwargs.get("step") == 0.1
+    assert "options" not in by_id["百万像素"].kwargs
     assert by_id["每段时长"].kwargs.get("default") == 5.0
     assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
     assert by_id["种子"].kwargs.get("control_after_generate") is True

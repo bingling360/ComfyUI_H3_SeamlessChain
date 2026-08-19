@@ -65,8 +65,12 @@ def test_apply_label_tokens_mixed_kinds():
 def test_reference_header_mixed():
     rh = plugin_nodes._reference_header
     order = [("image", "角色1"), ("video", "视频1"), ("audio", "音频1")]
-    assert rh(order) == "参考：<Picture 1>=角色1，<Video 1>=视频1，<Audio 1>=音频1。"
-    assert rh(["场景1"]) == "参考：<Picture 1>=场景1。"
+    assert rh(order) == ("subject_definitions:\n"
+                         "<Picture 1> is the reference image for 角色1, used as a generation anchor of this segment.\n"
+                         "<Video 1> is the reference video for 视频1, used as a generation anchor of this segment.\n"
+                         "<Audio 1> is the reference audio for 音频1, used as a generation anchor of this segment.")
+    assert rh(["场景1"]) == ("subject_definitions:\n"
+                             "<Picture 1> is the reference image for 场景1, used as a generation anchor of this segment.")
     print("PASS test_reference_header_mixed")
 
 
@@ -81,7 +85,9 @@ def test_per_segment_subset_renumber():
     assert alt("[[角色1]] 配 [[BGM]]", seg1) == "<Picture 1> 配 <Audio 1>"
     assert alt("[[场景1]] 引用 [[视频1]]", seg2) == "<Picture 1> 引用 <Video 1>"
     # 提示词提到但未勾选的素材由 execute 并入 order（此处直接验证并入后的头行）
-    assert rh(seg1) == "参考：<Picture 1>=角色1，<Audio 1>=BGM。"
+    assert rh(seg1) == ("subject_definitions:\n"
+                        "<Picture 1> is the reference image for 角色1, used as a generation anchor of this segment.\n"
+                        "<Audio 1> is the reference audio for BGM, used as a generation anchor of this segment.")
     assert len(pool) == 4
     print("PASS test_per_segment_subset_renumber")
 

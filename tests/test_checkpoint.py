@@ -118,7 +118,7 @@ def test_state_roundtrip():
         checkpoint.save_state(state)
         assert checkpoint.load_state() == state                 # 原子写后可原样读回
         # 坏 JSON（写入中途损坏）-> None，面板据此显示空态而不是抛错
-        with open(os.path.join(checkpoint.checkpoints_root(), "h3chain_state.json"), "w") as f:
+        with open(os.path.join(checkpoint.projects_root(), "h3chain_state.json"), "w") as f:
             f.write("{broken")
         assert checkpoint.load_state() is None
     finally:

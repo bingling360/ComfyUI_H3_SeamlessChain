@@ -3,16 +3,16 @@
  * 打开导演台时若画布上没有 H3SeamlessChainSampler，可一键载入本模板：
  * - 模型加载器（ref2va UNET / Qwen3-VL CLIP / 视频+音频 VAE）+ 主节点 + 成片保存
  * - 提示词×3（PrimitiveStringMultiline 隐藏预连线到「提示词组」）：导演台 JSON 优先，
- *   画布节点作为镜像/兜底——没有导演台状态也能直接跑
- * - 分段输出链：分段图像+分段音频 → Create Video → Save Video，
- *   每段自动落盘 output/h3_segments/seg_*.mp4（output list 逐段展开）
- * - 「素材池 · 自动管理」节点组：首帧图 + 参考图×9 + 参考视频×3 + 参考音频×3
+ *   画布节点作为镜像/兜底——没有导演台状态也能直接跑（导演台段数 1–64 不限）
+ * - 每段视频由主节点「自动保存=分段+成片」存进项目文件夹 output/h3_projects/<项目名>/，
+ *   manifest 记录后在导演台段卡片直接预览（不再单独落盘 output/h3_segments/）
+ * - 「素材池 · 自动管理」节点组：首帧图 + 尾帧图（尾帧锚定）+ 参考图×9 + 参考视频×3 + 参考音频×3
  *   全部预连线到主节点对应输入槽；不用时 mode=2(Never)+折叠 = 隐藏但连线常驻，
  *   导演台上传/删除素材时点亮/隐藏对应节点（连线与配置保留，不动态建线）
  *
  * 注意：主节点 widgets_values 顺序须与 nodes.py define_schema 的 widget 顺序一致；
  *      inputs 数组顺序与 define_schema 的输入槽位顺序一致（模型/编码器/VAE×2/
- *      首帧/起始视频/起始音轨/提示词组/参考图片组/参考视频组/参考音轨组/参考音频组）。
+ *      首帧/尾帧锚定/起始视频/起始音轨/提示词组/参考图片组/参考视频组/参考音轨组/参考音频组）。
  */
 (function () {
   "use strict";
@@ -27,7 +27,7 @@
   // 智能切镜, 递减锚定, 切镜最多丢帧, 全链丢弃预算, 自适应精修,
   // 生成模式, 导演台状态
   const H3_WIDGETS = [
-    "16:9", "0.5", 864, 480, 5.0, "22",
+    "16:9", 0.5, 864, 480, 5.0, "22",
     0, "fixed", 25, 1.0,
     "res_multistep", "simple",
     "关闭", "", "标注", 30.0, 34,
@@ -84,15 +84,17 @@
   nodes.push(unet, clip, vaeV, vaeA);
 
   // ---- 主节点：全部输入槽按 schema 顺序预声明（连线常驻） ----
-  // 槽位：0 模型 1 文本编码器 2 视频VAE 3 音频VAE 4 首帧图片 5 起始视频 6 起始视频音轨
-  //       7..9 提示词_0..2（autogrow 全组 0 起编号）  10..18 参考图片_0..8
-  //       19..21 参考视频_0..2  22..24 参考视频音轨_0..2  25..27 参考音频_0..2
+  // 槽位：0 模型 1 文本编码器 2 视频VAE 3 音频VAE 4 首帧图片 5 尾帧锚定
+  //       6 起始视频 7 起始视频音轨
+  //       8..10 提示词_0..2（autogrow 全组 0 起编号）  11..19 参考图片_0..8
+  //       20..22 参考视频_0..2  23..25 参考视频音轨_0..2  26..28 参考音频_0..2
   const h3Inputs = [
     inp("模型", "MODEL", L(1, 0, 10, 0, "MODEL")),
     inp("文本编码器", "CLIP", L(2, 0, 10, 1, "CLIP")),
     inp("视频VAE", "VAE", L(3, 0, 10, 2, "VAE")),
     inp("音频VAE", "VAE", L(4, 0, 10, 3, "VAE")),
     inp("首帧图片", "IMAGE", null),
+    inp("尾帧锚定", "IMAGE", null),
     inp("起始视频", "IMAGE", null),
     inp("起始视频音轨", "AUDIO", null),
   ];
@@ -127,26 +129,9 @@
   };
   nodes.push(saver);
 
-  // ---- 分段输出链：分段图像/音频（output list 逐段展开）→ CreateVideo → SaveVideo ----
-  nodes.push({
-    id: 60, type: "CreateVideo", title: "分段打包（每段一个视频）",
-    pos: [900, 420], size: [340, 180], flags: {}, order: 12, mode: 0,
-    inputs: [
-      inp("images", "IMAGE", L(10, 4, 60, 0, "IMAGE")),
-      inp("audio", "AUDIO", L(10, 5, 60, 1, "AUDIO")),
-    ],
-    outputs: [inp("VIDEO", "VIDEO", null)],
-    properties: { "Node name for S&R": "CreateVideo" },
-    widgets_values: [24.0, 8],
-  });
-  nodes.push({
-    id: 61, type: "SaveVideo", title: "分段落盘 → output/h3_segments/",
-    pos: [900, 640], size: [340, 200], flags: {}, order: 13, mode: 0,
-    inputs: [inp("video", "VIDEO", L(60, 0, 61, 0, "VIDEO"))],
-    outputs: [inp("video", "VIDEO", null)],
-    properties: { "Node name for S&R": "SaveVideo" },
-    widgets_values: ["h3_segments/seg", "auto"],
-  });
+  // 分段视频不再单独打包落盘：主节点「自动保存=分段+成片」已把每段 mp4/缩略图
+  // 存进项目文件夹 output/h3_projects/<项目名>/（manifest 记录，导演台段卡片直接预览）。
+  // 需要另行编码导出时，可手动连主节点「分段图像/分段音频」输出到 CreateVideo。
 
   // ---- 素材池 · 自动管理（mode=2 隐藏 + 折叠，连线常驻） ----
   function hiddenNode(id, type, title, pos, widgets, outputs) {
@@ -160,10 +145,10 @@
     inp("MASK", "MASK", null),
   ];
 
-  // 提示词×3（槽位 7..9，autogrow 槽名 0 起编号：提示词_0..2）：导演台 JSON 优先，画布为镜像/兜底
+  // 提示词×3（槽位 8..10，autogrow 槽名 0 起编号：提示词_0..2）：导演台 JSON 优先，画布为镜像/兜底
   for (let i = 0; i < 3; i++) {
     const id = 50 + i;
-    const lid = L(id, 0, 10, 7 + i, "STRING");
+    const lid = L(id, 0, 10, 8 + i, "STRING");
     nodes.push(hiddenNode(id, "PrimitiveStringMultiline", `提示词·${i + 1}`,
       [40 + i * 330, 1330], [i === 0 ? "示例段落：黄昏的海边小镇，海浪轻拍礁石，镜头缓缓推近灯塔" : ""],
       [inp("STRING", "STRING", lid)]));
@@ -176,21 +161,27 @@
   nodes.push(hiddenNode(20, "LoadImage", "首帧图", [40, 1660], ["", "image"],
     imgOut(ffLid)));
 
-  // 参考图·1..9（槽位 10..18）
+  // 尾帧锚定图（槽位 5，任意模式可用：导演台上传尾帧时点亮）
+  const lfLid = L(5, 0, 10, 5, "IMAGE");
+  h3Inputs[5].link = lfLid;
+  nodes.push(hiddenNode(5, "LoadImage", "尾帧图", [380, 1660], ["", "image"],
+    imgOut(lfLid)));
+
+  // 参考图·1..9（槽位 11..19）
   for (let i = 0; i < 9; i++) {
     const id = 21 + i;
     const col = i % 3, row = Math.floor(i / 3);
-    const lid = L(id, 0, 10, 10 + i, "IMAGE");
+    const lid = L(id, 0, 10, 11 + i, "IMAGE");
     nodes.push(hiddenNode(id, "LoadImage", `参考图·${i + 1}`,
-      [380 + col * 320, 1660 + row * 340], ["", "image"], imgOut(lid)));
+      [720 + col * 320, 1660 + row * 340], ["", "image"], imgOut(lid)));
     h3Inputs.push(refSlot("参考图片组", `参考图片_${i}`, "IMAGE", lid));
   }
 
-  // 参考视频×3 + 配套 GetVideoComponents（槽位 19..21 图像 / 22..24 音轨，先视频组后音轨组）
+  // 参考视频×3 + 配套 GetVideoComponents（槽位 20..22 图像 / 23..25 音轨，先视频组后音轨组）
   for (let k = 0; k < 3; k++) {
     const lvId = 30 + k, gvcId = 33 + k;
-    const imgLid = L(gvcId, 0, 10, 19 + k, "IMAGE");
-    const audLid = L(gvcId, 1, 10, 22 + k, "AUDIO");
+    const imgLid = L(gvcId, 0, 10, 20 + k, "IMAGE");
+    const audLid = L(gvcId, 1, 10, 23 + k, "AUDIO");
     const lvLid = L(lvId, 0, gvcId, 0, "VIDEO");
     nodes.push(hiddenNode(lvId, "LoadVideo", `参考视频·${k + 1}`,
       [1380, 1660 + k * 240], [""],
@@ -220,10 +211,10 @@
       links.find((l) => l[1] === gvcId && l[2] === 1 && l[3] === 10)[0]));
   }
 
-  // 参考音频×3（槽位 25..27）
+  // 参考音频×3（槽位 26..28）
   for (let k = 0; k < 3; k++) {
     const id = 36 + k;
-    const lid = L(id, 0, 10, 25 + k, "AUDIO");
+    const lid = L(id, 0, 10, 26 + k, "AUDIO");
     nodes.push(hiddenNode(id, "LoadAudio", `参考音频·${k + 1}`,
       [2040, 1660 + k * 240], [""], [inp("audio", "AUDIO", lid), inp("name", "STRING", null)]));
     h3Inputs.push(refSlot("参考音频组", `参考音频_${k}`, "AUDIO", lid));
@@ -236,13 +227,14 @@
     inputs: [], outputs: [], properties: {}, widgets_values: [
       "# H3 长片导演台 · 配套工作流\n\n" +
       "- 生成控制在左侧「长片导演台」侧栏：提示词/素材/参数一体化，无需手动连点节点\n" +
-      "- 提示词走导演台状态（JSON 优先）；「提示词·1..3」隐藏节点是画布镜像兼兜底，" +
-      "没有导演台状态时按画布内容直接跑\n" +
-      "- 「素材池 · 自动管理」组的节点由导演台自动点亮/隐藏：**连线常驻，不用时只是隐藏**，请勿删除\n" +
-      "- 每段结果两条路可见：output/h3_segments/seg_*.mp4（分段落盘链）与" +
-      "output/h3_auto/（审片/自动保存）；导演台段卡片可直接预览\n" +
+      "- 提示词走导演台状态（JSON 优先），**1–64 段不限**：「＋ 添加一段」加段，" +
+      "「提示词·1..3」隐藏节点只是画布镜像兼兜底，超过 3 段全在导演台管理\n" +
+      "- 「素材池 · 自动管理」组的节点由导演台自动点亮/隐藏：**连线常驻，不用时只是隐藏**，请勿删除；" +
+      "「尾帧图」= 尾帧锚定（任意模式可用，防主体漂移）\n" +
+      "- 每段结果自动存进项目文件夹 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图 + 成片），" +
+      "导演台段卡片直接预览播放；需要另行导出可手动连「分段图像/分段音频」输出\n" +
       "- 默认 ref2va UNET（多参模式）；纯文生/首帧模式请在导演台切换，或把 UNETLoader 换成 fl2va 权重\n" +
-      "- 每段时长/宽高比/百万像素/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」",
+      "- 每段时长/宽高比/百万像素（0.1–2.0MP 步进0.1）/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」",
     ],
   });
 
@@ -257,8 +249,8 @@
 
   window.H3_DEFAULT_WORKFLOW = {
     id: "h3-chain-director-default",
-    revision: 1,
-    last_node_id: 61,
+    revision: 2,
+    last_node_id: 52,
     last_link_id: linkId,
     nodes,
     links,

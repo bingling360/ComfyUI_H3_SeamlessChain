@@ -1,49 +1,92 @@
-"""成片保存节点画廊与导演台存档的删除路由（官方 ComfyExtension.add_routes 钩子挂载）。
+"""项目存档与成片的 HTTP 路由（官方 ComfyExtension.add_routes 钩子挂载）。
 
-前端删除历史成片走 POST /h3chain/delete（saver 画廊）；
-删除项目存档走 POST /h3chain/delete_archive（导演台左栏，删 checkpoints/<名> 与
-h3_auto/<名> 两处，若被删的是当前链则一并清掉 h3chain_state.json 指针）。
+游戏式存档接口（前缀 /h3chain/）：
+- GET  /ping            诊断：确认路由已注册（前端开面板时探测）
+- GET  /projects        扫描磁盘列出全部项目（导演台项目列表数据源）
+- GET  /project?dir=x   读单个项目 manifest（提示词/参数/进度）
+- POST /create_project  新建项目：当场建文件夹+初始 manifest（游戏存档槽语义）
+- POST /delete_project  删除项目 = 删除整个项目文件夹
+- POST /delete_file     删除项目内单个文件（成片等，限 h3_projects/<项目>/<文件>）
+- POST /delete          删除成片保存节点输出目录中的文件（saver 画廊，限两级路径）
+
 均受限于输出目录内、防目录穿越；无新依赖。
+注册有运行期兜底：ensure_registered() 幂等重试，节点执行时会再调一次，
+根治「导入期注册失败 -> 前端 404/405」的问题。
+
+每条路由同时挂「根路径」与「/api 前缀」两份：ComfyUI 0.33.x 的
+PromptServer.add_routes() 只在启动时给当时已知的路由生成 /api 副本，
+自定义节点加载晚于该时点；而新版前端 api.fetchApi() 会给所有不以
+/api 开头的路径强制加 /api 前缀（comfyui-frontend 的 ComfyApi.apiURL）。
+只挂根路径 => 新前端全部 404；两份都挂 => 新旧前端与浏览器直访全通。
 """
 
 import json
 import os
-import shutil
 import traceback
 
 from aiohttp import web
 from folder_paths import get_output_directory
 
+from . import projects
+
 _registered = False
+_mounted = []  # [(目标对象, {(method, path)})]：按对象身份防重复挂载（持引用防 id 复用）
+
+ROUTES = [
+    ("GET", "/h3chain/ping"),
+    ("GET", "/h3chain/projects"),
+    ("GET", "/h3chain/project"),
+    ("POST", "/h3chain/create_project"),
+    ("POST", "/h3chain/delete"),
+    ("POST", "/h3chain/delete_project"),
+    ("POST", "/h3chain/delete_file"),
+]
+
+_ROUTES_LOG = ", ".join(f"{m} {p}" for m, p in ROUTES)
 
 
-def safe_name(name):
-    """文件名安全校验：拒空、路径分隔、盘符、与点开头（防目录穿越）。"""
-    s = str(name or "").strip()
-    if not s or s.startswith(".") or "/" in s or "\\" in s or ":" in s or ".." in s:
-        return None
-    return s
+def _routes_desc() -> list:
+    return [{"method": m, "path": p} for m, p in ROUTES]
 
 
 def safe_relfile(rel):
     """saver 输出目录内单文件：<前缀>/<文件名>，两级、无穿越。"""
     s = str(rel or "").strip()
     parts = s.split("/")
-    if (len(parts) != 2 or not all(safe_name(p) for p in parts)
+    if (len(parts) != 2 or not all(projects.safe_name(p) for p in parts)
             or not os.path.splitext(parts[1])[1]):
         return None
     return s
 
 
 def add_routes(routes):
-    """把删除路由挂到 routes 对象（aiohttp）。
+    """把路由挂到 routes 对象（aiohttp）。
 
     routes 可能是：
-    - web.RouteTableDef（自定义节点标准写法，支持 routes.post 装饰器）
-    - app.router（UrlDispatcher，运行中的真实路由表，用 add_post 方法）——
+    - web.RouteTableDef（自定义节点标准写法，支持 routes.get/post 装饰器）
+    - app.router（UrlDispatcher，运行中的真实路由表，用 add_get/add_post 方法）——
       ComfyUI 0.33.x 在 custom node 导入前已 app.add_routes(routes)，
       直接挂到 app.router 才能绕过挂载时序问题。
     """
+
+    async def ping(request):
+        return web.json_response({"ok": True, "version": "v3", "routes": _routes_desc()})
+
+    async def list_projects(request):
+        return web.json_response({"ok": True, "projects": projects.list_projects()})
+
+    async def project_detail(request):
+        manifest = projects.read_project(request.query.get("dir") or "")
+        if manifest is None:
+            return web.json_response({"error": "项目不存在"}, status=404)
+        return web.json_response({"ok": True, "manifest": manifest})
+
+    async def create_project(request):
+        data = await request.json()
+        manifest = projects.create_project(str(data.get("dir") or ""))
+        if manifest is None:
+            return web.json_response({"error": "无效的项目目录名"}, status=400)
+        return web.json_response({"ok": True, "manifest": manifest})
 
     async def delete(request):
         data = await request.json()
@@ -57,43 +100,86 @@ def add_routes(routes):
         os.remove(target)
         return web.json_response({"ok": True})
 
-    async def delete_archive(request):
+    async def delete_project(request):
         data = await request.json()
-        name = safe_name(data.get("dir"))
-        if not name or name == "h3chain_state.json":
-            return web.json_response({"error": "无效的存档目录名"}, status=400)
-        root = os.path.realpath(get_output_directory())
-        deleted = []
-        for sub in ("checkpoints", "h3_auto"):
-            target = os.path.realpath(os.path.join(root, sub, name))
-            if not target.startswith(root + os.sep) or not os.path.isdir(target):
-                continue
-            shutil.rmtree(target)
-            deleted.append(os.path.relpath(target, root).replace("\\", "/"))
-        # 被删的是当前链时清掉状态指针，防面板继续指向已删目录
-        state_path = os.path.join(root, "checkpoints", "h3chain_state.json")
+        name = projects.safe_name(data.get("dir"))
+        if not name:
+            return web.json_response({"error": "无效的项目目录名"}, status=400)
         try:
-            with open(state_path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            if isinstance(state, dict) and state.get("dir") == name:
-                os.remove(state_path)
-        except Exception:
-            pass
-        if not deleted:
-            return web.json_response({"error": "存档目录不存在"}, status=404)
+            deleted = projects.delete_project(name)
+        except OSError as e:
+            return web.json_response(
+                {"error": f"删除失败（文件可能被播放器/编码器占用）：{e}"}, status=500)
+        if deleted is None:
+            return web.json_response({"error": "项目不存在"}, status=404)
         return web.json_response({"ok": True, "deleted": deleted})
 
-    # 兼容 RouteTableDef（.post 装饰器）与 UrlDispatcher（app.router，add_post 方法）
-    if hasattr(routes, "add_post"):
-        # 运行中真实路由表（ComfyUI 0.33.x 优先走这里）
-        routes.add_post("/h3chain/delete", delete)
-        routes.add_post("/h3chain/delete_archive", delete_archive)
-    elif hasattr(routes, "post"):
-        # RouteTableDef 装饰器写法（旧版 ComfyUI）
-        routes.post("/h3chain/delete")(delete)
-        routes.post("/h3chain/delete_archive")(delete_archive)
-    else:
-        raise TypeError("add_routes: 不支持的 routes 类型 %r" % type(routes))
+    async def delete_file(request):
+        data = await request.json()
+        rel = str(data.get("path") or "").strip().replace("\\", "/")
+        parts = rel.split("/")
+        if (len(parts) != 3 or parts[0] != "h3_projects"
+                or not projects.safe_name(parts[1])
+                or not projects.safe_name(parts[2])
+                or not os.path.splitext(parts[2])[1]):
+            return web.json_response(
+                {"error": "路径必须是 h3_projects/<项目>/<文件名>"}, status=400)
+        root = os.path.realpath(get_output_directory())
+        target = os.path.realpath(os.path.join(root, *parts))
+        if not target.startswith(root + os.sep) or not os.path.isfile(target):
+            return web.json_response({"error": "文件不存在"}, status=404)
+        os.remove(target)
+        return web.json_response({"ok": True})
+
+    handlers = [
+        ("GET", "/h3chain/ping", ping),
+        ("GET", "/h3chain/projects", list_projects),
+        ("GET", "/h3chain/project", project_detail),
+        ("POST", "/h3chain/create_project", create_project),
+        ("POST", "/h3chain/delete", delete),
+        ("POST", "/h3chain/delete_project", delete_project),
+        ("POST", "/h3chain/delete_file", delete_file),
+    ]
+
+    def _mount(target, method, path, handler):
+        keys = None
+        for obj, ks in _mounted:
+            if obj is target:
+                keys = ks
+                break
+        if keys is None:
+            keys = set()
+            _mounted.append((target, keys))
+        if (method, path) in keys:
+            return
+        if hasattr(target, "add_post"):
+            # 运行中真实路由表（UrlDispatcher：app.router 的 add_get/add_post）
+            getattr(target, f"add_{method.lower()}")(path, handler)
+        elif hasattr(target, "post"):
+            # RouteTableDef 装饰器写法（旧版 ComfyUI，加载后才统一装载）
+            getattr(target, method.lower())(path)(handler)
+        else:
+            raise TypeError("add_routes: 不支持的 routes 类型 %r" % type(target))
+        keys.add((method, path))
+
+    for method, path, handler in handlers:
+        _mount(routes, method, path, handler)             # 根路径：浏览器直访 / 旧前端
+        _mount(routes, method, "/api" + path, handler)    # /api 副本：新版前端 fetchApi 强制前缀
+
+
+def ensure_registered() -> bool:
+    """运行期兜底：未注册成功时重试一次（幂等）。
+
+    节点每次 execute 前调用——即使导入期的注册因时序问题全部失败，
+    第一次排队执行后路由也会就位，前端删除/列表不再 404/405。
+    """
+    global _registered
+    if _registered:
+        return True
+    try:
+        return register()
+    except Exception:
+        return False
 
 
 def register(routes=None):
@@ -116,7 +202,7 @@ def register(routes=None):
         try:
             add_routes(routes)
             _registered = True
-            print("[ComfyUI_H3_SeamlessChain] 路由已注册：POST /h3chain/delete, /h3chain/delete_archive")
+            print(f"[ComfyUI_H3_SeamlessChain] 路由已注册（扩展钩子，含 /api 前缀副本）：{_ROUTES_LOG}")
             return True
         except Exception:
             print("[ComfyUI_H3_SeamlessChain] 路由注册失败（删除功能不可用）。详细错误：")
@@ -146,7 +232,7 @@ def register(routes=None):
             add_routes(target)
             _registered = True
             where = "app.router" if router is not None else "PromptServer.instance.routes"
-            print(f"[ComfyUI_H3_SeamlessChain] 路由已注册（{where}）：POST /h3chain/delete, /h3chain/delete_archive")
+            print(f"[ComfyUI_H3_SeamlessChain] 路由已注册（{where}，含 /api 前缀副本）：{_ROUTES_LOG}")
             return True
         except Exception:
             # app.router 失败则回退 RouteTableDef（保留旧版兼容）
@@ -155,7 +241,7 @@ def register(routes=None):
                 try:
                     add_routes(routes2)
                     _registered = True
-                    print("[ComfyUI_H3_SeamlessChain] 路由已注册：POST /h3chain/delete, /h3chain/delete_archive")
+                    print(f"[ComfyUI_H3_SeamlessChain] 路由已注册（RouteTableDef，含 /api 前缀副本）：{_ROUTES_LOG}")
                     return True
                 except Exception:
                     traceback.print_exc()

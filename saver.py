@@ -57,7 +57,7 @@ def copy_segments(dirpath):
     name = state.get("dir") or ""
     if not name or "/" in name or "\\" in name or ".." in name:
         return []
-    src = os.path.join(checkpoint.checkpoints_root(), name)
+    src = os.path.join(checkpoint.projects_root(), name)
     if not os.path.isdir(src):
         return []
     dst = os.path.join(dirpath, "segs")

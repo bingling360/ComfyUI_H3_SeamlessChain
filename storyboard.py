@@ -68,12 +68,12 @@ def keyframes_from_ckpt(import_dir, video_vae):
     """续拍链断点目录 -> 关键帧图列表：kf[0]=段0首帧，kf[i+1]=段i尾帧。
 
     按 seg_NNN.pt 连续存在读最大前缀（中断段无尾帧，不导入）；
-    import_dir 支持绝对路径或相对 output/checkpoints/ 的目录名。
+    import_dir 支持绝对路径或相对 output/h3_projects/ 的目录名。
     """
     root = import_dir if os.path.isabs(import_dir) else os.path.join(
-        checkpoint.checkpoints_root(), import_dir)
+        checkpoint.projects_root(), import_dir)
     if not os.path.isdir(root):
-        raise ValueError(f"断点导入目录不存在：{root}（相对路径以 output/checkpoints/ 为基准）")
+        raise ValueError(f"断点导入目录不存在：{root}（相对路径以 output/h3_projects/ 为基准）")
     last = -1
     while os.path.exists(checkpoint.seg_path(root, last + 1)):
         last += 1
@@ -133,7 +133,7 @@ class H3StoryboardChain(io.ComfyNode):
                 io.Combo.Input("断点续拍", options=["关闭", "自动续跑"], default="关闭",
                                tooltip="自动续跑：每段采样后立即落盘 latent 断点，中断后重跑自动跳过已完成段"),
                 io.String.Input("断点目录", default="",
-                                tooltip="空=按参数指纹自动命名于 output/checkpoints/ 下；换链请填新名字或清空旧目录"),
+                                tooltip="项目名：output/h3_projects/<项目名>/ 一个项目一个文件夹；空=按参数指纹自动命名"),
                 io.Combo.Input("审片模式", options=["关闭", "逐段确认"], default="关闭",
                                tooltip="逐段确认：每次运行只生成一个新段落即返回，预览后重新运行继续；"
                                        "不满意可改该段提示词（自动从该段重跑）。开启后断点自动启用"),
@@ -144,7 +144,8 @@ class H3StoryboardChain(io.ComfyNode):
                                tooltip="上传=「分镜图组」逐张接图（LoadImage）；从断点导入=读续拍链断点目录各段 latent "
                                        "解码出关键帧（首段首帧+各段尾帧），实现续拍粗剪→分镜精修两遍法"),
                 io.String.Input("断点导入目录", default="",
-                                tooltip="关键帧来源=从断点导入时生效：续拍链断点目录名（相对 output/checkpoints/）或绝对路径"),
+                                tooltip="关键帧来源=从断点导入时生效：项目目录名（相对 output/h3_projects/）或绝对路径"
+                                        "（旧 checkpoints 目录需填绝对路径）"),
                 io.Autogrow.Input("分镜图组", optional=True,
                                   template=io.Autogrow.TemplatePrefix(
                                       input=io.Image.Input("分镜图",
@@ -206,7 +207,7 @@ class H3StoryboardChain(io.ComfyNode):
             src = 断点导入目录.strip()
             if not src:
                 raise ValueError("关键帧来源=从断点导入 时，「断点导入目录」不能为空："
-                                 "填续拍链断点目录名（相对 output/checkpoints/）或绝对路径")
+                                 "填项目目录名（相对 output/h3_projects/）或绝对路径")
             kf_imgs = keyframes_from_ckpt(src, video_vae)
             base = os.path.basename(src.rstrip("/\\"))
             kf_origin = f"从断点导入（{base}，{len(kf_imgs) - 1} 段）"
@@ -253,9 +254,16 @@ class H3StoryboardChain(io.ComfyNode):
         seg_hashes = [cls._seg_hash(p, kf_hashes[hi], kf_hashes[ti], tail_locked)
                       for hi, ti, p in plan]
         root, manifest, done, seeds = None, None, 0, []
+        proj_title, proj_created, proj_finals = "", None, []
         if use_ckpt:
             root = checkpoint.ckpt_dir(ckpt_params, 断点目录.strip())
             manifest = checkpoint.load_manifest(root)
+            proj_title = os.path.basename(root)
+            proj_created = time.time()
+            if manifest is not None:
+                proj_title = str(manifest.get("title") or proj_title)
+                proj_created = manifest.get("created_at") or proj_created
+                proj_finals = list(manifest.get("finals") or [])
             if manifest is not None:
                 if manifest.get("schema") != checkpoint.SCHEMA:
                     raise ValueError(f"断点目录格式不认识（{manifest.get('schema')}），请换一个目录名")
@@ -410,6 +418,8 @@ class H3StoryboardChain(io.ComfyNode):
                     "prompts": list(seg_prompts[:done]),
                     "seams": seams[:done], "anchors": anchors[:done],
                     "params": ckpt_params,
+                    "title": proj_title, "created_at": proj_created,
+                    "updated_at": time.time(), "finals": list(proj_finals),
                 })
 
             pbar.update(1)
@@ -430,13 +440,15 @@ class H3StoryboardChain(io.ComfyNode):
                 "prompts": list(seg_prompts[:done]),
                 "seams": seams[:done], "anchors": anchors[:done],
                 "params": ckpt_params,
+                "title": proj_title, "created_at": proj_created,
+                "updated_at": time.time(), "finals": list(proj_finals),
             })
             if review:
                 if len(seg_frames) == total:
                     report.append("审片：本链已全部完成")
                 if reroll > 0:
                     report.append(f"注意：「重跑起始段」={reroll} 已生效，确认无误后请改回 0")
-            report.append(f"断点目录（含中间 latent，跑完可删）：{root}")
+            report.append(f"项目文件夹（关键帧/分段视频/latent 全在此，删项目=删整个文件夹）：{root}")
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
                                    "review": bool(review), "reroll": reroll,
                                    "report": "\n".join(report), "updated_at": time.time()})

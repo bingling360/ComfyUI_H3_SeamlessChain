@@ -19,6 +19,8 @@ eq("16:9+1.0", mod.resolveCanvas("16:9", "1.0"), [1344, 768]);
 eq("9:16+1.0", mod.resolveCanvas("9:16", "1.0"), [768, 1344]);
 eq("16:9+0.5", mod.resolveCanvas("16:9", "0.5"), [960, 544]);
 eq("21:9+1.0 上限收敛", mod.resolveCanvas("21:9", "1.0"), [1344, 576]);
+eq("1:1+2.0 上限收敛", mod.resolveCanvas("1:1", "2.0"), [768, 768]);
+eq("16:9+2.0 上限收敛", mod.resolveCanvas("16:9", "2.0"), [1344, 768]);
 eq("非法AR", mod.resolveCanvas("自定义", "1.0"), null);
 
 eq("snap 5.0", mod.snapFrames(5.0), 124);
@@ -27,14 +29,16 @@ eq("snap 6.0", mod.snapFrames(6.0), 141);
 eq("snap 0.5", mod.snapFrames(0.5), 5);
 eq("snap 15", mod.snapFrames(15), 362);
 
-eq("match 1344x768", mod.matchCanvasCombo(1344, 768), ["16:9", "1.0"]);
-eq("match 864x480 无组合", mod.matchCanvasCombo(864, 480), null);
+eq("match 1344x768", mod.matchCanvasCombo(1344, 768), ["16:9", 1]);
+eq("match 960x544", mod.matchCanvasCombo(960, 544), ["16:9", 0.5]);
+eq("match 864x480", mod.matchCanvasCombo(864, 480), ["16:9", 0.4]);   // 20 档细分后旧默认画布可命中
+eq("match 850x480 无组合", mod.matchCanvasCombo(850, 480), null);      // 非 32 倍数必然无组合
 
 const remapped = mod.remapOldWidgetValues([864, 480, 124, "22", 0, "fixed", 25, 1.0, "res_multistep", "simple"]);
-eq("迁移头部", remapped.slice(0, 8), ["自定义", "0.5", 864, 480, 5.2, "22", 0, "fixed"]);
+eq("迁移头部", remapped.slice(0, 8), ["16:9", 0.4, 864, 480, 5.2, "22", 0, "fixed"]);
 eq("迁移尾部保留", remapped.slice(8), [25, 1.0, "res_multistep", "simple"]);
 const remapped2 = mod.remapOldWidgetValues([1344, 768, 124, "22", 9, "randomize", 30, 2.0]);
-eq("迁移命中组合", remapped2.slice(0, 7), ["16:9", "1.0", 1344, 768, 5.2, "22", 9]);
+eq("迁移命中组合", remapped2.slice(0, 7), ["16:9", 1, 1344, 768, 5.2, "22", 9]);
 
 /* 导演台时代 25 值 → 统一接缝后端 35 值：头部不变、接缝混合映射、新控件默认值插入、尾部保留 */
 const v25 = ["16:9", "0.5", 864, 480, 5.0, "22", 0, "fixed", 25, 1.0,
@@ -131,7 +135,7 @@ if (wf) {
         ok(`link${lid} 槽位回指`, so.link === lid && di.link === lid);
     }
     /* 主节点输入槽顺序与后端 schema 一致（autogrow 全组 0 起编号，含提示词组） */
-    const expect = ["模型", "文本编码器", "视频VAE", "音频VAE", "首帧图片", "起始视频", "起始视频音轨",
+    const expect = ["模型", "文本编码器", "视频VAE", "音频VAE", "首帧图片", "尾帧锚定", "起始视频", "起始视频音轨",
         "提示词组.提示词_0", "提示词组.提示词_1", "提示词组.提示词_2",
         ...Array.from({ length: 9 }, (_v, i) => `参考图片组.参考图片_${i}`),
         ...Array.from({ length: 3 }, (_v, i) => `参考视频组.参考视频_${i}`),
@@ -139,21 +143,20 @@ if (wf) {
         ...Array.from({ length: 3 }, (_v, i) => `参考音频组.参考音频_${i}`)];
     eq("主节点槽位顺序", h3n.inputs.map((i) => i.name), expect);
     /* 提示词组 3 槽都已连线（运行兜底） */
-    ok("提示词槽已连线", h3n.inputs.slice(7, 10).every((i) => i.link != null));
-    /* 分段输出链：分段图像/音频 → CreateVideo → SaveVideo */
-    const cv = [...byId.values()].find((n) => n.type === "CreateVideo");
-    const sv = [...byId.values()].find((n) => n.type === "SaveVideo");
-    ok("CreateVideo 存在", !!cv);
-    ok("SaveVideo 存在", !!sv);
-    if (cv && sv) {
-        eq("分段图像→CreateVideo.images", [10, 4], [wf.links.find((l) => l[0] === cv.inputs[0].link)[1], wf.links.find((l) => l[0] === cv.inputs[0].link)[2]]);
-        eq("分段音频→CreateVideo.audio", [10, 5], [wf.links.find((l) => l[0] === cv.inputs[1].link)[1], wf.links.find((l) => l[0] === cv.inputs[1].link)[2]]);
-        ok("CreateVideo→SaveVideo", sv.inputs[0].link != null
-            && wf.links.find((l) => l[0] === sv.inputs[0].link)[1] === cv.id);
-        eq("CreateVideo fps=24", cv.widgets_values[0], 24.0);
+    ok("提示词槽已连线", h3n.inputs.slice(8, 11).every((i) => i.link != null));
+    /* 尾帧锚定：槽位 5 预连线到隐藏「尾帧图」LoadImage（任意模式可点亮） */
+    const lf = [...byId.values()].find((n) => n.title === "尾帧图");
+    ok("尾帧图节点存在", !!lf);
+    if (lf) {
+        eq("尾帧图节点隐藏", lf.mode, 2);
+        eq("尾帧图→槽位5 尾帧锚定", [10, 5],
+            [wf.links.find((l) => l[0] === lf.outputs[0].link)[3], wf.links.find((l) => l[0] === lf.outputs[0].link)[4]]);
     }
+    /* 分段视频不再单独打包：改由主节点「自动保存」存进项目文件夹（导演台段卡片预览） */
+    ok("无遗留分段打包链", ![...byId.values()].some((n) => n.type === "CreateVideo" || n.type === "SaveVideo"));
     /* widgets_values 顺序与后端 schema 控件数一致（35 项 = 34 控件 + 种子 control 占 1 位） */
     eq("主节点 widgets 数量", h3n.widgets_values.length, 35);
+    eq("百万像素浮点默认 0.5", h3n.widgets_values[1], 0.5);
     eq("主节点接缝处理默认值", h3n.widgets_values[17], "标准");
     eq("主节点生成模式/导演台状态尾部", h3n.widgets_values.slice(33), ["文生视频", ""]);
     /* last_link_id / last_node_id 覆盖全部 */

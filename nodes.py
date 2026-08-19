@@ -17,7 +17,8 @@
   成片以它开头，后续生成段从其结尾续拍（24fps 约定，经一次 VAE 重编码）
 
 配套节点：成片历史画廊走 H3ChainSaver（web/h3chain_saver.js）；
-「自动保存=分段+成片」时每段 mp4 与完整成片自动落盘 output/h3_auto/<存档名>/。
+「自动保存=分段+成片」时每段 mp4 与完整成片自动落盘项目文件夹
+output/h3_projects/<项目名>/（游戏式存档：一项目一文件夹，导演台可读档/删除）。
 
 兼容性：不 monkey-patch；conditioning/latent 构造直接调用官方
 MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo 节点类，采样走官方
@@ -209,34 +210,14 @@ def _center_cover(frames, width, height):
     return x.movedim(1, -1)
 
 
-def _autosave_dir(root):
-    from folder_paths import get_output_directory
-    return os.path.join(get_output_directory(), "h3_auto", os.path.basename(root))
-
-
-def _autosave_copy_seg(root, idx):
-    """把存档目录里刚落盘的分段 mp4 复制到自动保存目录（不重编码，秒级）。"""
-    import shutil
-    try:
-        src = os.path.join(root, f"seg_{idx:03d}.mp4")
-        if os.path.isfile(src):
-            dst_dir = _autosave_dir(root)
-            os.makedirs(dst_dir, exist_ok=True)
-            shutil.copy2(src, os.path.join(dst_dir, f"seg_{idx:03d}.mp4"))
-    except Exception:
-        pass
-
-
 def _autosave_final(root, frames, wav, sample_rate, fps=24):
-    """完整链（或审片已确认部分）PyAV 编码成片到自动保存目录，成功返回路径。
+    """完整链（或审片已确认部分）PyAV 编码成片到项目文件夹，成功返回路径。
 
     失败时返回 (None, error_msg) 供调用方写入报告；成功返回 (path, None)。
     """
     from . import media
     try:
-        dst_dir = _autosave_dir(root)
-        os.makedirs(dst_dir, exist_ok=True)
-        path = os.path.join(dst_dir, f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
+        path = os.path.join(root, f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
         print(f"[H3自动保存] 编码完整成片：{int(frames.shape[0])} 帧 → {path}（编码期间 CPU 升高属正常）")
         t0 = time.time()
         ok = media.save_av_mp4(path, frames, wav, sample_rate, fps)
@@ -333,7 +314,7 @@ def _parse_director_state(raw):
 # ---- 官方 Resolution Selector 同款画布换算 + 时长网格吸附 ----
 
 _AR_RATIO = {"21:9": 21 / 9, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4, "1:1": 1.0}
-_MP_OPTIONS = ["0.25", "0.5", "0.75", "1.0"]
+_MP_OPTIONS = [round(i * 0.1, 1) for i in range(1, 21)]   # 0.1–2.0MP，0.1 步进（官方箭头微调同款）
 _LABEL_TOKEN = re.compile(r"\[\[([^\[\]]{1,24})\]\]")
 
 
@@ -341,14 +322,24 @@ def _resolve_canvas(ar, mp):
     """宽高比+百万像素 -> 32 倍数对齐画布（短边≤768、长边≤1344，H3 原生画布上限）。
 
     16:9+1.0 → 1344×768（官方原生画布）；16:9+0.5 → 960×544；9:16+1.0 → 768×1344。
+    ceil 对齐可能顶破上限（2.0MP 正方形 → 800>768）：_fit 就近回落到上限
+    （768/1344 均为 32 倍数，回落不破坏对齐）；方形两边统一走短边上限。
     """
     r = _AR_RATIO[str(ar)]
     total = float(mp) * 1_000_000
     w0, h0 = (total * r) ** 0.5, (total / r) ** 0.5
     s = min(1.0, 1344 / max(w0, h0), 768 / min(w0, h0))
-    w = max(32, math.ceil(w0 * s / 32) * 32)
-    h = max(32, math.ceil(h0 * s / 32) * 32)
-    return w, h
+
+    def _fit(target, cap):
+        v = math.ceil(target / 32) * 32
+        return max(32, min(v, cap))
+
+    if w0 == h0:                                   # 1:1 方形：短边上限对两边生效
+        side = _fit(w0 * s, 768)
+        return side, side
+    if w0 > h0:
+        return _fit(w0 * s, 1344), _fit(h0 * s, 768)
+    return _fit(w0 * s, 768), _fit(h0 * s, 1344)
 
 
 def _snap_seconds(seconds):
@@ -400,9 +391,64 @@ def _apply_label_tokens(prompt, label_order):
 
 
 def _reference_header(label_order):
-    """段首自动注入的参考映射行（官方建议显式指派每个参考的职责），三类 token 各自编号。"""
+    """段首自动注入的参考定义（官方 Ref2VA subject_definitions 风格），三类 token 各自编号。"""
     mapping = _kind_tokens(_normalize_order(label_order))
-    return "参考：" + "，".join(f"{tok}={lbl}" for lbl, tok in mapping.items()) + "。"
+    role = {"Picture": "reference image", "Video": "reference video", "Audio": "reference audio"}
+    lines = [f"{tok} is the {role[tok.split()[0][1:].capitalize()]} for {lbl}, "
+             f"used as a generation anchor of this segment."
+             for lbl, tok in mapping.items()]
+    return "subject_definitions:\n" + "\n".join(lines)
+
+
+# 官方 h3-prompt-writing 三字段标签：主提示词含任一即视为已是官方格式，直通不包装
+_OFFICIAL_FIELD_RE = re.compile(
+    r"integrated_multimodal_description\s*:|overall_soundscape\s*:|detailed_description\s*:")
+
+
+def _wrap_dialogue(text):
+    """中文对白「……」→ 官方 <d>[中文] ……</d>。
+
+    只动「」（中文对白惯例）；英文双引号是官方可见屏幕文字记法，不动。
+    """
+    return re.sub(r"「([^「」]*)」", r"<d>[中文] \1</d>", text)
+
+
+def _compose_official(scene, char, prompt, soundscape, music):
+    """按官方 h3-prompt-writing 结构组装单段提示词。
+
+    - prompt 已是官方格式（三字段任一标签）→ 原样直通（含 [[标签]] 等待后续替换）
+    - 否则组装三字段：描述体 = 场景。角色。主提示词（句号连接，各剥尾部标点），
+      主提示词已以 [Shot 开头时不重复加 [Shot 1] 前缀
+    - 环境音/配乐留空则整个字段省略（不写 N/A——官方 N/A = 明确请求无声，
+      省略 = 不约束）
+    - 主提示词未含 <d> 时自动把「……」转 <d>[中文] …</d>
+    返回 (组装文本, 对白转换次数)。
+    """
+    prompt = prompt or ""
+    if _OFFICIAL_FIELD_RE.search(prompt):
+        return prompt, 0
+    wrapped = prompt
+    dialogues = 0
+    if "<d>" not in prompt:
+        wrapped = _wrap_dialogue(prompt)
+        dialogues = len(re.findall(r"<d>", wrapped))
+    parts = [str(p).strip().rstrip("。.；;，, ") for p in (scene, char, wrapped) if str(p).strip()]
+    # 主提示词已带 [Shot N] 开头标签：剥掉防重复，统一在描述行首放一个前缀
+    shot_tag = re.match(r"\s*(\[Shot\s*\d+\])\s*", str(wrapped))
+    if shot_tag:
+        parts = [str(p).strip().rstrip("。.；;，, ") for p in (scene, char) if str(p).strip()]
+        parts.append(wrapped[shot_tag.end():].strip().rstrip("。.；;，, "))
+        parts = [p for p in parts if p]
+    body = "。".join(parts)
+    lines = []
+    if body:
+        prefix = f"{shot_tag.group(1)} " if shot_tag else "[Shot 1] "
+        lines.append(f"integrated_multimodal_description: {prefix}{body}")
+    if str(soundscape or "").strip():
+        lines.append(f"overall_soundscape: {str(soundscape).strip()}")
+    if str(music or "").strip():
+        lines.append(f"non_diegetic_music: {str(music).strip()}")
+    return "\n".join(lines), dialogues
 
 
 class H3SeamlessChainSampler(io.ComfyNode):
@@ -423,9 +469,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Combo.Input("宽高比", options=["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"], default="16:9",
                                tooltip="官方 Resolution Selector 同款：与「百万像素」共同换算画布，32 倍数对齐，"
                                        "短边≤768、长边≤1344（H3 原生画布上限）。选「自定义」时直接用下方宽度/高度"),
-                io.Combo.Input("百万像素", options=_MP_OPTIONS, default="0.5",
-                               tooltip="目标总像素：0.25 草稿 / 0.5 快速预览 / 0.75 均衡 / 1.0 官方原生"
-                                       "（16:9 下即 1344×768）。超出画布上限会自动收到上限"),
+                io.Float.Input("百万像素", default=0.5, min=0.1, max=2.0, step=0.1,
+                               tooltip="目标总像素（MP），0.1–2.0 步进 0.1 共 20 档，箭头微调（官方 Resolution Selector 同款）："
+                                       "0.25 草稿 / 0.5 快速预览 / 1.0 官方原生（16:9 下即 1344×768）/ 2.0 超采样上限。"
+                                       "超出画布上限会自动收到上限（短边≤768、长边≤1344）"),
                 io.Int.Input("宽度", default=864, min=32, max=16384, step=32, advanced=True,
                              tooltip="「宽高比=自定义」时直接生效；其余模式由 宽高比+百万像素 换算覆盖"),
                 io.Int.Input("高度", default=480, min=32, max=16384, step=32, advanced=True,
@@ -444,8 +491,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Combo.Input("自动存档", options=["关闭", "自动存档"], default="关闭",
                                tooltip="自动存档：每段采样后立即落盘 latent 存档（约5MB/段），中断后重跑自动跳过已完成段，结果与一次跑完一致"),
                 io.String.Input("存档目录", default="",
-                                tooltip="空=按参数指纹自动命名于 output/checkpoints/ 下；换链请填新名字或清空旧目录。"
-                                        "填了名字即固定存档：中断重跑、改词重跑都续在这个目录。存档为中间产物，跑完可删"),
+                                tooltip="项目名：output/h3_projects/<项目名>/ 一个项目一个文件夹（视频/提示词/成片/latent 全在内）。"
+                                        "空=按参数指纹自动命名；填了名字即固定项目：中断重跑、改词重跑都续在这个文件夹"),
                 io.Combo.Input("桥帧门控", options=["关闭", "标注", "自动回退"], default="标注",
                                tooltip="对将成为重叠桥的尾帧打分（Laplacian清晰度+曝光）：标注=只写报告；自动回退=尾帧低于阈值时向前回退17/34帧取好帧续拍（该段可见帧数随之减少）"),
                 io.Float.Input("清晰度阈值", default=30.0, min=0.0, max=100.0, step=0.5,
@@ -478,12 +525,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "0.2 标准（SkyReels 同值）；0.3+ 干预强但画面细节会变软。"
                                        "仅影响带引导桥的段；不进存档指纹，改参数不触发重跑"),
                 io.Combo.Input("审片模式", options=["关闭", "逐段确认"], default="关闭",
-                               tooltip="逐段确认：每次运行只生成一个新的段落即返回，预览「分段图像」或自动保存目录里的"
+                               tooltip="逐段确认：每次运行只生成一个新的段落即返回，预览「分段图像」或项目文件夹里的"
                                        "分段视频后重新运行继续下一段；不满意可改该段提示词（自动从该段重跑）或设「重跑起始段」重摇。"
                                        "开启后存档自动启用"),
                 io.Combo.Input("自动保存", options=["关闭", "分段+成片"], default="分段+成片",
                                tooltip="开启后无需任何下游接线：每段生成完自动存 mp4、链（或审片已确认部分）自动拼成"
-                                       "完整成片，全部落在 output/h3_auto/<存档名>/ 下，报告注明路径。开启后存档自动启用"),
+                                       "完整成片，全部直接落在项目文件夹 output/h3_projects/<项目名>/ 内，报告注明路径。开启后存档自动启用"),
                 io.Int.Input("重跑起始段", default=0, min=0, max=63,
                              tooltip="0=自动（沿用存档进度，改过提示词的段自动重做）；N=从第 N 段起丢弃存档重新生成"
                                      "（有序章时序章为第 1 段），配合改「种子」即可重摇该段及之后。用完记得改回 0"),
@@ -536,18 +583,21 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.String.Input("导演台状态", multiline=True, default="", socketless=True, advanced=True,
                                tooltip="导演台前端写入的 JSON 状态（模式/提示词/素材文件名/分段处理）。"
                                        "有值时优先于画布接线：提示词从 JSON 读取，图片从 input 目录加载。"
+                                       "first_frame=首帧图片、last_frame=尾帧锚定（身份锚点，任意模式可用）；"
                                        "ref_assets 为标签素材池 [{file,label}]；segments 数组为每段提供 "
-                                       "scene_prompt / character_prompt / seconds（本段秒数）/"
+                                       "scene_prompt / character_prompt / soundscape（环境音）/"
+                                       "music（配乐，均留空省略）/ seconds（本段秒数）/"
                                        "refs（本段引用的素材标签，缺省=全部），提示词用 [[标签]] 引用素材，"
-                                       "后端按段压实重编号为 <Picture k>。"
-                                       "空值或旧工作流走原有画布输入（向后兼容）。"
+                                       "后端按官方 h3-prompt-writing 三字段结构组装（含对白「」→<d> 自动转换）。"
+                                       "空值或旧工作流走原有画布输入（同样获得官方结构组装，向后兼容）。"
                                        "只存相对输入文件名，不存媒体内容、密钥或绝对路径。"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Image.Input("尾帧锚定", optional=True,
                                tooltip="身份锚定帧（last_frame keyframe）：注入每段末尾位置作为人物/场景参考，"
                                        "与段首引导桥形成「隧道」——模型去噪全程被首尾双锚点约束，过了桥窗口"
-                                       "（约2秒）也不会漂移。建议用角色正面清晰帧。不传则不锚定尾帧（保持现状）"),
+                                       "（约2秒）也不会漂移。建议用角色正面清晰帧（导演台素材池可上传，"
+                                       "任意模式可用）。不传则不锚定尾帧（保持现状）"),
                 io.Image.Input("起始视频", optional=True,
                                tooltip="序章：上传视频（≥5 帧、24fps，超长只取前「每段时长」内）编码为第 1 段存入存档，"
                                        "成片以它开头，生成段从其结尾续拍；经一次 VAE 重编码，不能与首帧图片同用"),
@@ -602,6 +652,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 精修强度=0.45, 精修窗口="39", 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
                 智能切镜="关闭", 递减锚定="关闭", 切镜最多丢帧=17, 全链丢弃预算=48,
                 自适应精修="开启", 生成模式="文生视频", 导演台状态=""):
+        # 运行期路由兜底：导入期注册因时序失败时，首次执行后前端删除/列表即可用
+        try:
+            from .routes import ensure_registered
+            ensure_registered()
+        except Exception:
+            pass
         # ---- 导演台状态驱动：有 JSON 状态时优先于画布接线 ----
         ds = _parse_director_state(导演台状态)
         ds_used = bool(ds)
@@ -651,54 +707,57 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         segments = ds.get("segments") if isinstance(ds.get("segments"), list) else []
 
-        # 分段处理中心：组合场景/角色提示词；[[标签]] -> <Picture>/<Video>/<Audio>；段首自动参考映射行
+        # 分段处理中心：官方三字段组装（场景/角色/环境音/配乐）；[[标签]] -> <Picture>/<Video>/<Audio>；
+        # 段首自动 subject_definitions。画布模式（无 JSON 状态）同样获得官方结构。
         seg_composed = 0
         seg_custom_refs = 0
+        seg_dialogues = 0
         seg_label_orders = [[] for _ in seg_prompts]   # 每段 [(kind, 标签)]，按勾选顺序
-        if segments or pool_files:
-            composed_prompts = []
-            for i, prompt in enumerate(seg_prompts):
-                seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
-                scene = str(seg.get("scene_prompt", "")).strip()
-                char = str(seg.get("character_prompt", "")).strip()
-                parts = [p for p in (scene, char, prompt) if p]
-                full = "\n".join(parts)
-                if pool_files:
-                    refs_sel = seg.get("refs")
-                    order = []
-                    if isinstance(refs_sel, list) and refs_sel:
-                        for r in refs_sel:
-                            lbl = str(r).strip()
-                            if lbl not in pool_labels:
-                                raise ValueError(f"段{i + 1} 引用了未知素材标签「{lbl}」：可用标签 {pool_labels}")
-                            item = (pool_kind[lbl], lbl)
-                            if item not in order:
-                                order.append(item)
-                        seg_custom_refs += 1
-                        # 提示词里 [[标签]] 提到但没勾选的素材：按出现顺序并入，防勾选/文本失配报错
-                        for tok in _LABEL_TOKEN.findall(full):
-                            lbl = tok.strip()
-                            if lbl in pool_labels and (pool_kind[lbl], lbl) not in order:
-                                order.append((pool_kind[lbl], lbl))
-                    else:
-                        # refs 缺省/显式空 = 引用全部素材（与旧行为一致，避免 ref2va 链空参考段）
-                        order = [(k, lbl) for k, lbl, _ in pool_files]
-                    # 官方单段上限：图 9 / 视 3 / 音 3（超了报错并指出勾选明细）
-                    for _k, _cap in REF_CAPS.items():
-                        _picked = [lbl for k, lbl in order if k == _k]
-                        if len(_picked) > _cap:
-                            raise ValueError(f"段{i + 1} 引用{_KIND_NAME[_k]}素材 {len(_picked)} 个，"
-                                             f"超过官方单段上限 {_cap} 个（{_picked}）：请在段卡片少勾几个")
-                    seg_label_orders[i] = order
-                    if order:
-                        has_pic = "<Picture" in full or "<Video" in full or "<Audio" in full
-                        full = _apply_label_tokens(full, order)
-                        if not has_pic:
-                            full = _reference_header(order) + "\n" + full
-                if scene or char:
-                    seg_composed += 1
-                composed_prompts.append(full)
-            seg_prompts = composed_prompts
+        composed_prompts = []
+        for i, prompt in enumerate(seg_prompts):
+            seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
+            scene = str(seg.get("scene_prompt", "")).strip()
+            char = str(seg.get("character_prompt", "")).strip()
+            soundscape = str(seg.get("soundscape", "")).strip()   # 旧 JSON 无此键 = 空
+            music = str(seg.get("music", "")).strip()
+            full, dlg = _compose_official(scene, char, prompt, soundscape, music)
+            seg_dialogues += dlg
+            if scene or char or soundscape or music:
+                seg_composed += 1
+            if pool_files:
+                refs_sel = seg.get("refs")
+                order = []
+                if isinstance(refs_sel, list) and refs_sel:
+                    for r in refs_sel:
+                        lbl = str(r).strip()
+                        if lbl not in pool_labels:
+                            raise ValueError(f"段{i + 1} 引用了未知素材标签「{lbl}」：可用标签 {pool_labels}")
+                        item = (pool_kind[lbl], lbl)
+                        if item not in order:
+                            order.append(item)
+                    seg_custom_refs += 1
+                    # 提示词里 [[标签]] 提到但没勾选的素材：按出现顺序并入，防勾选/文本失配报错
+                    for tok in _LABEL_TOKEN.findall(full):
+                        lbl = tok.strip()
+                        if lbl in pool_labels and (pool_kind[lbl], lbl) not in order:
+                            order.append((pool_kind[lbl], lbl))
+                else:
+                    # refs 缺省/显式空 = 引用全部素材（与旧行为一致，避免 ref2va 链空参考段）
+                    order = [(k, lbl) for k, lbl, _ in pool_files]
+                # 官方单段上限：图 9 / 视 3 / 音 3（超了报错并指出勾选明细）
+                for _k, _cap in REF_CAPS.items():
+                    _picked = [lbl for k, lbl in order if k == _k]
+                    if len(_picked) > _cap:
+                        raise ValueError(f"段{i + 1} 引用{_KIND_NAME[_k]}素材 {len(_picked)} 个，"
+                                         f"超过官方单段上限 {_cap} 个（{_picked}）：请在段卡片少勾几个")
+                seg_label_orders[i] = order
+                if order:
+                    has_pic = "<Picture" in full or "<Video" in full or "<Audio" in full
+                    full = _apply_label_tokens(full, order)
+                    if not has_pic:
+                        full = _reference_header(order) + "\n" + full
+            composed_prompts.append(full)
+        seg_prompts = composed_prompts
 
         # 每段时长原始值：seg.seconds（None=跟随全局默认），吸附网格在 length 确定后统一做
         seg_secs = []
@@ -713,6 +772,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 首帧图片：导演台 JSON 优先，空则用画布连接
         if ds.get("first_frame"):
             首帧图片 = _load_input_image(ds["first_frame"])
+
+        # 尾帧锚定（身份锚点，任意模式可用）：导演台 JSON 优先，空则用画布连接
+        if ds.get("last_frame"):
+            尾帧锚定 = _load_input_image(ds["last_frame"])
+
+        # i2v 首段官方指令行（官方 I2VA 固定格式：声明首帧 = <Picture 1> 锚）；
+        # 已是官方格式的段不注入（用户自管的完整结构里可能自带指令行）
+        if 首帧图片 is not None and seg_prompts and not _OFFICIAL_FIELD_RE.search(seg_prompts[0]):
+            seg_prompts[0] = ("For the target video, at 0.00 seconds into the target video, "
+                              "<Picture 1> (from [Shot 1]) is fully referenced.\n" + seg_prompts[0])
 
         # 素材池张量（按类别）：JSON 池各类别独立加载；图片池空时回退画布 autogrow（全段共用）
         pool_tensors = {"image": {}, "video": {}, "audio": {}}
@@ -773,7 +842,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}，模式 {_mode}，上下文 {ctx} 帧"]
         if str(宽高比) != "自定义":
-            report.append(f"画布：{宽高比} · {百万像素}MP → {width}×{height}（32 倍数对齐，短边≤768）")
+            report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（32 倍数对齐，短边≤768）")
         else:
             report.append(f"画布：自定义 {width}×{height}")
         _custom_len = [i for i in range(len(seg_lengths)) if seg_lengths[i] != length]
@@ -783,7 +852,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if ds_used:
             report.append("素材来源：导演台状态（JSON）")
         if seg_composed:
-            report.append(f"分段处理：{seg_composed}/{len(seg_prompts)} 段含场景/角色提示词（已组合到主提示词前）")
+            report.append(f"分段处理：{seg_composed}/{len(seg_prompts)} 段含场景/角色/声音提示词（官方三字段组装）")
+        if seg_dialogues:
+            report.append(f"对白格式：{seg_dialogues} 处「」已转 <d>[中文]")
         if has_refs:
             _k_short = {"image": "图", "video": "视", "audio": "音"}
             _parts = []
@@ -898,10 +969,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
             prologue_hash = checkpoint.prompt_hash(
                 f"prologue:{int(起始视频.shape[0])}:{float(f0.mean()):.4f}:{float(f0.std()):.4f}")
         root, manifest, done, seeds = None, None, 0, []
+        proj_title, proj_created, proj_finals = "", None, []
         off = 1 if 起始视频 is not None else 0
         if use_ckpt:
             root = checkpoint.ckpt_dir(ckpt_params, 存档目录.strip())
             manifest = checkpoint.load_manifest(root)
+            # 项目元数据：title 首次=目录名、created_at 首次=本次、finals 沿用存档
+            proj_title = os.path.basename(root)
+            proj_created = time.time()
+            if manifest is not None:
+                proj_title = str(manifest.get("title") or proj_title)
+                proj_created = manifest.get("created_at") or proj_created
+                proj_finals = list(manifest.get("finals") or [])
             if manifest is not None:
                 if manifest.get("schema") != checkpoint.SCHEMA:
                     raise ValueError(f"存档目录格式不认识（{manifest.get('schema')}），请换一个目录名；"
@@ -935,7 +1014,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     report.append("控件种子仅在「重跑起始段」> 0 时生效，当前沿用存档种子序列")
         full_hashes = ([prologue_hash] if off else []) + seg_hashes
         if review and autosave:
-            report.append(f"审片：分段视频每段落盘 → output/h3_auto/{os.path.basename(root) or '…'}/seg_XXX.mp4，"
+            report.append(f"审片：分段视频每段落盘 → output/h3_projects/{os.path.basename(root) or '…'}/seg_XXX.mp4，"
                           "成片为运行结束时的已确认部分")
 
         pbar = comfy.utils.ProgressBar(len(seg_prompts))
@@ -1347,8 +1426,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 thumbs.append(checkpoint.save_thumb(root, g, frames[0]))
                 videos.append(checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate,
                                                           fresh=not replay))
-                if autosave:
-                    _autosave_copy_seg(root, g)
             else:
                 thumbs.append("")
                 videos.append("")
@@ -1379,12 +1456,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     "seams": seams[:done], "bridge_scores": bridge_scores[:done],
                     "seam_metrics": seam_metrics_rows[:done],
                     "params": ckpt_params, "seam_refine": seam_refine,
+                    "title": proj_title, "created_at": proj_created,
+                    "updated_at": time.time(), "finals": list(proj_finals),
                 })
 
             pbar.update(1)
 
             if review and not replay and i + 1 < len(seg_prompts):
-                report.append(f"审片：段 {g + 1} 已完成并落盘 → 看自动保存目录里的 seg_{g:03d}.mp4；"
+                report.append(f"审片：段 {g + 1} 已完成并落盘 → 看项目文件夹里的 seg_{g:03d}.mp4；"
                               f"满意请直接重新运行继续段 {g + 2}；不满意：改该段提示词后运行（自动从本段重跑），"
                               f"或设「重跑起始段={g + 1}」+ 换种子重摇")
                 break
@@ -1401,23 +1480,29 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 "seams": seams[:done], "bridge_scores": bridge_scores[:done],
                 "seam_metrics": seam_metrics_rows[:done],
                 "params": ckpt_params, "seam_refine": seam_refine,
+                "title": proj_title, "created_at": proj_created,
+                "updated_at": time.time(), "finals": list(proj_finals),
             })
             if review:
                 if len(seg_frames) == total:
                     report.append("审片：本链已全部完成")
                 if reroll > 0:
                     report.append(f"注意：「重跑起始段」={reroll} 已生效，确认无误后请改回 0")
-            report.append(f"存档目录（含中间 latent，跑完可删）：{root}")
+            report.append(f"项目文件夹（视频/提示词/latent 全在此，删项目=删整个文件夹）：{root}")
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
                                    "review": bool(review), "reroll": reroll,
                                    "report": "\n".join(report), "updated_at": time.time()})
 
         images = torch.cat(all_frames, dim=0)
-        # 自动保存：完整链（或审片已确认部分）编码成片到 output/h3_auto/<存档名>/
+        # 自动保存：完整链（或审片已确认部分）编码成片，直接落项目文件夹
         if autosave and use_ckpt:
             final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate)
             if final_name:
-                report.append(f"自动保存：分段与成片已就绪 → output/h3_auto/{os.path.basename(root)}/"
+                proj_finals.append(os.path.basename(final_name))
+                mf = checkpoint.load_manifest(root) or {}
+                mf["finals"] = list(proj_finals)
+                checkpoint.save_manifest(root, mf)
+                report.append(f"自动保存：分段与成片已就绪 → {root}"
                               f"（seg_XXX.mp4 逐段，{os.path.basename(final_name)} 完整成片）")
             else:
                 err_detail = f"（{enc_err}）" if enc_err else ""

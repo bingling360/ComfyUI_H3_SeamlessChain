@@ -20,7 +20,7 @@ from test_node_structure import _install_stubs
 
 @contextlib.contextmanager
 def _output_env():
-    """stub folder_paths -> 临时 output 目录（saver_dir / checkpoints_root 都吃它）。"""
+    """stub folder_paths -> 临时 output 目录（saver_dir / projects_root 都吃它）。"""
     out = tempfile.mkdtemp()
     sys.modules["folder_paths"] = types.SimpleNamespace(get_output_directory=lambda: out)
     try:
@@ -60,7 +60,7 @@ def test_copy_segments():
     from ComfyUI_H3_SeamlessChain import saver, checkpoint
     with _output_env() as out:
         assert saver.copy_segments(out) == []                 # 无 state 指针 -> 空列表不炸
-        arch = os.path.join(out, "checkpoints", "chainA")
+        arch = os.path.join(out, "h3_projects", "chainA")
         os.makedirs(arch)
         for fn in ("seg_000.mp4", "seg_001.mp4", "manifest.json", "thumb_000.png"):
             open(os.path.join(arch, fn), "wb").close()

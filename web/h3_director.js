@@ -50,7 +50,7 @@ const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
 const AR_LIST = ["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"];
 const AR_RATIO = { "21:9": 21 / 9, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4, "1:1": 1 };
-const MP_LIST = ["0.25", "0.5", "0.75", "1.0"];
+const MP_LIST = Array.from({ length: 20 }, (_v, i) => ((i + 1) / 10).toFixed(1));   // 0.1–2.0 共 20 档（与后端 _MP_OPTIONS 一致）
 const QUICK_LABELS = ["角色1", "角色2", "场景1", "场景2", "风格", "道具"];
 /* 素材类别：与后端 REF_CAPS/_KIND_NAME 对齐（官方单段上限 图9/视3/音3） */
 const KIND_LIST = ["image", "video", "audio"];
@@ -62,11 +62,12 @@ const KIND_ACCEPT = { image: "image/*", video: "video/*", audio: "audio/*" };
 /* 引用语模板库：插入到提示词光标处，[[标签]] 由后端按段压实为 <Picture k> */
 const REF_TEMPLATES = [
     ["插入 [[标签]]", (l) => `[[${l}]]`],
-    ["主角出场", (l) => `主角：[[${l}]] 全程出镜，保持外观与服饰一致`],
-    ["配角出场", (l) => `画面中出现的 [[${l}]] 为次要角色，保持一致`],
-    ["场景还原", (l) => `场景以 [[${l}]] 为准，延续其环境与光照`],
-    ["风格参考", (l) => `整体画风与色调参考 [[${l}]]`],
-    ["镜头参考", (l) => `运镜方式参考 [[${l}]]`],
+    ["主角出场", (l) => `主角 [[${l}]] 全程出镜（主体身份、外观与服饰全程保持一致）`],
+    ["配角出场", (l) => `画面中出现的 [[${l}]] 为次要角色，身份与外观保持一致`],
+    ["场景还原", (l) => `场景以 [[${l}]] 为准，延续其环境、光照与空间布局`],
+    ["风格参考", (l) => `整体画风、色调与质感参考 [[${l}]]`],
+    ["镜头参考", (l) => `运镜方式参考 [[${l}]]（可用官方词汇：Push In / Pan Left / Truck Right / Tracking Shot，加 with small amplitude at slow speed 等修饰）`],
+    ["说话人", () => `短发女主 (S1) 轻声说：「……」`],
 ];
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
@@ -75,7 +76,6 @@ const MODES = [
 ];
 const MODE_DEFAULT = "文生视频";
 const MAX_SEG = 64;
-const LS_PROJECTS = "h3d_projects";
 
 let miniBox = null;
 let desk = null;
@@ -83,6 +83,7 @@ let pendingReset = false;
 let refreshTimer = null;
 let ledPhase = "idle";
 let ledText = "待命";
+let apiErrorText = "";
 
 /* ---------- 小工具 ---------- */
 
@@ -113,6 +114,25 @@ async function fetchJson(subfolder, filename) {
     }
 }
 
+/* 项目存档后端接口（/h3chain/*，与 /api/view 文件读取不同源） */
+async function apiGet(path) {
+    try {
+        const r = await api.fetchApi(path);
+        if (!r.ok) return { ok: false, status: r.status };
+        return { ok: true, data: await r.json() };
+    } catch (e) {
+        return { ok: false, status: 0, error: String(e) };
+    }
+}
+
+function setApiError(text) {
+    apiErrorText = text || "";
+    document.querySelectorAll(".h3d-banner").forEach((b) => {
+        b.textContent = apiErrorText;
+        b.style.display = apiErrorText ? "" : "none";
+    });
+}
+
 function fmtTime(v) {
     if (!v) return "";
     if (typeof v === "number") {
@@ -136,9 +156,10 @@ function resolveCanvas(ar, mp) {
     if (!isFinite(total) || total <= 0) return null;
     const w0 = Math.sqrt(total * r), h0 = Math.sqrt(total / r);
     const s = Math.min(1, 1344 / Math.max(w0, h0), 768 / Math.min(w0, h0));
-    const w = Math.max(32, Math.ceil(w0 * s / 32) * 32);
-    const h = Math.max(32, Math.ceil(h0 * s / 32) * 32);
-    return [w, h];
+    const fit = (t, cap) => Math.max(32, Math.min(Math.ceil(t / 32) * 32, cap));
+    if (w0 === h0) { const side = fit(w0 * s, 768); return [side, side]; }
+    if (w0 > h0) return [fit(w0 * s, 1344), fit(h0 * s, 768)];
+    return [fit(w0 * s, 768), fit(h0 * s, 1344)];
 }
 
 function snapFrames(seconds) {
@@ -156,12 +177,13 @@ function canvasBadgeText(node) {
     return c ? `${ar} · ${mp}MP → ${c[0]}×${c[1]}` : null;
 }
 
-/** 反推：宽高完全命中某 AR×MP 组合则返回 [ar, mp]，否则 null（旧工作流迁移用） */
+/** 反推：宽高完全命中某 AR×MP 组合则返回 [ar, mp]，否则 null（旧工作流迁移用）。
+ *  mp 返回数值（「百万像素」已改浮点控件，写字符串会留下类型混杂） */
 function matchCanvasCombo(w, h) {
     for (const ar of Object.keys(AR_RATIO)) {
         for (const mp of MP_LIST) {
             const c = resolveCanvas(ar, mp);
-            if (c && c[0] === w && c[1] === h) return [ar, mp];
+            if (c && c[0] === w && c[1] === h) return [ar, Number(mp)];
         }
     }
     return null;
@@ -280,7 +302,7 @@ function remapOldWidgetValues(wv) {
         ? Math.max(0.5, Math.min(15, Math.round((framesNum / 24) * 10) / 10)) : 5.0;
     return [
         combo ? combo[0] : "自定义",          // 宽高比：能命中 AR×MP 组合则迁移，否则保持自定义画幅
-        combo ? combo[1] : "0.5",            // 百万像素
+        combo ? combo[1] : 0.5,              // 百万像素（浮点控件）
         Number(w), Number(h),                // 宽/高（自定义模式继续生效，存档指纹不变）
         secs, guide, Number(seed), ctrl, ...tail,
     ];
@@ -340,11 +362,11 @@ function fixInvalidArWidget(node) {
 /* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
 
 function defaultDs() {
-    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", ref_images: [], ref_assets: [], segments: [] };
+    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [] };
 }
 
 function defaultSegment() {
-    return { scene_prompt: "", character_prompt: "", seconds: null, refs: [] };
+    return { scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [] };
 }
 
 function getDs(node) {
@@ -387,6 +409,8 @@ function getDs(node) {
             return {
                 scene_prompt: typeof s?.scene_prompt === "string" ? s.scene_prompt : "",
                 character_prompt: typeof s?.character_prompt === "string" ? s.character_prompt : "",
+                soundscape: typeof s?.soundscape === "string" ? s.soundscape : "",
+                music: typeof s?.music === "string" ? s.music : "",
                 seconds: (isFinite(sec) && sec > 0) ? Math.min(15, Math.max(0.5, sec)) : null,
                 refs: Array.isArray(s?.refs) ? s.refs.map(String).filter((l) => validLabels.has(l)) : [],
             };
@@ -395,6 +419,7 @@ function getDs(node) {
             mode: MODES.some(([m]) => m === raw.mode) ? raw.mode : MODE_DEFAULT,
             prompts,
             first_frame: typeof raw.first_frame === "string" ? raw.first_frame : "",
+            last_frame: typeof raw.last_frame === "string" ? raw.last_frame : "",
             ref_images: refAssets.filter((a) => a.kind === "image").map((a) => a.file),
             ref_assets: refAssets,
             segments,
@@ -497,7 +522,7 @@ function clearPrompts(node) {
     setDs(node, ds);
 }
 
-/* ---- 分段处理中心：场景/角色提示词 + 每段时长 + 段级素材引用（状态驱动） ---- */
+/* ---- 分段处理中心：场景/角色/声音提示词 + 每段时长 + 段级素材引用（状态驱动） ---- */
 
 function getSegment(node, idx) {
     const ds = getDs(node);
@@ -614,6 +639,19 @@ function removeFirstFrame(node) {
     scheduleRefresh(120);
 }
 
+/* 尾帧锚定（身份锚点，任意模式可用）：与首帧同机制，但不随模式切换清空 */
+function setLastFrame(node, filename) {
+    const ds = getDs(node);
+    ds.last_frame = filename || "";
+    setDs(node, ds);
+    syncMirrors(node, ds);
+    scheduleRefresh(120);
+}
+
+function removeLastFrame(node) {
+    setLastFrame(node, "");
+}
+
 /* ---- 配套工作流：素材/提示词节点镜像（连线常驻，仅切换 点亮/隐藏） ---- */
 
 function mirrorNodeByTitle(title) {
@@ -650,6 +688,7 @@ function syncMirrors(node, ds) {
     if (!node || !ds) return;
     const byKind = (k) => (Array.isArray(ds.ref_assets) ? ds.ref_assets.filter((a) => a.kind === k) : []);
     setMirrorNode("首帧图", ds.mode === "首帧视频" ? (ds.first_frame || "") : "", ["image"]);
+    setMirrorNode("尾帧图", ds.last_frame || "", ["image"]);   // 尾帧锚定：任意模式可用
     const multi = ds.mode === "多参视频";
     const imgs = multi ? byKind("image") : [];
     for (let i = 0; i < 9; i++) {
@@ -692,14 +731,14 @@ async function loadDefaultWorkflow() {
     scheduleRefresh(300);
 }
 
-/** 文件选择 + 上传：target="first"=首帧图；kind=image/video/audio=入素材池。
+/** 文件选择 + 上传：target="first"=首帧图；target="last"=尾帧锚定；kind=image/video/audio=入素材池。
  *  上传统一走 /upload/image（服务端按原样字节写入 input 目录，不限图片）。 */
 async function pickAsset(target, kind) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = target === "first" ? "image/*" : KIND_ACCEPT[kind] || "image/*";
+    input.accept = (target === "first" || target === "last") ? "image/*" : KIND_ACCEPT[kind] || "image/*";
     input.onchange = async () => {
         const f = input.files && input.files[0];
         if (!f) return;
@@ -707,6 +746,8 @@ async function pickAsset(target, kind) {
             const name = await uploadToInput(f);
             if (target === "first") {
                 setFirstFrame(node, name);
+            } else if (target === "last") {
+                setLastFrame(node, name);
             } else {
                 addAsset(node, kind, name);
             }
@@ -840,29 +881,7 @@ function scheduleRefresh(delay = 900) {
     refreshTimer = setTimeout(refresh, delay);
 }
 
-/* ---------- 项目记忆 ---------- */
-
-function lsProjects() {
-    try { return JSON.parse(localStorage.getItem(LS_PROJECTS) || "[]"); } catch (e) { return []; }
-}
-
-function rememberProject(dir) {
-    if (!dir) return;
-    try {
-        const arr = lsProjects().filter((d) => d !== dir);
-        arr.unshift(dir);
-        localStorage.setItem(LS_PROJECTS, JSON.stringify(arr.slice(0, 50)));
-    } catch (e) { /* 隐私模式等场景静默降级 */ }
-}
-
-function forgetProject(dir) {
-    try {
-        const arr = lsProjects().filter((d) => d !== dir);
-        localStorage.setItem(LS_PROJECTS, JSON.stringify(arr));
-    } catch (e) { /* 静默降级 */ }
-}
-
-/* ---------- 动作 ---------- */
+/* ---------- 项目动作（游戏式存读档） ---------- */
 
 function doReroll(segNo) {
     const node = findNode();
@@ -910,20 +929,35 @@ async function doRunOnly(segNo, done) {
     scheduleRefresh();
 }
 
-/** 删除项目存档：后端删 checkpoints/<名> 与 h3_auto/<名>；当前链被删时服务端自动清状态指针 */
-async function deleteArchive(dir) {
+/** 从段 idx+1 之后继续生成到底（游戏读档语义）：
+ *  保留第 1..N 段，N 之后有旧存档时先截断（弹确认），然后连续生成到链尾。 */
+function continueFromSegment(idx, done) {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    const n = idx + 1;
+    if (n < done
+        && !confirm(`从段 ${n + 1} 继续生成？\n段 ${n + 1} 之后的旧存档会被丢弃，从段 ${n + 1} 起逐段重新生成到链尾。`)) return;
+    setWidgetValue(node, W_REROLL, n < done ? n + 1 : 0);
+    setLed("running", `从段 ${Math.min(n + 1, done + 1)} 续拍已提交`);
+    queuePrompt();
+}
+
+/** 删除项目 = 删除整个项目文件夹（分段视频/成片/提示词/latent 全删）。 */
+async function deleteProject(dir) {
     if (!dir) return;
-    if (!confirm(`删除存档「${dir}」？\n\n`
-        + `将删除：output/checkpoints/${dir}（断点 latent/缩略图/清单）\n`
-        + `　　　　output/h3_auto/${dir}（分段视频/成片）\n\n不可恢复，继续？`)) return;
+    if (!confirm(`删除项目「${dir}」？\n\n`
+        + `将删除整个文件夹：output/h3_projects/${dir}\n`
+        + `（全部分段视频、成片、提示词清单、续拍 latent 一并删除）\n\n不可恢复，继续？`)) return;
     try {
-        const r = await api.fetchApi("/h3chain/delete_archive", {
+        const r = await api.fetchApi("/h3chain/delete_project", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ dir }),
         });
         if (r.status === 404 || r.status === 405) {
-            alert(`删除路由未注册（HTTP ${r.status}）：请重启 ComfyUI（日志应出现「路由已注册」）后刷新浏览器重试。`);
+            setApiError(`项目接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台是否出现`
+                + `「[ComfyUI_H3_SeamlessChain] 路由已注册」日志；若仍失败请把控制台报错反馈给开发。`);
+            setLed("error", `删除路由未注册 (HTTP ${r.status})`);
             return;
         }
         if (!r.ok) {
@@ -931,21 +965,73 @@ async function deleteArchive(dir) {
             alert(`删除失败：${j.error || `HTTP ${r.status}`}`);
             return;
         }
-        forgetProject(dir);
-        setLed("idle", "存档已删除");
+        setLed("idle", "项目已删除");
         scheduleRefresh(300);
     } catch (e) {
         alert(`删除失败：${e}`);
     }
 }
 
-function switchProject(dir) {
+/** 读档：切换「存档目录」+ 载入该项目的提示词进导演台状态（后端续跑校验共享参数）。 */
+async function switchProject(dir) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点（只读模式）"); return; }
     if (!setDirValue(node, dir)) { alert("节点上没有「存档目录/断点目录」控件"); return; }
     setWidgetValue(node, W_REROLL, 0);
-    rememberProject(dir);
-    scheduleRefresh();
+    const r = await apiGet(`/h3chain/project?dir=${encodeURIComponent(dir)}`);
+    const mf = r.ok ? (r.data?.manifest || null) : null;
+    if (mf) {
+        const total = mf.total || (mf.prompts || []).length || 0;
+        if (total) {
+            const ds = getDs(node);
+            ds.prompts = Array.from({ length: total }, (_v, i) => String((mf.prompts || [])[i] ?? ""));
+            ds.segments = Array.from({ length: total }, (_v, i) => ds.segments?.[i] ?? defaultSegment());
+            setDs(node, ds);
+        }
+        setLed("idle", `已读档「${mf.title || dir}」（${mf.total ? `${mf.done ?? 0}/${mf.total} 段` : "草稿，未配置段落"}）`);
+    } else {
+        setLed("idle", `已指向 ${dir}`);
+    }
+    scheduleRefresh(200);
+}
+
+/** 把项目 manifest 的共享参数映射回画布控件（画幅优先尝试 宽高比×MP combo 匹配）。 */
+function applyParamsToCanvas(node, params) {
+    if (!node || !params) return;
+    const applied = [];
+    const w = Number(params.width), h = Number(params.height);
+    if (w && h) {
+        const combo = matchCanvasCombo(w, h);
+        if (combo && setWidgetValue(node, W_AR, combo[0]) && setWidgetValue(node, W_MP, combo[1])) {
+            applied.push(`画幅 ${combo[0]}·${combo[1]}MP（${w}×${h}）`);
+        } else if (setWidgetValue(node, W_WIDTH, w) && setWidgetValue(node, W_HEIGHT, h)) {
+            applied.push(`宽×高 ${w}×${h}（自定义）`);
+        }
+    }
+    if (params.length) {
+        const sec = +(params.length / 24).toFixed(2);
+        if (setWidgetValue(node, W_DUR, sec)) applied.push(`每段时长 ${sec}s`);
+    }
+    if (params.ctx != null) {
+        const v = String(params.ctx);
+        const wd = (node.widgets || []).find((x) => x.name === "引导帧数");
+        if (!wd || (wd.options?.options || []).includes(v)) {
+            if (setWidgetValue(node, "引导帧数", v)) applied.push(`引导帧数 ${v}`);
+        }
+    }
+    if (params.steps && setWidgetValue(node, "步数", params.steps)) applied.push(`步数 ${params.steps}`);
+    if (params.cfg != null && setWidgetValue(node, "CFG", params.cfg)) applied.push(`CFG ${params.cfg}`);
+    for (const [name, key] of [["采样器", "sampler"], ["调度器", "scheduler"]]) {
+        const v = params[key];
+        if (!v) continue;
+        const wd = (node.widgets || []).find((x) => x.name === name);
+        if (wd && !(wd.options?.options || []).includes(v)) continue;
+        if (setWidgetValue(node, name, v)) applied.push(`${name} ${v}`);
+    }
+    scheduleRefresh(300);
+    alert(applied.length
+        ? `已套用参数到画布：\n\n${applied.join("\n")}`
+        : "该项目没有可套用的参数（或控件不匹配）");
 }
 
 /* ---------- LED 状态灯 ---------- */
@@ -1020,10 +1106,29 @@ function chainSeconds(node, ds, plan) {
 async function collectData() {
     const node = findNode();
     if (node) fixInvalidArWidget(node);
-    const state = await fetchJson("checkpoints", "h3chain_state.json");
-    const idx = await fetchJson("checkpoints", "h3chain_index.json");
-    let mf = null;
-    if (state && state.dir) mf = await fetchJson(`checkpoints/${state.dir}`, "manifest.json");
+
+    /* 诊断 + 项目列表（后端实时扫描磁盘，一个项目一个文件夹） */
+    const ping = await apiGet("/h3chain/ping");
+    let projects = [];
+    if (ping.ok) {
+        const r = await apiGet("/h3chain/projects");
+        if (r.ok) projects = r.data?.projects || [];
+    }
+    setApiError(ping.ok ? "" :
+        `项目存档接口未注册（HTTP ${ping.status || "??"}）：请重启 ComfyUI 并检查控制台是否出现`
+        + `「[ComfyUI_H3_SeamlessChain] 路由已注册」日志；若仍失败请把控制台报错反馈给开发。`);
+
+    /* 当前项目：节点「存档目录」指向优先（用户刚切换还没跑），回落 state 指针 */
+    const stateRaw = await fetchJson("h3_projects", "h3chain_state.json");
+    const nodeDir = node ? String(getDirValue(node) || "").trim() : "";
+    const dir = nodeDir || stateRaw?.dir || "";
+    const mf = dir ? await fetchJson(`h3_projects/${dir}`, "manifest.json") : null;
+    const state = stateRaw || {};
+    const sameChain = !!stateRaw && dir === stateRaw.dir;
+    state.dir = dir;
+    state.done = mf?.done ?? (sameChain ? stateRaw?.done : 0) ?? 0;
+    state.total = mf?.total ?? (sameChain ? stateRaw?.total : 0) ?? 0;
+
     const prefix = saverPrefix();
     const history = await fetchJson(prefix, "h3saver_history.json");
 
@@ -1034,7 +1139,7 @@ async function collectData() {
         ({ plan, drafts, ds } = planFromDs(node));
     }
     if (!plan || !plan.length) {
-        const total = (state && state.total) ?? (mf && mf.total) ?? 0;
+        const total = state.total ?? (mf && mf.total) ?? 0;
         if (total && node) {
             // 采纳存档提示词进导演台状态：卡片可编辑（此前回退成只读历史段，导致无法输入）
             const dsAdopt = getDs(node);
@@ -1052,12 +1157,12 @@ async function collectData() {
             plan = [];
         }
     }
-    return { node, state, idx, mf, plan, drafts, history, prefix, ds };
+    return { node, state, mf, plan, drafts, history, prefix, ds, projects, apiOk: ping.ok };
 }
 
 function statusLine(state, mf, plan) {
-    const total = plan ? plan.length : (state?.total ?? mf?.total ?? 0);
-    const done = state?.done ?? mf?.done ?? 0;
+    const total = plan ? plan.length : (mf?.total ?? state?.total ?? 0);
+    const done = mf?.done ?? state?.done ?? 0;
     if (!total) return { text: "尚未配置段落：在流水线卡片填写提示词，或点「＋ 添加一段」", next: false };
     if (done >= total) return { text: `本链已全部完成（${total}/${total} 段）✓ 可「＋ 新建项目」开下一条`, next: false };
     const anchored = done > 0 ? `，锚定段 ${done} 尾部` : "";
@@ -1067,11 +1172,12 @@ function statusLine(state, mf, plan) {
 function segMediaHtml(state, mf, idx) {
     const done = mf?.done ?? 0;
     if (idx >= done || !state?.dir) return null;
+    const sub = `h3_projects/${state.dir}`;
     const thumbFile = (mf.thumbs || [])[idx];
     const videoFile = (mf.videos || [])[idx];
-    const thumbSrc = thumbFile ? viewUrl(state.dir, thumbFile) : "";
+    const thumbSrc = thumbFile ? viewUrl(sub, thumbFile) : "";
     if (videoFile) {
-        return `<video class="h3d-segvideo" controls preload="metadata"${thumbSrc ? ` poster="${thumbSrc}"` : ""} src="${viewUrl(state.dir, videoFile)}"></video>`;
+        return `<video class="h3d-segvideo" controls preload="metadata"${thumbSrc ? ` poster="${thumbSrc}"` : ""} src="${viewUrl(sub, videoFile)}"></video>`;
     }
     if (thumbSrc) return `<img loading="lazy" src="${thumbSrc}" alt="段${idx + 1}">`;
     return null;
@@ -1134,6 +1240,7 @@ function injectStyles() {
     .h3d-top-right{display:flex;gap:14px;align-items:center;justify-self:end}
     .h3d-close{width:36px;height:36px;border:1px solid var(--h3d-line);border-radius:7px;background:#2d333b;color:var(--h3d-bone);cursor:pointer;font-size:15px}
     .h3d-close:hover{filter:brightness(1.2)}
+    .h3d-banner{display:none;padding:9px 18px;border-bottom:1px solid #8a4a3f;background:#3a2620;color:#ffc9b8;font-size:12px;line-height:1.6}
     .h3d-stage{min-height:0;display:grid;grid-template-columns:minmax(255px,300px) minmax(400px,1fr) minmax(255px,300px);gap:1px;background:var(--h3d-line)}
     .h3d-col{min-width:0;min-height:0;background:var(--h3d-panel);overflow:auto}
     .h3d-sechead{position:sticky;top:0;z-index:3;padding:14px 16px 10px;background:#22272eee;backdrop-filter:blur(8px);border-bottom:1px solid #3f4854}
@@ -1145,9 +1252,11 @@ function injectStyles() {
     .h3d-projrow .h3d-proj{flex:1;min-width:0}
     .h3d-proj-del{flex:none;width:30px;border:1px solid #4c3a3d;border-radius:8px;background:#2a2225;color:#b08a8e;cursor:pointer;font-size:13px;line-height:1;transition:.15s}
     .h3d-proj-del:hover{border-color:#c2565f;background:#3a2429;color:#ffb3b8}
-    .h3d-proj{display:grid;gap:3px;padding:9px 10px 9px 13px;border:1px solid #3f4854;border-radius:8px;background:#262c36;cursor:pointer;box-shadow:inset 3px 0 0 #444c56;text-align:left;font-family:inherit;color:inherit}
+    .h3d-proj{display:grid;grid-template-columns:44px 1fr;grid-template-rows:auto auto;gap:2px 10px;padding:8px 10px 9px 13px;border:1px solid #3f4854;border-radius:8px;background:#262c36;cursor:pointer;box-shadow:inset 3px 0 0 #444c56;text-align:left;font-family:inherit;color:inherit}
     .h3d-proj:hover{background:#2a313b}
     .h3d-proj.active{box-shadow:inset 3px 0 0 var(--h3d-cyan);border-color:#316dca}
+    .h3d-proj-cover{grid-row:1/3;width:44px;height:33px;object-fit:cover;border-radius:5px;border:1px solid #3f4854;background:#1c2128}
+    .h3d-proj.nocover{grid-template-columns:1fr;padding-left:13px}
     .h3d-proj-name{font-weight:700;word-break:break-all;font-size:12.5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;color:var(--h3d-bone)}
     .h3d-proj-meta{color:var(--h3d-muted);font-size:11px;font-family:ui-monospace,Consolas}
     .h3d-newrow{display:flex;gap:8px;padding:0 12px 12px;flex-wrap:wrap}
@@ -1193,6 +1302,7 @@ function injectStyles() {
     .h3d-drawer pre{margin:0;padding:0 12px 12px;white-space:pre-wrap;font-size:11.5px;max-height:300px;overflow:auto;color:#b6c2cf}
 
     .h3d-hist{padding:12px;display:grid;gap:10px;align-content:start}
+    .h3d-hist-head{color:var(--h3d-copper);font:700 10.5px/1 ui-monospace,Consolas;letter-spacing:.08em;margin:2px 0 -2px;word-break:break-all}
     .h3d-empty{padding:16px 10px;border:1px dashed #444c56;border-radius:8px;color:var(--h3d-muted);text-align:center;background:#262c36;line-height:1.8}
     .h3d-result{padding:8px;border:1px solid #3f4854;border-radius:9px;background:#20262e}
     .h3d-result.current{border-color:#316dca}
@@ -1322,7 +1432,7 @@ function renderMini(data) {
     const card = el("div", "h3d-mini");
 
     const total = plan ? plan.length : 0;
-    const done = state?.done ?? mf?.done ?? 0;
+    const done = mf?.done ?? state?.done ?? 0;
 
     const head = el("div", "h3d-mini-head");
     const brand = el("div", "h3d-mini-brand", "长片导演台");
@@ -1337,7 +1447,9 @@ function renderMini(data) {
 
     const cards = el("div", "h3d-mini-cards");
     const info = el("div", "h3d-mini-card", escapeHtml(statusLine(state, mf, plan).text));
-    const count = el("div", "h3d-mini-count", `${done}<small>/${total || "?"} 段</small>`);
+    const count = el("div", "h3d-mini-count", total
+        ? `${done}<small>/${total} 段</small>`
+        : `<small>0 段<br>待添加</small>`);
     cards.append(info, count);
 
     const foot = el("div", "h3d-mini-foot");
@@ -1377,6 +1489,11 @@ function openDesk() {
     right.append(ledWrap, sub, close);
     topbar.append(left, right);
 
+    /* 诊断横幅：项目存档接口未注册时显示（/h3chain/ping 探测失败） */
+    const banner = el("div", "h3d-banner");
+    banner.textContent = apiErrorText;
+    banner.style.display = apiErrorText ? "" : "none";
+
     /* 主舞台三栏（侧栏各含两个固定分区，渲染器只填充分区内容） */
     const stage = el("div", "h3d-stage");
     const colL = el("aside", "h3d-col left");
@@ -1384,7 +1501,8 @@ function openDesk() {
     const lAssets = el("section", "h3d-lsec h3d-asec");
     colL.append(lProj, lAssets);
     const colC = el("section", "h3d-col center");
-    colC.append(el("div", "h3d-sechead", "<strong>段落流水线</strong><small>卡片 = 生成顺序；✏ 改词 · 🎲 重摇 · 📎 插视频 · 🎬 分段处理（场景/角色）</small>"));
+    colC.append(el("div", "h3d-sechead",
+        "<strong>段落流水线</strong><small>卡片 = 生成顺序（1–64 段不限，「＋ 添加一段」即可加段；「提示词·1..3」只是画布镜像）；✏ 改词 · 🎲 重摇 · 📎 插视频 · 🎬 分段处理（场景/角色）</small>"));
     const colR = el("aside", "h3d-col right");
     const rParams = el("section", "h3d-rsec h3d-psec");
     const rHist = el("section", "h3d-rsec h3d-hsec");
@@ -1397,7 +1515,7 @@ function openDesk() {
     const run = el("button", "h3d-btn h3d-btn-cta h3d-run", "▶ 开始生成");
     footer.append(footInfo, run);
 
-    page.append(topbar, stage, footer);
+    page.append(topbar, banner, stage, footer);
     document.body.append(page);
     page.focus();
 
@@ -1447,7 +1565,7 @@ function cardsSignature(data) {
 
 function updateDesk(data) {
     if (!desk) return;
-    const { node, state, idx, mf, plan, drafts, history, prefix } = data;
+    const { node, state, mf, plan, drafts, history, prefix } = data;
     const z = desk.zones;
 
     /* 顶栏项目名 + LED */
@@ -1471,7 +1589,8 @@ function updateDesk(data) {
         z.rParams.dataset.sig = psig;
         renderParamsZone(z.rParams, data);
     }
-    const histSig = prefix + "|" + (history ? history.length + ":" + (history[0]?.file ?? "") : "-");
+    const histSig = prefix + "|" + (history ? history.length + ":" + (history[0]?.file ?? "") : "-")
+        + "|" + (state?.dir ?? "") + "|" + (mf?.finals || []).join(",");
     if (histSig !== desk.histSig || !z.rHist.querySelector(".h3d-hist")) {
         if (!isVideoPlaying(z.rHist)) {
             desk.histSig = histSig;
@@ -1486,35 +1605,50 @@ function updateDesk(data) {
 /* ---- 左栏 ---- */
 
 function renderLeftColumn(sec, data) {
-    const { node, state, idx } = data;
+    const { node, state, mf } = data;
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
-        "<strong>项目与链</strong><small>切换项目 = 换存档目录，提示词自动沿用</small>"));
+        "<strong>项目存档</strong><small>一个项目一个文件夹 · 点击读档继续拍</small>"));
 
     const list = el("div", "h3d-projlist");
-    const projects = mergeProjects(idx, state);
-    if (!projects.length) {
+    const projects = mergeProjects(data.projects, state);
+    if (!data.apiOk) {
         list.append(el("div", "h3d-empty",
-            "暂无历史项目：跑一次（开审片/存档）后会自动登记；也可点下方「＋ 新建项目」直接开跑。"));
+            "项目接口未注册：列表暂不可用（生成不受影响）。请重启 ComfyUI 后刷新浏览器。"));
+    } else if (!projects.length) {
+        list.append(el("div", "h3d-empty",
+            "暂无项目存档：点下方「＋ 新建项目」立即在 output/h3_projects/ 建好文件夹；"
+            + "开自动存档/审片跑一次也会自动生成项目。"));
     }
     for (const p of projects) {
         const active = state?.dir && p.dir === state.dir;
         const row = el("div", "h3d-projrow");
-        const btn = el("button", "h3d-proj" + (active ? " active" : ""));
-        const nodeDir = node ? getDirValue(node) : "";
+        const coverUrl = p.cover ? viewUrl(`h3_projects/${p.dir}`, p.cover) : "";
+        const btn = el("button", "h3d-proj" + (active ? " active" : "") + (coverUrl ? "" : " nocover"));
         btn.innerHTML = `
-            <span class="h3d-proj-name">${escapeHtml(p.dir)}
-                ${p.dir === nodeDir && nodeDir ? badge("已指向", "cyan") : ""}
-                ${p.draft ? badge("草稿", "") : ""}
+            <span class="h3d-proj-name">${escapeHtml(p.title || p.dir)}
+                ${p.finals && p.finals.length ? badge(`成片×${p.finals.length}`, "media") : ""}
+                ${!p.total ? badge("草稿", "") : ""}
             </span>
-            <span class="h3d-proj-meta">${p.done ?? "?"}/${p.total ?? "?"} 段${p.updated_at ? " · " + escapeHtml(fmtTime(p.updated_at)) : ""}</span>`;
-        btn.title = "点击把「存档目录」切到该项目（共享参数需与其一致，否则后端会提示换链）";
+            <span class="h3d-proj-meta">${p.total
+                ? `${p.done ?? 0}/${p.total} 段`
+                : "未配置段落"}${p.updated_at ? " · " + escapeHtml(fmtTime(p.updated_at)) : ""}</span>`;
+        if (coverUrl) {
+            const img = document.createElement("img");
+            img.className = "h3d-proj-cover";
+            img.loading = "lazy";
+            img.src = coverUrl;
+            img.alt = "";
+            img.onerror = () => img.remove();
+            btn.prepend(img);
+        }
+        btn.title = "点击读档：切换「存档目录」并载入该项目提示词（共享参数需与其一致，否则后端会提示换链）";
         btn.onclick = () => switchProject(p.dir);
         row.append(btn);
         const del = el("button", "h3d-proj-del", "🗑");
         del.type = "button";
-        del.title = `删除该存档（output/checkpoints/${p.dir} 与 output/h3_auto/${p.dir}，不可恢复）`;
-        del.onclick = (e) => { e.stopPropagation(); deleteArchive(p.dir); };
+        del.title = `删除项目（整个文件夹 output/h3_projects/${p.dir}，视频与提示词全删，不可恢复）`;
+        del.onclick = (e) => { e.stopPropagation(); deleteProject(p.dir); };
         row.append(del);
         list.append(row);
     }
@@ -1525,33 +1659,35 @@ function renderLeftColumn(sec, data) {
     newBtn.title = "新开一条视频链：换存档目录名，提示词沿用当前内容作底稿";
     newBtn.onclick = openNewProjectModal;
     newrow.append(newBtn);
+    if (node && mf?.params && Object.keys(mf.params).length) {
+        const ap = el("button", "h3d-btn", "⚙ 套用参数到画布");
+        ap.title = "把当前项目的共享参数（画幅/每段时长/引导帧数/步数/采样器等）写回节点控件";
+        ap.onclick = () => applyParamsToCanvas(node, mf.params);
+        newrow.append(ap);
+    }
     sec.append(newrow);
 
     if (state?.dir) {
-        const done = state.done ?? 0;
+        const done = mf?.done ?? state.done ?? 0;
         const total = state.total ?? 0;
         const ps = paramsSummary(node, data.mf);
         const totalSec = data.plan?.length
             ? `共${chainSeconds(node, data.ds, data.plan).toFixed(1)}s` : "";
         const meter = el("div", "h3d-meter");
-        meter.innerHTML = `<strong>${done}/${total || "?"} 段${state.review ? " · 审片中" : ""}</strong>
+        meter.innerHTML = `<strong>${total ? `${done}/${total} 段` : "未配置段落（提示词每行一段）"}${state.review ? " · 审片中" : ""}</strong>
             <p>${escapeHtml([ps.geo, ps.len, ps.ctx, totalSec].filter(Boolean).join(" · ") || "参数待首次运行后显示")}</p>`;
         sec.append(meter);
-        sec.append(el("div", "h3d-foot", `链目录：output/checkpoints/${escapeHtml(state.dir)}`));
+        sec.append(el("div", "h3d-foot", `项目文件夹：output/h3_projects/${escapeHtml(state.dir)}`));
     }
 }
 
-function mergeProjects(idx, state) {
+function mergeProjects(projects, state) {
     const map = new Map();
-    for (const p of (idx?.projects) || []) {
-        if (p?.dir) map.set(p.dir, { dir: p.dir, done: p.done, total: p.total, updated_at: p.updated_at, draft: false });
+    for (const p of projects || []) {
+        if (p?.dir) map.set(p.dir, p);
     }
     if (state?.dir && !map.has(state.dir)) {
-        map.set(state.dir, { dir: state.dir, done: state.done, total: state.total, updated_at: state.updated_at, draft: false });
-    }
-    const known = new Set(map.keys());
-    for (const dir of lsProjects()) {
-        if (dir && !known.has(dir)) map.set(dir, { dir, done: null, total: null, updated_at: null, draft: true });
+        map.set(state.dir, { dir: state.dir, done: state.done, total: state.total, updated_at: state.updated_at });
     }
     const arr = [...map.values()];
     arr.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
@@ -1576,7 +1712,7 @@ function buildCenterBody(data) {
     const { node, state, mf, plan, drafts } = data;
     const wrap = el("div", "h3d-center-pad");
     const total = plan ? plan.length : 0;
-    const done = state?.done ?? mf?.done ?? 0;
+    const done = mf?.done ?? state?.done ?? 0;
 
     /* 状态条 */
     const bar = el("div", "h3d-statusbar");
@@ -1620,7 +1756,7 @@ function buildCenterBody(data) {
     const addrow = el("div", "h3d-addrow");
     if (node) {
         const addSeg = el("button", "h3d-btn", "＋ 添加一段");
-        addSeg.title = "新增一段提示词到导演台状态";
+        addSeg.title = "新增一段提示词到导演台状态（最多 64 段；「提示词·1..3」画布镜像只显前 3 段，超过 3 段全在导演台管理）";
         addSeg.onclick = () => addPromptSegment(node);
         addrow.append(addSeg);
         if (hasInserts(node)) {
@@ -1732,7 +1868,9 @@ function buildCards(data) {
             const poolHint = pool.length
                 ? `用 [[${pool[0].label}]] 这样的标签引用素材，或手写 <Picture N>`
                 : "上传参考图后可用 [[标签]] 引用";
-            ta.placeholder = `第 ${idx + 1} 段画面描述：顺着上一段结尾继续；${poolHint}`;
+            ta.placeholder = `第 ${idx + 1} 段画面与动作时间线：顺着上一段结尾继续；`
+                + `对白写「…」自动转官方 <d>[中文] 格式，说话人标 (S1)；`
+                + `运镜可写 The camera pushes in with small amplitude at slow speed；${poolHint}`;
             if (!node || it.idx === undefined) {
                 ta.disabled = true;
                 ta.title = it.idx === undefined ? "历史段只读（来自存档，非导演台状态）" : "画布上未找到节点";
@@ -1825,43 +1963,39 @@ function buildCards(data) {
             /* 分段处理中心：场景/角色提示词（可展开折叠） */
             if (node && it.idx !== undefined) {
                 const seg = (data.ds.segments && data.ds.segments[it.idx]) || defaultSegment();
-                const hasSeg = !!(seg.scene_prompt || seg.character_prompt);
+                const hasSeg = !!(seg.scene_prompt || seg.character_prompt || seg.soundscape || seg.music);
                 const det = el("details", "h3d-seg-panel" + (hasSeg ? " has-content" : ""));
                 det.open = hasSeg;
-                det.innerHTML = `<summary>分段处理 · 场景 & 角色${hasSeg ? ' <span class="h3d-chip cyan">已填写</span>' : ""}</summary>`;
+                det.innerHTML = `<summary>分段处理 · 场景 / 角色 / 声音${hasSeg ? ' <span class="h3d-chip cyan">已填写</span>' : ""}</summary>`;
                 const segBody = el("div", "h3d-seg-body");
 
-                const sceneLabel = el("label", "h3d-seg-label", "场景提示词");
-                const sceneTa = document.createElement("textarea");
-                sceneTa.className = "h3d-ta h3d-seg-ta";
-                sceneTa.rows = 2;
-                sceneTa.value = seg.scene_prompt || "";
-                sceneTa.placeholder = "本段场景描述（环境、光照、氛围等），留空则不附加";
-                sceneTa.addEventListener("input", () => debounceSegmentWrite(node, it.idx, "scene_prompt", sceneTa.value));
-                sceneTa.addEventListener("blur", () => {
-                    const key = `s${it.idx}_scene_prompt`;
-                    const t = _taTimers.get(key);
-                    if (t) { clearTimeout(t); _taTimers.delete(key); }
-                    setSegmentField(node, it.idx, "scene_prompt", sceneTa.value);
-                    scheduleRefresh(200);
-                });
-                segBody.append(sceneLabel, sceneTa);
-
-                const charLabel = el("label", "h3d-seg-label", "角色提示词");
-                const charTa = document.createElement("textarea");
-                charTa.className = "h3d-ta h3d-seg-ta";
-                charTa.rows = 2;
-                charTa.value = seg.character_prompt || "";
-                charTa.placeholder = "本段角色描述（外貌、动作、表情等），留空则不附加";
-                charTa.addEventListener("input", () => debounceSegmentWrite(node, it.idx, "character_prompt", charTa.value));
-                charTa.addEventListener("blur", () => {
-                    const key = `s${it.idx}_character_prompt`;
-                    const t = _taTimers.get(key);
-                    if (t) { clearTimeout(t); _taTimers.delete(key); }
-                    setSegmentField(node, it.idx, "character_prompt", charTa.value);
-                    scheduleRefresh(200);
-                });
-                segBody.append(charLabel, charTa);
+                const segFields = [
+                    ["scene_prompt", "场景提示词",
+                        "本段场景（风格+环境+光照），如：实景电影感，雨夜的东京小巷，霓虹灯反射在湿柏油路上。留空省略"],
+                    ["character_prompt", "角色提示词",
+                        "本段角色（外观+服饰+位置），如：米色风衣短发女主，坐在便利店门口台阶上。留空省略"],
+                    ["soundscape", "环境音",
+                        "环境音+动作音（1-4句，官方 overall_soundscape），如：雨点敲打柏油路，远处车流，伞面撑开的轻响。留空=不约束"],
+                    ["music", "配乐",
+                        "背景配乐（乐器+节奏+动态，角色听不到的；官方 non_diegetic_music），如：慢速钢琴单音，弦乐渐强后淡出。留空=不约束"],
+                ];
+                for (const [field, label, ph] of segFields) {
+                    const lab = el("label", "h3d-seg-label", label);
+                    const ta = document.createElement("textarea");
+                    ta.className = "h3d-ta h3d-seg-ta";
+                    ta.rows = 2;
+                    ta.value = seg[field] || "";
+                    ta.placeholder = ph;
+                    ta.addEventListener("input", () => debounceSegmentWrite(node, it.idx, field, ta.value));
+                    ta.addEventListener("blur", () => {
+                        const key = `s${it.idx}_${field}`;
+                        const t = _taTimers.get(key);
+                        if (t) { clearTimeout(t); _taTimers.delete(key); }
+                        setSegmentField(node, it.idx, field, ta.value);
+                        scheduleRefresh(200);
+                    });
+                    segBody.append(lab, ta);
+                }
 
                 det.append(segBody);
                 body.append(det);
@@ -1884,6 +2018,13 @@ function buildCards(data) {
             }
             if (canInsert) actions.append(insertButton("在此段后插入", idx + 2));
         } else {
+            if (isDone) {
+                const cont = el("button", "h3d-btn h3d-btn-cta", "▶ 从这段继续");
+                cont.title = `保留段 1–${idx + 1}，从段 ${idx + 2} 起连续生成到链尾`
+                    + (idx + 1 < done ? `（段 ${idx + 2} 之后的旧存档会被丢弃）` : "");
+                cont.onclick = () => continueFromSegment(idx, done);
+                actions.append(cont);
+            }
             const runOne = el("button", "h3d-btn h3d-btn-cyan",
                 isDone ? "▶ 重跑这段" : "▶ 只跑这段");
             runOne.title = isDone
@@ -2087,11 +2228,27 @@ function renderAssetsZone(sec, data) {
         }
         box.append(upRow);
     }
+
+    /* 尾帧锚定（身份锚点，任意模式可用）：每段末尾注入参考帧，与段首引导桥形成双锚约束防漂移 */
+    {
+        const lf = ds.last_frame;
+        const card = assetCard("尾帧锚定", lf, lf ? () => { removeLastFrame(node); } : null);
+        card.querySelector("small").textContent = lf || "未设置（可选，建议角色正面清晰帧）";
+        const acts = card.querySelector(".h3d-asset-acts") || el("div", "h3d-asset-acts");
+        const up = el("button", "h3d-btn h3d-btn-cyan", lf ? "替换" : "上传");
+        up.title = "尾帧锚定（任意模式可用）：注入每段末尾作为人物/场景参考，"
+            + "与段首引导桥形成「隧道」双锚约束，防止过了桥窗口后主体漂移。画布「尾帧图」节点同步点亮";
+        up.onclick = () => pickAsset("last");
+        acts.insertBefore(up, acts.firstChild);
+        if (!card.querySelector(".h3d-asset-acts")) card.append(acts);
+        box.append(card);
+    }
     sec.append(box);
     sec.append(el("div", "h3d-foot",
         "标签素材池（图 ≤9 / 视 ≤3 / 音 ≤3，官方单段上限）：每类素材打标签（角色1 / 场景1…），"
         + "段落卡片里勾选本段引用哪些——未勾选的素材不进该段（后端按段压实重编号），提示词写 [[标签]] 引用"
         + "（图→&lt;Picture k&gt;、视→&lt;Video k&gt;、音→&lt;Audio j&gt;）。参考视频的原声自动配对，无需单独传音轨。<br>"
+        + "尾帧锚定不限模式：不想锚定就不上传。<br>"
         + "配套工作流下素材节点由导演台点亮/隐藏——连线常驻，只是隐藏，请勿删除。"));
 }
 
@@ -2145,8 +2302,14 @@ function renderWidgetField(node, name, labelOverride) {
         inp.value = w.value;
         const step = w.options && w.options.step;
         inp.step = step || (name === "CFG" || name === W_DUR ? 0.1 : 1);
+        if (w.options && Number.isFinite(w.options.min)) inp.min = w.options.min;
+        if (w.options && Number.isFinite(w.options.max)) inp.max = w.options.max;
         inp.onchange = () => setWidgetValue(node, name, Number(inp.value));
         row.append(inp);
+        if (name === W_MP) {
+            row.append(el("span", "h3d-secs-hint", "MP"));
+            inp.title = "目标总像素 0.1–2.0MP（步进0.1，箭头微调，共20档）：0.25 草稿 / 0.5 预览 / 1.0 官方原生 / 超出画布上限自动收敛";
+        }
         if (name === W_SEED) {
             const dice = el("button", "h3d-btn", "🎲");
             dice.title = "随机种子";
@@ -2206,25 +2369,79 @@ function renderParamsZone(sec, data) {
 /* ---- 右栏 ---- */
 
 function renderHistoryZone(sec, data) {
-    const { history, prefix, state } = data;
+    const { history, prefix, state, mf } = data;
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
-        "<strong>成片历史</strong><small>播放 / 下载 / 删除（输出目录随前缀变化）</small>"));
+        "<strong>成片</strong><small>项目文件夹内的成片 + 保存节点历史</small>"));
     const box = el("div", "h3d-hist");
-    const items = (history || []).slice(0, 10);
 
-    if (!items.length) {
-        box.append(el("div", "h3d-empty",
-            `还没有成片：工作流跑完后，最终视频与分段会出现在 output/${escapeHtml(prefix)}/<br>（接 H3ChainSaver 节点或开启「自动保存」）`));
-    } else {
-        items.forEach((it, i) => {
-            const url = viewUrl(prefix, it.file);
+    /* 第一区块：项目文件夹内的成片（manifest.finals，最新在前） */
+    const dir = state?.dir;
+    const finals = (mf?.finals || []).filter(Boolean).slice(-10).reverse();
+    if (dir && finals.length) {
+        const head = el("div", "h3d-hist-head", `项目成片（output/h3_projects/${escapeHtml(dir)}/）`);
+        box.append(head);
+        finals.forEach((file, i) => {
+            const sub = `h3_projects/${dir}`;
+            const url = viewUrl(sub, file);
             const card = el("div", "h3d-result" + (i === 0 ? " current" : ""));
             const v = document.createElement("video");
             v.controls = true;
             v.preload = "metadata";
             v.src = url;
-            card.append(v, el("div", "h3d-result-name", (i === 0 ? "当前成片 · " : "") + escapeHtml(it.file)));
+            card.append(v, el("div", "h3d-result-name", (i === 0 ? "最新成片 · " : "") + escapeHtml(file)));
+            const meta = el("div", "h3d-result-meta");
+            const acts = el("div", "h3d-result-acts");
+            const open = el("a", "h3d-dl", "↗ 打开");
+            open.href = url; open.target = "_blank";
+            const dl = el("a", "h3d-dl", "⬇ 下载");
+            dl.href = url; dl.download = file;
+            acts.append(open, dl);
+            const del = el("button", "h3d-btn h3d-btn-danger", "🗑 删除");
+            del.title = "删除项目内该成片文件（二次确认，项目其余内容不动）";
+            del.onclick = async () => {
+                if (del.dataset.armed !== "1") {
+                    del.dataset.armed = "1";
+                    del.textContent = "确认删除？";
+                    setTimeout(() => { del.dataset.armed = ""; del.textContent = "🗑 删除"; }, 2500);
+                    return;
+                }
+                try {
+                    const r = await api.fetchApi("/h3chain/delete_file", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ path: `h3_projects/${dir}/${file}` }),
+                    });
+                    if (r.ok) { refresh(); return; }
+                    if (r.status === 404 || r.status === 405) {
+                        setApiError(`删除接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`);
+                        return;
+                    }
+                    const j = await r.json().catch(() => ({}));
+                    alert(`删除失败：${j.error || `HTTP ${r.status}`}`);
+                } catch (e) {
+                    alert("删除请求失败：" + e);
+                }
+            };
+            acts.append(del);
+            meta.append(acts);
+            card.append(meta);
+            box.append(card);
+        });
+    }
+
+    /* 第二区块：成片保存节点（H3ChainSaver）输出历史 */
+    const items = (history || []).slice(0, 10);
+    if (items.length) {
+        if (finals.length) box.append(el("div", "h3d-hist-head", `保存节点历史（output/${escapeHtml(prefix)}/）`));
+        items.forEach((it, i) => {
+            const url = viewUrl(prefix, it.file);
+            const card = el("div", "h3d-result" + (!finals.length && i === 0 ? " current" : ""));
+            const v = document.createElement("video");
+            v.controls = true;
+            v.preload = "metadata";
+            v.src = url;
+            card.append(v, el("div", "h3d-result-name", (!finals.length && i === 0 ? "当前成片 · " : "") + escapeHtml(it.file)));
             card.append(el("div", "h3d-result-info",
                 escapeHtml(`${fmtTime(it.time)} · ${it.frames || "?"} 帧` +
                     (it.archive ? ` · 存档 ${it.archive}` : "") +
@@ -2246,13 +2463,16 @@ function renderHistoryZone(sec, data) {
                     return;
                 }
                 try {
-                    const r = await fetch("/h3chain/delete", {
+                    const r = await api.fetchApi("/h3chain/delete", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ file: `${prefix}/${it.file}` }),
                     });
                     if (r.ok) { refresh(); return; }
-                    if (r.status === 404 || r.status === 405) { alert("删除路由未注册（HTTP " + r.status + "）：请重启 ComfyUI（日志应出现「路由已注册」）后刷新浏览器重试。"); return; }
+                    if (r.status === 404 || r.status === 405) {
+                        setApiError(`删除接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`);
+                        return;
+                    }
                     alert("删除失败（文件可能已被移动）");
                 } catch (e) {
                     alert("删除请求失败：" + e);
@@ -2266,10 +2486,14 @@ function renderHistoryZone(sec, data) {
         if ((history || []).length > 10) {
             box.append(el("div", "h3d-foot", `仅显示最近 10 条（共 ${history.length} 条），更早在 output/${escapeHtml(prefix)}/`));
         }
+    } else if (!finals.length) {
+        box.append(el("div", "h3d-empty",
+            "还没有成片：开启「自动保存」后成片直接落在项目文件夹；<br>"
+            + `接 H3ChainSaver 节点的输出历史会出现在 output/${escapeHtml(prefix)}/`));
     }
     sec.append(box);
     if (state?.dir) {
-        sec.append(el("div", "h3d-foot", `分段存档：output/checkpoints/${escapeHtml(state.dir)}`));
+        sec.append(el("div", "h3d-foot", `项目文件夹：output/h3_projects/${escapeHtml(state.dir)}（分段视频也在其中）`));
     }
 }
 
@@ -2278,7 +2502,7 @@ function renderHistoryZone(sec, data) {
 function renderFooter(z, data) {
     const { node, state, mf, plan } = data;
     const total = plan ? plan.length : 0;
-    const done = state?.done ?? mf?.done ?? 0;
+    const done = mf?.done ?? state?.done ?? 0;
 
     const infos = [];
     infos.push(`当前 <b>${escapeHtml(state?.dir || (node ? getDirValue(node) || "未命名" : "无"))}</b>`);
@@ -2325,6 +2549,7 @@ function openNewProjectModal() {
     dialog.innerHTML = `
         <h3>＋ 新建项目</h3>
         <p class="h3d-lead">新开一条视频链：换存档目录名即换链，旧链原样保留可随时切回。
+        点「创建项目」会在 output/h3_projects/ 下立即建好文件夹（游戏存档槽：创建即可见，0 段起跑）。
         提示词沿用当前内容作底稿（可勾选下方清空）。</p>`;
     const input = document.createElement("input");
     input.type = "text";
@@ -2349,17 +2574,43 @@ function openNewProjectModal() {
     const close = () => overlay.remove();
     cancel.onclick = close;
     overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
-    const submit = () => {
+    const submit = async () => {
         const name = input.value.trim();
         if (!name) { err.textContent = "项目名不能为空"; return; }
         if (!/^[0-9A-Za-z_\-一-龥]+$/.test(name)) {
             err.textContent = "仅允许中文、字母、数字、下划线、连字符";
             return;
         }
+        /* 立即落盘建项目文件夹（游戏存档槽语义：创建即可见）。
+           接口 404/405（未注册）时降级为旧的惰性行为——首次运行仍会建目录，不阻断。 */
+        let diskOk = false;
+        try {
+            const r = await api.fetchApi("/h3chain/create_project", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ dir: name }),
+            });
+            if (r.ok) {
+                diskOk = true;
+            } else if (r.status === 400) {
+                const j = await r.json().catch(() => ({}));
+                err.textContent = `创建失败：${j.error || "项目名非法"}`;
+                return;
+            } else if (r.status === 404 || r.status === 405) {
+                setApiError(`项目接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`
+                    + `本次新建未落盘，首次运行时会自动建目录。`);
+            } else {
+                const j = await r.json().catch(() => ({}));
+                err.textContent = `创建失败：${j.error || `HTTP ${r.status}`}`;
+                return;
+            }
+        } catch (e) {
+            console.warn("[h3-director] create_project failed:", e);
+        }
         if (!setDirValue(node, name)) { err.textContent = "节点上没有「存档目录/断点目录」控件"; return; }
         setWidgetValue(node, W_REROLL, 0);
         if (cb.checked) clearPrompts(node);
-        rememberProject(name);
+        setLed("idle", `新项目「${name}」已就绪${diskOk ? "（文件夹已建）" : ""}`);
         close();
         scheduleRefresh(200);
     };

@@ -7,6 +7,9 @@ v2：指纹只覆盖共享参数（不含提示词、不含种子），改某段
 提示词按段存哈希，改了第 N 段 -> reroll_start 找到首个不一致段，从该段起重做
 （段 N 的锚定依赖段 N-1 尾帧，其后段必然级联重做）。
 
+v3：存档根目录迁至 output/h3_projects/<项目名>/（游戏式一项目一文件夹），
+manifest 增加 title/created_at/updated_at/finals 键；旧 checkpoints 目录不读不写。
+
 torch / folder_paths 延迟导入：指纹与 manifest 逻辑在无 ComfyUI 环境下可单测。
 """
 
@@ -16,7 +19,7 @@ import os
 import re
 import tempfile
 
-SCHEMA = "h3seamless/ckpt-v2"
+SCHEMA = "h3seamless/ckpt-v3"
 
 
 def fingerprint(params: dict) -> str:
@@ -103,15 +106,15 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
 
 
 def ckpt_dir(params: dict, custom: str = "") -> str:
-    """断点根目录：output/checkpoints/<自定义名> 或按参数指纹自动命名。"""
+    """项目根目录：output/h3_projects/<自定义名> 或按参数指纹自动命名。"""
     from folder_paths import get_output_directory
 
     if custom:
-        root = os.path.join(get_output_directory(), "checkpoints", custom)
+        root = os.path.join(get_output_directory(), "h3_projects", custom)
     else:
         name = (f"h3chain_{params['width']}x{params['height']}"
                 f"_{params['length']}f_ctx{params['ctx']}_{fingerprint(params)}")
-        root = os.path.join(get_output_directory(), "checkpoints", name)
+        root = os.path.join(get_output_directory(), "h3_projects", name)
     os.makedirs(root, exist_ok=True)
     return root
 
@@ -189,25 +192,25 @@ def load_segment(root: str, idx: int):
     return payload["video"], payload["audio"]
 
 
-def checkpoints_root() -> str:
+def projects_root() -> str:
     from folder_paths import get_output_directory
 
-    return os.path.join(get_output_directory(), "checkpoints")
+    return os.path.join(get_output_directory(), "h3_projects")
 
 
 def save_state(state: dict):
-    """链状态指针写到 checkpoints/h3chain_state.json（审片面板据此定位当前链）。
+    """链状态指针写到 h3_projects/h3chain_state.json（审片面板据此定位当前链）。
 
     固定路径 + /api/view 端点：面板无需自建 HTTP 路由，也不必复刻指纹算法。
     """
-    root = checkpoints_root()
+    root = projects_root()
     os.makedirs(root, exist_ok=True)
     _atomic_write(os.path.join(root, "h3chain_state.json"),
                   json.dumps(state, ensure_ascii=False, indent=1).encode("utf-8"))
 
 
 def load_state():
-    path = os.path.join(checkpoints_root(), "h3chain_state.json")
+    path = os.path.join(projects_root(), "h3chain_state.json")
     if not os.path.exists(path):
         return None
     try:

@@ -118,26 +118,26 @@ function buildGallery(node) {
 
     async function renderSegments() {
         body.innerHTML = "";
-        const st = await fetchJson("checkpoints", "h3chain_state.json");
+        const st = await fetchJson("h3_projects", "h3chain_state.json");
         const dir = st && st.dir;
         if (!dir) {
             body.append(el("div", "h3sv-empty", "还没有当前链：跑一次采样后这里显示其分段视频"));
             return;
         }
-        const mf = (await fetchJson(`checkpoints/${dir}`, "manifest.json")) || {};
+        const mf = (await fetchJson(`h3_projects/${dir}`, "manifest.json")) || {};
         const vids = mf.videos || [];
         const thumbs = mf.thumbs || [];
         if (!vids.length) {
-            body.append(el("div", "h3sv-empty", `存档「${dir}」还没有分段视频（至少完成一段后出现）`));
+            body.append(el("div", "h3sv-empty", `项目「${dir}」还没有分段视频（至少完成一段后出现）`));
             return;
         }
         body.append(el("div", "h3sv-curtitle",
-            `本次分段（存档 ${escapeHtml(dir)} · ${mf.done || vids.length}/${mf.total || "?"} 段）`));
+            `本次分段（项目 ${escapeHtml(dir)} · ${mf.done || vids.length}/${mf.total || "?"} 段）`));
         for (let i = 0; i < vids.length; i++) {
-            const poster = thumbs[i] ? ` poster="${viewUrl({ subfolder: `checkpoints/${dir}`, filename: thumbs[i] })}"` : "";
+            const poster = thumbs[i] ? ` poster="${viewUrl({ subfolder: `h3_projects/${dir}`, filename: thumbs[i] })}"` : "";
             const wrap = el("div", "h3sv-seg");
             wrap.innerHTML = `<div class="h3sv-seg-n">段 ${i + 1}</div>
-                <video controls preload="metadata"${poster} src="${viewUrl({ subfolder: `checkpoints/${dir}`, filename: vids[i] })}"></video>`;
+                <video controls preload="metadata"${poster} src="${viewUrl({ subfolder: `h3_projects/${dir}`, filename: vids[i] })}"></video>`;
             body.append(wrap);
         }
     }

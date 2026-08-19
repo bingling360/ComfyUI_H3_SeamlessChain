@@ -20,7 +20,10 @@ try:
             try:
                 from .routes import add_routes as _add_routes
                 _add_routes(routes)
-                print("[ComfyUI_H3_SeamlessChain] 路由已注册（扩展钩子）：POST /h3chain/delete, /h3chain/delete_archive")
+                print("[ComfyUI_H3_SeamlessChain] 路由已注册（扩展钩子，含 /api 前缀副本）："
+                      "GET /h3chain/ping, /h3chain/projects, /h3chain/project, "
+                      "POST /h3chain/create_project, /h3chain/delete, "
+                      "/h3chain/delete_project, /h3chain/delete_file")
             except Exception:
                 print("[ComfyUI_H3_SeamlessChain] 扩展钩子路由注册失败，回退到 PromptServer。详细错误：")
                 traceback.print_exc()

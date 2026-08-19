@@ -20,8 +20,12 @@ def test_resolve_canvas():
     assert rc("9:16", "1.0") == (768, 1344)     # 竖版原生
     w, h = rc("21:9", "1.0")                    # 超上限收敛到 1344 长边
     assert w == 1344 and h <= 768 and h % 32 == 0
+    # 百万像素浮点档位：0.1–2.0 共 20 档（官方箭头微调同款），字符串/浮点输入均可
+    mps = plugin_nodes._MP_OPTIONS
+    assert len(mps) == 20 and mps[0] == 0.1 and mps[-1] == 2.0
+    assert rc("16:9", 0.5) == rc("16:9", "0.5")
     for ar in ("21:9", "16:9", "9:16", "4:3", "3:4", "1:1"):
-        for mp in plugin_nodes._MP_OPTIONS:
+        for mp in mps:
             w, h = rc(ar, mp)
             assert w % 32 == 0 and h % 32 == 0 and w >= 32 and h >= 32
             assert max(w, h) <= 1344 and min(w, h) <= 768
@@ -64,7 +68,9 @@ def test_apply_label_tokens():
 
 def test_reference_header():
     rh = plugin_nodes._reference_header
-    assert rh(["角色1", "场景1"]) == "参考：<Picture 1>=角色1，<Picture 2>=场景1。"
+    assert rh(["角色1", "场景1"]) == ("subject_definitions:\n"
+                                     "<Picture 1> is the reference image for 角色1, used as a generation anchor of this segment.\n"
+                                     "<Picture 2> is the reference image for 场景1, used as a generation anchor of this segment.")
     print("PASS test_reference_header")
 
 
