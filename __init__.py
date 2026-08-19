@@ -16,13 +16,20 @@ try:
                     H3SeamDoctor]
 
         async def add_routes(self, routes):
-            # 兼容未来版本可能存在的扩展钩子；现行版本靠下方 register() 直挂
+            # 新版 ComfyUI / Comfy Desktop 官方路径：框架直接传入 routes 对象
             try:
-                from .routes import register
-                register()
+                from .routes import add_routes as _add_routes
+                _add_routes(routes)
+                print("[ComfyUI_H3_SeamlessChain] 路由已注册（扩展钩子）：POST /h3chain/delete, /h3chain/delete_archive")
             except Exception:
-                print("[ComfyUI_H3_SeamlessChain] 路由注册失败（成片画廊降级：仅显示当前链）。详细错误：")
+                print("[ComfyUI_H3_SeamlessChain] 扩展钩子路由注册失败，回退到 PromptServer。详细错误：")
                 traceback.print_exc()
+                try:
+                    from .routes import register
+                    register()
+                except Exception:
+                    print("[ComfyUI_H3_SeamlessChain] 回退路由注册也失败。详细错误：")
+                    traceback.print_exc()
 
     async def comfy_entrypoint() -> H3SeamlessChainExtension:
         return H3SeamlessChainExtension()

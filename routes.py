@@ -79,28 +79,80 @@ def add_routes(routes):
         return web.json_response({"ok": True, "deleted": deleted})
 
 
-def register():
+def register(routes=None):
     """把路由挂到 PromptServer.instance.routes（自定义节点标准方式）。
 
-    此前用 ComfyExtension.add_routes 扩展钩子注册，但现行 ComfyUI 的基类
-    没有 add_routes 钩子、server.py 也不调用它——路由从未注册，
-    前端 POST 命中前端托管层返回 405。custom nodes 加载晚于 PromptServer
-    构造，导入期 instance 已就绪（ComfyUI-Manager 等同款做法）。
+    兼容多种运行环境：
+    - 标准 ComfyUI：custom nodes 加载晚于 PromptServer 构造，instance 已就绪。
+    - Comfy Desktop / 新版 ComfyUI：可能通过 ComfyExtension.add_routes(routes)
+      直接把 routes 对象传进来，此时用 routes 参数注册。
+    - PromptServer.instance 尚未构造：给 PromptServer.__init__ 安装钩子，
+      在实例化瞬间自动注册。
+    - 测试环境：无 server 模块，返回 False。
     """
     global _registered
     if _registered:
         return True
-    try:
-        from server import PromptServer
-    except Exception:
-        print("[ComfyUI_H3_SeamlessChain] 未找到 server.PromptServer，跳过路由注册（测试环境正常）")
+
+    # 扩展钩子直接传入了 routes 对象（Comfy Desktop / 新版 ComfyUI 官方路径）
+    if routes is not None:
+        try:
+            add_routes(routes)
+            _registered = True
+            print("[ComfyUI_H3_SeamlessChain] 路由已注册：POST /h3chain/delete, /h3chain/delete_archive")
+            return True
+        except Exception:
+            print("[ComfyUI_H3_SeamlessChain] 路由注册失败（删除功能不可用）。详细错误：")
+            traceback.print_exc()
+            return False
+
+    PromptServer = _import_promptserver()
+    if PromptServer is None:
+        print("[ComfyUI_H3_SeamlessChain] 未找到 PromptServer，跳过路由注册（测试环境正常）")
         return False
-    try:
-        add_routes(PromptServer.instance.routes)
-        _registered = True
-        print("[ComfyUI_H3_SeamlessChain] 路由已注册：POST /h3chain/delete, /h3chain/delete_archive")
-        return True
-    except Exception:
-        print("[ComfyUI_H3_SeamlessChain] 路由注册失败（删除功能不可用）。详细错误：")
-        traceback.print_exc()
-        return False
+
+    routes_obj = getattr(getattr(PromptServer, "instance", None), "routes", None)
+    if routes_obj is not None:
+        try:
+            add_routes(routes_obj)
+            _registered = True
+            print("[ComfyUI_H3_SeamlessChain] 路由已注册：POST /h3chain/delete, /h3chain/delete_archive")
+            return True
+        except Exception:
+            print("[ComfyUI_H3_SeamlessChain] 路由注册失败（删除功能不可用）。详细错误：")
+            traceback.print_exc()
+            return False
+
+    # PromptServer 已导入但 instance 尚未构造（Comfy Desktop 常见），安装实例化钩子
+    _install_promptserver_hook(PromptServer)
+    return False
+
+
+def _import_promptserver():
+    """尝试多种 PromptServer 导入路径（标准 ComfyUI / Comfy Desktop / 打包版）。"""
+    import importlib
+    for path in ("server", "comfy.server", "comfy_api.server"):
+        try:
+            return importlib.import_module(path).PromptServer
+        except Exception:
+            continue
+    return None
+
+
+def _install_promptserver_hook(PromptServer):
+    """当 PromptServer 实例化时自动注册路由（处理加载顺序不一致的 Desktop 环境）。"""
+    if getattr(PromptServer, "_h3_route_hook_installed", False):
+        return
+    orig_init = PromptServer.__init__
+
+    def _h3_init(self, *args, **kwargs):
+        result = orig_init(self, *args, **kwargs)
+        try:
+            register()
+        except Exception:
+            pass
+        return result
+
+    PromptServer.__init__ = _h3_init
+    PromptServer._h3_route_hook_installed = True
+    print("[ComfyUI_H3_SeamlessChain] PromptServer 尚未实例化，已安装实例化后自动注册路由的钩子")
