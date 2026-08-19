@@ -111,19 +111,43 @@ def register(routes=None):
         print("[ComfyUI_H3_SeamlessChain] 未找到 PromptServer，跳过路由注册（测试环境正常）")
         return False
 
-    routes_obj = getattr(getattr(PromptServer, "instance", None), "routes", None)
-    if routes_obj is not None:
+    inst = getattr(PromptServer, "instance", None)
+    if inst is None:
+        # PromptServer 尚未构造：装钩子，实例化后自动注册
+        _install_promptserver_hook(PromptServer)
+        return False
+
+    # 优先直接挂到运行中的 app.router：绕过 RouteTableDef 的挂载时序问题。
+    # ComfyUI 部分版本（如 0.33.x）在 custom node 导入前已执行
+    # app.add_routes(PromptServer.instance.routes)，导入期加进 RouteTableDef
+    # 的路由不会被装载，导致代码里"注册成功"但浏览器访问 404。
+    app = getattr(inst, "app", None)
+    router = getattr(app, "router", None) if app is not None else None
+    target = router if router is not None else getattr(inst, "routes", None)
+    if target is not None:
         try:
-            add_routes(routes_obj)
+            add_routes(target)
             _registered = True
-            print("[ComfyUI_H3_SeamlessChain] 路由已注册：POST /h3chain/delete, /h3chain/delete_archive")
+            where = "app.router" if router is not None else "PromptServer.instance.routes"
+            print(f"[ComfyUI_H3_SeamlessChain] 路由已注册（{where}）：POST /h3chain/delete, /h3chain/delete_archive")
             return True
         except Exception:
+            # app.router 失败则回退 RouteTableDef（保留旧版兼容）
+            routes2 = getattr(inst, "routes", None)
+            if routes2 is not None and routes2 is not target:
+                try:
+                    add_routes(routes2)
+                    _registered = True
+                    print("[ComfyUI_H3_SeamlessChain] 路由已注册：POST /h3chain/delete, /h3chain/delete_archive")
+                    return True
+                except Exception:
+                    traceback.print_exc()
+                    return False
             print("[ComfyUI_H3_SeamlessChain] 路由注册失败（删除功能不可用）。详细错误：")
             traceback.print_exc()
             return False
 
-    # PromptServer 已导入但 instance 尚未构造（Comfy Desktop 常见），安装实例化钩子
+    # app 还没建好：装钩子，等 __init__ 完成后重试（此时 app.router 应已就绪）
     _install_promptserver_hook(PromptServer)
     return False
 

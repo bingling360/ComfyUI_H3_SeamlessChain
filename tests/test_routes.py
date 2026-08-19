@@ -170,6 +170,36 @@ def test_register_no_server_module():
         assert r2.register() is False
 
 
+def test_register_prefers_app_router():
+    """register()：server 同时有 app.router 与 routes 时，优先挂到 app.router。
+
+    对应 ComfyUI 0.33.x 在 custom node 导入前已 app.add_routes(routes) 的情况：
+    挂进 RouteTableDef 的路由不会被装载，必须直接挂到运行中的 app.router。
+    """
+    with _server_env():
+        router3 = _Router()
+        router4 = _Router()  # 不应被使用
+        ps_instance = types.SimpleNamespace(
+            app=types.SimpleNamespace(router=router3),
+            routes=router4,
+        )
+
+        class _PS:
+            instance = ps_instance
+        srv = types.SimpleNamespace(PromptServer=_PS)
+        sys.modules["server"] = srv
+        try:
+            from ComfyUI_H3_SeamlessChain import routes as r3
+            assert r3.register() is True
+            # 路由只挂到了 app.router（router3），未挂到 RouteTableDef（router4）
+            assert set(router3.table) == {"/h3chain/delete", "/h3chain/delete_archive"}
+            assert router4.table == {}
+            resp = asyncio.run(router3.table["/h3chain/delete_archive"](_Req({"dir": "nope"})))
+            assert resp["status"] == 404
+        finally:
+            del sys.modules["server"]
+
+
 if __name__ == "__main__":
     _install_stubs(with_audio_support=False)
     for name, fn in sorted(globals().items()):
