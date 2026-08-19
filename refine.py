@@ -59,19 +59,76 @@ def build_seam_window(prev_lat, cur_lat, side_frames):
     return win_v, win_a, vt_p, vt_c, wf
 
 
-def adaptive_strength(seam_diff):
+# —— 统一接缝处理后端 ——————————————————————————————————————————
+# 「接缝处理/锚定加噪/递减锚定/自适应精修/精修强度/精修窗口/混合帧数」
+# 原本是 7 个独立旋钮，自由组合很容易配出伤画质的组合（加噪 + 递减锚定 +
+# 高强度精修叠加 = 接缝发糊的配方）。现在统一由「接缝处理」一个下拉决定：
+# 预设档内部固化保守参数——锚定加噪与递减锚定一律关闭（实测对画质是净
+# 伤害），只有「自定义」和两个旧值兼容档才读细粒度控件。
+#
+# 预设分档表 tiers=(好缝, 中缝, 坏缝)：缝差 <0.04 / 0.04-0.08 / >0.08。
+
+SEAM_PROFILES = {
+    "轻量": {"tiers": (0.22, 0.30, 0.40), "window": 22, "blend": 4},
+    "标准": {"tiers": (0.30, 0.45, 0.55), "window": 39, "blend": 6},
+    "强力": {"tiers": (0.40, 0.55, 0.65), "window": 39, "blend": 8},
+}
+
+
+def resolve_profile(mode, anchor_aug=0.0, fade_ratio=0.0, strength=0.45,
+                    window=39, blend=6, adaptive=True):
+    """统一接缝处理入口：模式 + 细粒度控件值 → 执行参数 dict。
+
+    返回键：mode（规范化名）/ use_refine / pixel_blend / tiers（自适应分档，
+    None=关）/ fixed（固定强度，None=用 tiers）/ window / blend /
+    anchor_aug / fade_ratio。
+
+    - 轻量/标准/强力：预设固化，不读控件；anchor_aug=fade_ratio=0（硬锚，
+      不加噪不递减——画质优先）。
+    - 自定义：透传全部细粒度控件（含锚定加噪/递减锚定，供实验）。
+    - 潜空间精修(旧值)：与自定义等价透传——旧工作流加载后行为不变。
+    - smoothstep像素混合(旧值)：纯像素路径；关闭：什么都不做。
+    """
+    mode = str(mode)
+    if mode in SEAM_PROFILES:
+        p = SEAM_PROFILES[mode]
+        return {"mode": mode, "use_refine": True, "pixel_blend": False,
+                "tiers": p["tiers"], "fixed": None,
+                "window": int(p["window"]), "blend": int(p["blend"]),
+                "anchor_aug": 0.0, "fade_ratio": 0.0}
+    if mode == "关闭":
+        return {"mode": "关闭", "use_refine": False, "pixel_blend": False,
+                "tiers": None, "fixed": None,
+                "window": int(window), "blend": int(blend),
+                "anchor_aug": 0.0, "fade_ratio": 0.0}
+    if mode == "smoothstep像素混合":
+        return {"mode": mode, "use_refine": False, "pixel_blend": True,
+                "tiers": None, "fixed": None,
+                "window": int(window), "blend": int(blend),
+                "anchor_aug": float(anchor_aug), "fade_ratio": float(fade_ratio)}
+    # "自定义" / 旧值 "潜空间精修"：完全透传细粒度控件
+    return {"mode": "自定义" if mode == "自定义" else "潜空间精修",
+            "use_refine": True, "pixel_blend": False,
+            "tiers": (0.30, 0.45, 0.55) if adaptive else None,
+            "fixed": None if adaptive else float(strength),
+            "window": int(window), "blend": int(blend),
+            "anchor_aug": float(anchor_aug), "fade_ratio": float(fade_ratio)}
+
+
+def adaptive_strength(seam_diff, tiers=(0.30, 0.45, 0.55)):
     """按缝差分档精修强度：坏缝需要更强的重去噪调和，好缝轻修保细节。
 
-    d < 0.04 → 0.30（轻调）；0.04-0.08 → 0.45（标准）；> 0.08 → 0.55（强调和）。
-    固定 0.45 整窗重去噪会把好缝也重新加噪-去噪一遍——细节软化的主因之一。
+    d < 0.04 → tiers[0]（轻调）；0.04-0.08 → tiers[1]（标准）；> 0.08 →
+    tiers[2]（强调和）。固定 0.45 整窗重去噪会把好缝也重新加噪-去噪一遍
+    ——细节软化的主因之一。
     """
     if seam_diff is None:
-        return 0.45
+        return tiers[1]
     if seam_diff < 0.04:
-        return 0.30
+        return tiers[0]
     if seam_diff <= 0.08:
-        return 0.45
-    return 0.55
+        return tiers[1]
+    return tiers[2]
 
 
 def refine_seam(模型, negative, prompt, refs, clip, video_vae, audio_vae,

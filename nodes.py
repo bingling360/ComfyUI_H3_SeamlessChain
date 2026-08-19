@@ -317,24 +317,30 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                tooltip="桥帧总分阈值，低于判定为坏尾。建议先跑「标注」档看报告里的分数分布再定"),
                 io.Int.Input("回退上限", default=34, min=0, max=68, step=17,
                              tooltip="自动回退最多向前多少帧（17 的倍数，踩 17k+5 网格）"),
-                io.Combo.Input("接缝处理", options=["潜空间精修", "smoothstep像素混合", "关闭"],
-                               default="潜空间精修",
-                               tooltip="拼接点衔接层（默认=旧「接缝混合」控件位）：潜空间精修=把上段尾+本段头"
-                                       "各「精修窗口」帧的干净 latent 拼成跨缝窗口，整体加噪到「精修强度」后"
-                                       "联合重去噪——缝两侧出自同一次去噪，缝差≈段内正常帧差，根治跳变/叠影；"
-                                       "smoothstep像素混合=旧机制：上段尾帧硬锁为本段首帧+权重窗吸收前「混合帧数」"
-                                       "帧偏差，偏差大时有叠影感；关闭=不处理。音频不做拼接期混合"
-                                       "（两侧是不同内容，叠加会双声部重叠；音频连贯靠生成期桥锚定+响度对齐）。"
+                io.Combo.Input("接缝处理",
+                               options=["标准", "轻量", "强力", "自定义",
+                                        "潜空间精修", "smoothstep像素混合", "关闭"],
+                               default="标准",
+                               tooltip="统一接缝处理入口（一个下拉决定全部衔接参数，细粒度控件仅「自定义/旧值档」生效）："
+                                       "标准=跨缝窗口联合重去噪+双端锚定+按缝差自适应强度(0.30/0.45/0.55)，"
+                                       "窗口39帧、羽化6帧，锚定加噪与递减锚定一律关闭（画质优先，推荐）；"
+                                       "轻量=更保守的分档(0.22/0.30/0.40)+窗口22帧+羽化4帧，好缝几乎不动；"
+                                       "强力=更强分档(0.40/0.55/0.65)+羽化8帧，坏缝多的链用；"
+                                       "自定义=读下方「锚定加噪/递减锚定/精修强度/精修窗口/混合帧数/自适应精修」"
+                                       "（自由组合易伤画质，仅供实验）；"
+                                       "潜空间精修/smoothstep像素混合=旧版值（兼容旧工作流，行为=自定义档/纯像素混合）。"
                                        "纯后处理不进存档指纹，改参数不触发重跑"),
                 io.Int.Input("混合帧数", default=6, min=1, max=24,
-                             tooltip="smoothstep 模式=像素混合窗帧数（两端权重导数为 0、中段过渡；"
+                             tooltip="仅接缝处理=自定义/旧值档时生效（预设档内部固化）："
+                                     "smoothstep 模式=像素混合窗帧数（两端权重导数为 0、中段过渡；"
                                      "运动越快窗应越短，6帧≈0.25s）；潜空间精修模式=精修区末端渐变回原帧的"
                                      "羽化帧数，防精修边界出现第二条微缝"),
                 io.Float.Input("锚定加噪", default=0.0, min=0.0, max=0.5, step=0.05,
-                               tooltip="对桥锚定帧注入噪声的比例（SkyReels-V2 addnoise_condition 思路）："
+                               tooltip="仅接缝处理=自定义/旧值档时生效（预设档一律关闭——实测对画质是净伤害）。"
+                                       "对桥锚定帧注入噪声的比例（SkyReels-V2 addnoise_condition 思路）："
                                        "干净锚定帧会让模型起步「刹车」并在可见部分重演锚定内容；加噪让模型"
-                                       "把锚定当「参考」而非「必须逐帧复现」。0=关闭（默认，保持现状）；"
-                                       "0.1 微调；0.2 标准（SkyReels 同值）；0.3+ 干预强但画面细节会变软。"
+                                       "把锚定当「参考」而非「必须逐帧复现」。0=关闭（默认）；"
+                                       "0.2 标准（SkyReels 同值）；0.3+ 干预强但画面细节会变软。"
                                        "仅影响带引导桥的段；不进存档指纹，改参数不触发重跑"),
                 io.Combo.Input("审片模式", options=["关闭", "逐段确认"], default="关闭",
                                tooltip="逐段确认：每次运行只生成一个新的段落即返回，预览「分段图像」或自动保存目录里的"
@@ -347,10 +353,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                              tooltip="0=自动（沿用存档进度，改过提示词的段自动重做）；N=从第 N 段起丢弃存档重新生成"
                                      "（有序章时序章为第 1 段），配合改「种子」即可重摇该段及之后。用完记得改回 0"),
                 io.Float.Input("精修强度", default=0.45, min=0.2, max=0.7, step=0.05,
-                               tooltip="接缝精修的加噪/去噪强度（denoise）：窗口两侧各保留 (1-强度) 的原结构。"
+                               tooltip="仅接缝处理=自定义/旧值档、且「自适应精修」关闭时生效（预设档内部固化）："
+                                       "接缝精修的加噪/去噪强度（denoise），窗口两侧各保留 (1-强度) 的原结构。"
                                        "0.2-0.3 改动小、调和弱；0.45 标准；0.6+ 过渡更顺但纹理细节改动大"),
                 io.Combo.Input("精修窗口", options=["22", "39", "56"], default="39",
-                               tooltip="接缝精修每侧帧数（缝前取上段尾、缝后取本段头，均为 token 网格点）。"
+                               tooltip="仅接缝处理=自定义/旧值档时生效（预设档内部固化）："
+                                       "接缝精修每侧帧数（缝前取上段尾、缝后取本段头，均为 token 网格点）。"
                                        "窗口越大过渡越从容、精修耗时越长（约为本段采样的 1/4-1/2）"),
                 io.Combo.Input("接缝重摇", options=["关闭", "自动"], default="自动",
                                tooltip="自动：本段生成后若接缝帧差 > 重摇阈值，换种子重采本段（最多「重摇上限」次），"
@@ -367,10 +375,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "搜索范围=段尾1/3，最少保留50%内容。"
                                        "与桥帧门控互补：门控查尾帧是否糊，切镜找内容是否到了自然间歇"),
                 io.Combo.Input("递减锚定", options=["关闭", "0.3", "0.5", "0.7"], default="关闭",
-                               tooltip="锚定约束随采样进度递减：开始强（接缝吻合）→ 逐渐减弱（模型自然过渡）"
+                               tooltip="仅接缝处理=自定义/旧值档时生效（预设档一律关闭——实测对画质是净伤害）。"
+                                       "锚定约束随采样进度递减：开始强（接缝吻合）→ 逐渐减弱（模型自然过渡）"
                                        "→ 完全消失（自由生成）。数值=递减占总步数比例（0.3=前30%步数递减完毕）。"
-                                       "开启后「锚定加噪」的值作为递减起点，终点为 0（锚定消失）。"
-                                       "治本：模型自己找到逻辑断点完成切镜，而非被强行拉住整段"),
+                                       "开启后「锚定加噪」的值作为递减起点，终点为 0（锚定消失）"),
                 io.Int.Input("切镜最多丢帧", default=17, min=0, max=120,
                              tooltip="智能切镜的单段丢帧上限（0=只标注切镜点不裁剪）。"
                                      "此前切镜在段尾 1/3 无上限搜索，多段累计可丢数秒内容"
@@ -380,7 +388,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                      "超预算后智能切镜自动降级为只标注不裁剪，门控回退仍生效但记 WARN。"
                                      "报告末尾有累计丢弃汇总行。进存档指纹"),
                 io.Combo.Input("自适应精修", options=["开启", "关闭"], default="开启",
-                               tooltip="按缝差分档精修强度：<0.04 轻修0.30（保细节）；0.04-0.08 标准0.45；"
+                               tooltip="仅接缝处理=自定义/旧值档时生效（预设档内部固化分档）："
+                                       "按缝差分档精修强度：<0.04 轻修0.30（保细节）；0.04-0.08 标准0.45；"
                                        ">0.08 强调和0.55。关闭=固定用「精修强度」值。固定 0.45 整窗重去噪"
                                        "会把好缝也重新去噪一遍——接缝发糊的主因之一。不进存档指纹"),
                 io.Image.Input("首帧图片", optional=True,
@@ -438,7 +447,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 提示词组=None,
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
                 自动存档="关闭", 存档目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
-                接缝处理="潜空间精修", 混合帧数=6, 锚定加噪=0.0,
+                接缝处理="标准", 混合帧数=6, 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0,
                 精修强度=0.45, 精修窗口="39", 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
                 智能切镜="关闭", 递减锚定="关闭", 切镜最多丢帧=17, 全链丢弃预算=48,
@@ -485,7 +494,32 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if not full_bridge:
             report.append("注意：当前 ComfyUI 的 keyframe 协议仅支持单帧锚定，段间引导已自动降级为单帧桥，"
                           "接缝质量受限；升级 ComfyUI 后无需改参数即自动恢复完整引导帧数")
-        aug = min(max(float(锚定加噪), 0.0), 0.5)
+        # 统一接缝后端：模式一个下拉决定全部衔接参数（refine.resolve_profile）。
+        # 预设档（标准/轻量/强力）固化保守参数——锚定加噪/递减锚定一律关闭；
+        # 自定义/旧值档透传下方细粒度控件。生成期参数（aug/fade）从 profile 取
+        if 接缝处理 not in ("标准", "轻量", "强力", "自定义",
+                            "潜空间精修", "smoothstep像素混合", "关闭"):
+            # 旧工作流按控件位存的是「接缝混合」时代的值，按位回填
+            接缝处理 = "关闭" if 接缝处理 == "关闭" else (
+                "smoothstep像素混合" if 接缝处理 == "smoothstep" else "潜空间精修")
+        seam = refine.resolve_profile(
+            接缝处理,
+            anchor_aug=float(锚定加噪),
+            fade_ratio=0.0 if 递减锚定 == "关闭" else float(递减锚定),
+            strength=float(精修强度), window=int(精修窗口), blend=int(混合帧数),
+            adaptive=自适应精修 == "开启")
+        if seam["mode"] in ("标准", "轻量", "强力"):
+            t = seam["tiers"]
+            report.append(f"接缝处理：{seam['mode']}（自适应强度 {t[0]:.2f}/{t[1]:.2f}/{t[2]:.2f}"
+                          f" · 窗口 {seam['window']} 帧 · 羽化 {seam['blend']} 帧"
+                          f" · 锚定加噪/递减锚定关闭）")
+        elif seam["use_refine"]:
+            strength_txt = "自适应分档" if seam["tiers"] else f"{seam['fixed']:.2f} 固定"
+            report.append(f"接缝处理：{seam['mode']}（细粒度控件：强度{strength_txt}"
+                          f" · 窗口 {seam['window']} · 羽化 {seam['blend']} · 加噪 {seam['anchor_aug']:.2f}"
+                          f" · 递减 {seam['fade_ratio']:.1f}）")
+
+        aug = min(max(seam["anchor_aug"], 0.0), 0.5)
         if aug > 0.0:
             report.append(f"锚定加噪 {aug:.2f}：桥锚定帧按参考而非逐帧复现注入（视觉 {1.0 - aug:.2f} / 音频 {1.0 - aug * 0.5:.2f} 保真）")
             if aug > 0.25:
@@ -495,12 +529,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if 尾帧锚定 is not None:
             tail_anchor_latent = video_vae.encode(_center_cover(尾帧锚定[:1], width, height))
             report.append(f"尾帧锚定：身份锚点注入末帧 keyframe（{'视觉保真 ' + format(1.0 - aug, '.2f') if aug > 0 else '硬锚定'}）")
-        if 接缝处理 not in ("潜空间精修", "smoothstep像素混合", "关闭"):
-            # 旧工作流按控件位存的是「接缝混合」时代的值，按位回填
-            接缝处理 = "关闭" if 接缝处理 == "关闭" else (
-                "smoothstep像素混合" if 接缝处理 == "smoothstep" else "潜空间精修")
 
-        fade_ratio = 0.0 if 递减锚定 == "关闭" else float(递减锚定)
+        fade_ratio = seam["fade_ratio"]
         if fade_ratio > 0:
             aug_start = 1.0 - aug if aug > 0 else 0.999
             report.append(f"递减锚定：前 {fade_ratio*100:.0f}% 步数内锚定 {aug_start:.2f} → 0 递减消失"
@@ -529,14 +559,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
         # 纯后处理参数只记录不进指纹（改值不触发重跑；报告回看用）
-        seam_refine = {"mode": 接缝处理, "strength": float(精修强度),
-                       "window": str(精修窗口), "blend": int(混合帧数),
+        seam_refine = {"mode": seam["mode"],
+                       "tiers": list(seam["tiers"]) if seam["tiers"] else None,
+                       "fixed": seam["fixed"], "window": seam["window"],
+                       "blend": seam["blend"],
                        "reroll": 接缝重摇, "reroll_th": float(重摇阈值),
-                       "reroll_max": int(重摇上限), "anchor_aug": aug,
-                       "adaptive": 自适应精修}
-        if 接缝处理 == "smoothstep像素混合":
+                       "reroll_max": int(重摇上限), "anchor_aug": aug}
+        if seam["pixel_blend"]:
             report.append("提示：smoothstep像素混合是加权平均（运动残影/糊感来源），建议仅调试对比用；"
-                          "正式出片建议「潜空间精修」")
+                          "正式出片建议「标准」档")
         seg_hashes = [checkpoint.prompt_hash(p) for p in seg_prompts]
         prologue_hash = None
         if 起始视频 is not None:
@@ -861,21 +892,23 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 flag = " ↑ 建议人工检查" if seam_d > 0.08 or (seam_db is not None and abs(seam_db) > 6.0) else ""
                 report.append(f"段{g + 1} 接缝：帧差 {seam_d:.3f} · 响度跳变 {db_txt}{flag}")
 
-            # 接缝处理（生成后、拼接前）：潜空间精修 / smoothstep 像素混合 / 关闭。
+            # 接缝处理（生成后、拼接前）：统一由 seam profile 驱动（refine.resolve_profile）。
             # 精修=跨缝窗口联合重去噪（refine.py）：缝两侧出自同一次去噪，根治
             # 段首偏差；只替换本段头部缝后侧帧，上段帧/存档/分段 mp4 均不动。
             # 纯后处理不进断点指纹（改此参数不触发重跑，replay 段结果仍一致）
             refine_used = False
+            seam_skipped = False   # 窗口不足=完全跳过（像素混合本身是糊感来源，不作兜底）
             if (i > 0 or off) and prev_tail_frame is not None and prev_lat is not None \
-                    and 接缝处理 != "关闭":
-                if 接缝处理 == "潜空间精修":
+                    and (seam["use_refine"] or seam["pixel_blend"]):
+                if seam["use_refine"]:
                     ck0 = video_latent_t(skip_f)
                     cur_lat_ctx = (video_t, audio_t, ck0, end_t,
                                    audio_tokens_for_frames(skip_f),
                                    audio_tokens_for_frames(skip_f + vis_len))
-                    win = refine.build_seam_window(prev_lat, cur_lat_ctx, int(精修窗口))
+                    win = refine.build_seam_window(prev_lat, cur_lat_ctx, seam["window"])
                     if win is None:
-                        report.append(f"段{g + 1} 精修窗口不足（保留区不足每侧 {精修窗口} 帧），本次不处理接缝")
+                        seam_skipped = True
+                        report.append(f"段{g + 1} 精修窗口不足（保留区不足每侧 {seam['window']} 帧），本次不处理接缝")
                     else:
                         win_v, win_a, vt_p, vt_c, wf = win
                         # 缝前侧（上段尾）全部 video latent 作为 keyframe 注入 cond
@@ -887,8 +920,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         # 模型只能改写中间区，不再自由改写无锚端后靠羽化硬接
                         seam_kf_lat = win_v[:, :, :vt_p].clone()
                         tail_kf_lat = win_v[:, :, -2:].clone()
-                        eff_strength = refine.adaptive_strength(seam_d) \
-                            if 自适应精修 == "开启" else float(精修强度)
+                        eff_strength = refine.adaptive_strength(seam_d, seam["tiers"]) \
+                            if seam["tiers"] else seam["fixed"]
                         try:
                             t1 = time.perf_counter()
                             refined_v = refine.refine_seam(
@@ -906,7 +939,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             # 丢弃缝前侧（上段侧），只保留本段替换区
                             wframes = wframes[latent_t_to_frames(vt_p):]
                             replace_n = min(wframes.shape[0], frames.shape[0])
-                            feather = min(max(1, int(混合帧数)), replace_n)
+                            feather = min(max(1, seam["blend"]), replace_n)
                             if feather > 1:
                                 # 精修区末端 smoothstep 渐变回原帧，防精修边界出现第二条微缝
                                 # （w: 0→1 沿羽化推进，末帧=原帧与未精修区无缝衔接）
@@ -920,14 +953,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             if seam_d is not None:
                                 worse = " · 缝差略升，已保留精修结果（不再回退像素混合）" if d2 > seam_d else ""
                                 report.append(f"段{g + 1} 接缝精修：{seam_d:.3f} → {d2:.3f}"
-                                              f" · 强度 {eff_strength:.2f}{'（自适应）' if 自适应精修 == '开启' else ''}"
+                                              f" · 强度 {eff_strength:.2f}{'（自适应）' if seam['tiers'] else ''}"
                                               f" · 双端锚定 · 窗口 {wf} 帧 · {time.perf_counter() - t1:.0f}s{worse}")
                             seam_d = d2
                         except Exception as e:
                             report.append(f"段{g + 1} 接缝精修异常（{type(e).__name__}），回退像素平滑")
-                if not refine_used and 接缝处理 != "关闭":
-                    # smoothstep 像素兜底：仅精修模式异常时使用（加权平均有叠影/糊感）
-                    span = min(max(1, int(混合帧数)), frames.shape[0])
+                if not refine_used and not seam_skipped and seam["use_refine"]:
+                    # smoothstep 像素兜底：仅精修异常时使用（加权平均有叠影/糊感）
+                    span = min(max(1, seam["blend"]), frames.shape[0])
+                    frames = qc.smoothstep_blend_head(frames, prev_tail_frame, span)
+                    report.append(f"段{g + 1} 接缝平滑：首帧硬锁锚帧 + smoothstep {span} 帧过渡")
+                elif seam["pixel_blend"]:
+                    # 纯像素混合档（旧值兼容）：非精修路径的主动选择
+                    span = min(max(1, seam["blend"]), frames.shape[0])
                     frames = qc.smoothstep_blend_head(frames, prev_tail_frame, span)
                     report.append(f"段{g + 1} 接缝平滑：首帧硬锁锚帧 + smoothstep {span} 帧过渡")
             if (i > 0 or off) and prev_tail_frame is not None:

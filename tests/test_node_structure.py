@@ -176,8 +176,9 @@ def test_structure():
     assert "提示词清单" not in ids                   # 控制台已回退，清单输入随之移除
     assert "接缝混合" not in ids                     # 旧控件已被「接缝处理」取代
     assert by_id["桥帧门控"].kwargs.get("options") == ["关闭", "标注", "自动回退"]
-    assert by_id["接缝处理"].kwargs.get("options") == ["潜空间精修", "smoothstep像素混合", "关闭"]
-    assert by_id["接缝处理"].kwargs.get("default") == "潜空间精修"
+    assert by_id["接缝处理"].kwargs.get("options") == [
+        "标准", "轻量", "强力", "自定义", "潜空间精修", "smoothstep像素混合", "关闭"]
+    assert by_id["接缝处理"].kwargs.get("default") == "标准"
     assert by_id["混合帧数"].kwargs.get("default") == 6
     assert by_id["混合帧数"].kwargs.get("min") == 1 and by_id["混合帧数"].kwargs.get("max") == 24
     # 接缝根治新控件（全部追加在既有控件之后，旧工作流 JSON 兼容）

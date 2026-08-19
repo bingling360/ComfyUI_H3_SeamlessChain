@@ -114,6 +114,59 @@ def test_adaptive_strength_mapping():
     assert refine.adaptive_strength(None) == 0.45
 
 
+def test_adaptive_strength_custom_tiers():
+    # 预设档传入自己的分档表：轻量 (0.22, 0.30, 0.40)
+    tiers = refine.SEAM_PROFILES["轻量"]["tiers"]
+    assert refine.adaptive_strength(0.02, tiers) == 0.22
+    assert refine.adaptive_strength(0.05, tiers) == 0.30
+    assert refine.adaptive_strength(0.10, tiers) == 0.40
+    assert refine.adaptive_strength(None, tiers) == 0.30
+
+
+def test_resolve_profile_presets():
+    # 预设档：固化参数、不读控件（传进来的控件值必须被忽略）、加噪/递减一律关闭
+    for mode in ("标准", "轻量", "强力"):
+        p = refine.resolve_profile(mode, anchor_aug=0.3, fade_ratio=0.5,
+                                   strength=0.7, window=56, blend=24, adaptive=False)
+        assert p["use_refine"] and not p["pixel_blend"]
+        assert p["anchor_aug"] == 0.0 and p["fade_ratio"] == 0.0, "预设档必须关闭加噪/递减"
+        exp = refine.SEAM_PROFILES[mode]
+        assert p["tiers"] == exp["tiers"]
+        assert p["window"] == exp["window"] and p["blend"] == exp["blend"]
+        assert p["fixed"] is None
+    assert refine.SEAM_PROFILES["标准"]["tiers"] == (0.30, 0.45, 0.55)
+
+
+def test_resolve_profile_custom_passthrough():
+    # 自定义档：透传全部细粒度控件（含加噪/递减，供实验）；自适应关=固定强度
+    p = refine.resolve_profile("自定义", anchor_aug=0.2, fade_ratio=0.3,
+                               strength=0.6, window=56, blend=12, adaptive=True)
+    assert p["use_refine"] and p["mode"] == "自定义"
+    assert p["anchor_aug"] == 0.2 and p["fade_ratio"] == 0.3
+    assert p["window"] == 56 and p["blend"] == 12
+    assert p["tiers"] == (0.30, 0.45, 0.55) and p["fixed"] is None
+
+    p2 = refine.resolve_profile("自定义", strength=0.35, adaptive=False)
+    assert p2["tiers"] is None and p2["fixed"] == 0.35
+
+
+def test_resolve_profile_legacy_values():
+    # 旧值兼容：潜空间精修=自定义等价透传（旧工作流行为不变）；smoothstep=纯像素；关闭=全关
+    p = refine.resolve_profile("潜空间精修", anchor_aug=0.2, fade_ratio=0.5,
+                               strength=0.5, window=22, blend=8, adaptive=False)
+    assert p["use_refine"] and not p["pixel_blend"] and p["mode"] == "潜空间精修"
+    assert p["anchor_aug"] == 0.2 and p["fade_ratio"] == 0.5
+    assert p["fixed"] == 0.5 and p["window"] == 22 and p["blend"] == 8
+
+    p2 = refine.resolve_profile("smoothstep像素混合", blend=10, anchor_aug=0.2, fade_ratio=0.5)
+    assert p2["pixel_blend"] and not p2["use_refine"]
+    assert p2["blend"] == 10 and p2["anchor_aug"] == 0.2   # 像素档加噪仍作用于生成期锚定
+
+    p3 = refine.resolve_profile("关闭", anchor_aug=0.3, fade_ratio=0.7)
+    assert not p3["use_refine"] and not p3["pixel_blend"]
+    assert p3["anchor_aug"] == 0.0 and p3["fade_ratio"] == 0.0
+
+
 def test_tail_anchor_index_alignment():
     # 双端锚定：尾锚=窗口末 2 token（5 帧），锚索引 = 窗口帧数 - 5，锚区恰好
     # 覆盖窗口末帧——与 storyboard frame_keyframe（5 帧钉窗口末）同模式
