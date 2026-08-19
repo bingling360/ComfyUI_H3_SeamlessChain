@@ -580,12 +580,12 @@ try:
                 description="只测不治：逐接缝量化跳变根因（时间断层/位移瞬移/颜色漂移/"
                             "内容切换/清晰度/音频爆音），输出详尽报告 + 残差伪彩对比图。"
                             "接采样器的 图像/音频/帧率，可选接「分段图像」精确定位接缝。",
-                output_node=True,
+                is_output_node=True,
                 inputs=[
                     io.Image.Input("图像", tooltip="完整链可见帧（采样器「图像」输出）"),
                     io.Audio.Input("音频", tooltip="完整链音轨（采样器「音频」输出）"),
-                    io.Image.Input("分段图像", optional=True, is_input_list=True,
-                                   tooltip="接采样器「分段图像」输出（列表）：精确定位每个接缝并"
+                    io.Image.Input("分段图像", optional=True,
+                                   tooltip="接采样器「分段图像」输出：精确定位每个接缝并"
                                            "校验拼装一致性；不接则自动检测跳变点"),
                     io.Int.Input("帧率", default=24, min=1, max=120),
                     io.Int.Input("窗口帧数", default=8, min=2, max=32,
@@ -614,7 +614,9 @@ try:
                 return v[0] if isinstance(v, list) and v else (v if v is not None else dft)
 
             fps = int(scalar(帧率, 24))
-            segs = [s for s in (分段图像 or [])
+            segs_raw = 分段图像 if isinstance(分段图像, (list, tuple)) else (
+                [] if 分段图像 is None else [分段图像])
+            segs = [s for s in segs_raw
                     if s is not None and getattr(s, "shape", None) and s.shape[0] > 0]
             wav = 音频.get("waveform") if isinstance(音频, dict) else 音频
             sr = int(音频.get("sample_rate", 0)) if isinstance(音频, dict) else 0

@@ -17,6 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                  
 
 try:
     import torch
+    if not hasattr(torch, "rand"):
+        # 合集运行时 test_node_structure 的假 torch stub 可能已在 sys.modules——视为无 torch
+        raise ImportError
 except ImportError:
     torch = None
 
@@ -26,6 +29,10 @@ if torch is not None:
         from ComfyUI_H3_SeamlessChain import qc
     from ComfyUI_H3_SeamlessChain.grid import (video_latent_t, latent_t_to_frames,
                                                audio_tokens_for_frames)
+else:
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.skip("需要真 torch（stub/无 torch 环境跳过）", allow_module_level=True)
 
 
 def _fake_lat(v_tokens, a_tokens, k0, k1, base=0.0):

@@ -7,10 +7,19 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import torch
-import torch.nn.functional as F
-
-from qc import find_cut_point
+try:
+    import torch
+    import torch.nn.functional as F  # noqa: F401
+    if not hasattr(torch, "rand"):
+        # 合集运行时 test_node_structure 的假 torch stub 可能已在 sys.modules——视为无 torch
+        raise ImportError
+    from qc import find_cut_point
+except ImportError:
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.skip("需要真 torch（stub/无 torch 环境跳过）", allow_module_level=True)
+    print("需要真 torch，本测跳过")
+    sys.exit(0)
 
 
 def _make_frames(n, h=64, w=64):

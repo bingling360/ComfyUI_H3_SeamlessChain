@@ -44,31 +44,60 @@ class FakeNested:
         return (self.video, self.audio)
 
 
+_TORCH_STUBBED = False
+
+
+def _setdefault_module(name, module):
+    """只在缺失时安装 stub：保持对象身份稳定（nodes.py 导入时绑定的模块引用
+    与 sys.modules 条目必须同一对象，否则测试补丁打在另一份上）。"""
+    if name not in sys.modules:
+        sys.modules[name] = module
+    return sys.modules[name]
+
+
 def _install_stubs(with_audio_support=False):
-    torch = types.ModuleType("torch")
-    torch.cat = lambda xs, dim=0: FakeTensor([1])
-    torch.std = lambda *a, **k: FakeTensor([1])
-    # torch.nn.functional 占位（seam_doctor 顶层 import，stub 下只需可导入）
-    torch_nn = types.ModuleType("torch.nn")
-    torch_nn_f = types.ModuleType("torch.nn.functional")
-    torch_nn_f.interpolate = lambda *a, **k: FakeTensor([1])
-    torch_nn_f.conv2d = lambda *a, **k: FakeTensor([1])
-    torch_nn.functional = torch_nn_f
-    torch.nn = torch_nn
-    sys.modules["torch"] = torch
-    sys.modules["torch.nn"] = torch_nn
-    sys.modules["torch.nn.functional"] = torch_nn_f
+    global _TORCH_STUBBED
+    try:
+        import torch as _real_torch
+        # 真 torch 带 __version__；本文件装的假 stub 不带。重复调用时
+        # sys.modules 里已是 stub，不能用 import 成功与否判断真假。
+        # 有真 torch（AutoDL/ComfyUI 环境）就不装假 stub——否则合集运行时
+        # sys.modules 污染会让 test_metrics/test_qc/test_refine/test_smart_cut
+        # 等真 torch 测试拿到假模块集体翻车
+        _TORCH_STUBBED = not hasattr(_real_torch, "__version__")
+    except ImportError:
+        _TORCH_STUBBED = True
+    if _TORCH_STUBBED:
+        torch = types.ModuleType("torch")
+        torch.cat = lambda xs, dim=0: FakeTensor([1])
+        torch.std = lambda *a, **k: FakeTensor([1])
+        # torch.nn.functional 占位（seam_doctor 顶层 import，stub 下只需可导入）
+        torch_nn = types.ModuleType("torch.nn")
+        torch_nn_f = types.ModuleType("torch.nn.functional")
+        torch_nn_f.interpolate = lambda *a, **k: FakeTensor([1])
+        torch_nn_f.conv2d = lambda *a, **k: FakeTensor([1])
+        torch_nn.functional = torch_nn_f
+        torch.nn = torch_nn
+        _setdefault_module("torch", torch)
+        _setdefault_module("torch.nn", torch_nn)
+        _setdefault_module("torch.nn.functional", torch_nn_f)
 
     nodes_mod = types.ModuleType("nodes")
     nodes_mod.common_ksampler = lambda *a, **k: ({},)
-    sys.modules["nodes"] = nodes_mod
+    _setdefault_module("nodes", nodes_mod)
 
     node_helpers = types.ModuleType("node_helpers")
 
     def conditioning_set_values(conditioning, values):
         return (conditioning[0], {**conditioning[1], **values})
     node_helpers.conditioning_set_values = conditioning_set_values
-    sys.modules["node_helpers"] = node_helpers
+    _setdefault_module("node_helpers", node_helpers)
+
+    folder_paths_mod = types.SimpleNamespace(
+        get_annotated_filepath=lambda name: name,
+        get_output_directory=lambda: "output",
+    )
+    _setdefault_module("folder_paths", folder_paths_mod)
 
     comfy = types.ModuleType("comfy")
     comfy_utils = types.ModuleType("comfy.utils")
@@ -81,8 +110,8 @@ def _install_stubs(with_audio_support=False):
             pass
     comfy_utils.ProgressBar = ProgressBar
     comfy.utils = comfy_utils
-    sys.modules["comfy"] = comfy
-    sys.modules["comfy.utils"] = comfy_utils
+    comfy = _setdefault_module("comfy", comfy)
+    _setdefault_module("comfy.utils", comfy_utils)
 
     samplers = types.ModuleType("comfy.samplers")
 
@@ -91,7 +120,7 @@ def _install_stubs(with_audio_support=False):
         SCHEDULERS = ["simple"]
     samplers.KSampler = _KS
     comfy.samplers = samplers
-    sys.modules["comfy.samplers"] = samplers
+    _setdefault_module("comfy.samplers", samplers)
 
     ldm = types.ModuleType("comfy.ldm")
     minimax = types.ModuleType("comfy.ldm.minimax")
@@ -102,17 +131,17 @@ def _install_stubs(with_audio_support=False):
         mm._ref_t_span = lambda blk: 0.0
     minimax.model = mm
     ldm.minimax = minimax
-    sys.modules["comfy.ldm"] = ldm
-    sys.modules["comfy.ldm.minimax"] = minimax
-    sys.modules["comfy.ldm.minimax.model"] = mm
+    _setdefault_module("comfy.ldm", ldm)
+    _setdefault_module("comfy.ldm.minimax", minimax)
+    _setdefault_module("comfy.ldm.minimax.model", mm)
 
     comfy_extras = types.ModuleType("comfy_extras")
     nmh = types.ModuleType("comfy_extras.nodes_minimax_h3")
     nmh.MiniMaxH3ImageToVideo = object
     nmh.MiniMaxH3ReferenceToVideo = object
     comfy_extras.nodes_minimax_h3 = nmh
-    sys.modules["comfy_extras"] = comfy_extras
-    sys.modules["comfy_extras.nodes_minimax_h3"] = nmh
+    _setdefault_module("comfy_extras", comfy_extras)
+    _setdefault_module("comfy_extras.nodes_minimax_h3", nmh)
 
     class _Any:
         def __init__(self, *a, **k):
@@ -147,8 +176,8 @@ def _install_stubs(with_audio_support=False):
     latest.io = io_mod
     latest.ComfyExtension = object
     comfy_api.latest = latest
-    sys.modules["comfy_api"] = comfy_api
-    sys.modules["comfy_api.latest"] = latest
+    _setdefault_module("comfy_api", comfy_api)
+    _setdefault_module("comfy_api.latest", latest)
 
 
 def test_structure():
@@ -156,8 +185,8 @@ def test_structure():
     cls = plugin_nodes.H3SeamlessChainSampler
     schema = cls.define_schema()
     ids = [inp.id for inp in schema.inputs]
-    for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽度", "高度",
-                "每段帧数", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
+    for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽高比", "百万像素", "宽度", "高度",
+                "每段时长", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
                 "自动存档", "存档目录", "桥帧门控", "清晰度阈值", "回退上限",
                 "接缝处理", "混合帧数",
                 "审片模式", "自动保存", "重跑起始段",
@@ -168,6 +197,10 @@ def test_structure():
                 "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
         assert key in ids, f"missing input: {key}"
     by_id = {inp.id: inp for inp in schema.inputs}
+    assert by_id["宽高比"].kwargs.get("options") == ["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"]
+    assert by_id["宽高比"].kwargs.get("default") == "16:9"
+    assert by_id["百万像素"].kwargs.get("options") == ["0.25", "0.5", "0.75", "1.0"]
+    assert by_id["每段时长"].kwargs.get("default") == 5.0
     assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
     assert by_id["种子"].kwargs.get("control_after_generate") is True
     assert by_id["自动存档"].kwargs.get("options") == ["关闭", "自动存档"]
@@ -234,7 +267,9 @@ class _FakeMask:
 def test_bridge_fallback_probe():
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
     mm = sys.modules["comfy.ldm.minimax.model"]
-    sys.modules["torch"].zeros = lambda *a, **k: FakeTensor(list(a))
+    if _TORCH_STUBBED:
+        # 假 torch 没有 zeros，补一个；真 torch 自带且不能覆盖（会污染后续真 torch 测试）
+        sys.modules["torch"].zeros = lambda *a, **k: FakeTensor(list(a))
 
     def layout_with(cond_rows):
         return lambda *a, **k: types.SimpleNamespace(img_update=_FakeMask(cond_rows))
@@ -322,7 +357,8 @@ def test_run_validation():
     from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes
     cls = plugin_nodes.H3SeamlessChainSampler
     common = {"模型": None, "文本编码器": _Clip(), "视频VAE": None, "音频VAE": None,
-              "宽度": 864, "高度": 480, "每段帧数": 124, "引导帧数": 22,
+              "宽高比": "自定义", "百万像素": "0.5", "宽度": 864, "高度": 480, "每段时长": 5.0,
+              "引导帧数": 22,
               "种子": 0, "步数": 25, "CFG": 1.0, "采样器": "res_multistep", "调度器": "simple"}
     try:
         cls.execute(**common, 提示词组={"提示词_1": "  ", "提示词_2": ""})

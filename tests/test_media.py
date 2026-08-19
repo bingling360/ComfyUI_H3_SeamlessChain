@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import av
     import torch
-    _HAS = True
+    # 合集运行时 test_node_structure 的假 torch stub 可能已在 sys.modules——视为缺失
+    _HAS = hasattr(torch, "rand")
 except Exception:
     _HAS = False
 

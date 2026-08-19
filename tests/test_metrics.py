@@ -14,6 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 try:
     import torch
+    if not hasattr(torch, "manual_seed"):
+        # 合集运行时 test_node_structure 的假 torch stub 可能已在 sys.modules——视为无 torch
+        raise ImportError
 except ImportError:
     torch = None
 

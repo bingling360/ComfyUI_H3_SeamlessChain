@@ -12,11 +12,20 @@ import math
 import os
 import sys
 
-import torch
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import seam_doctor as sd
+try:
+    import torch
+    if not hasattr(torch, "meshgrid"):
+        # 合集运行时 test_node_structure 的假 torch stub 可能已在 sys.modules——视为无 torch
+        raise ImportError
+    import seam_doctor as sd
+except ImportError:
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.skip("需要真 torch（stub/无 torch 环境跳过）", allow_module_level=True)
+    print("需要真 torch，本测跳过")
+    sys.exit(0)
 
 W, H = 96, 64
 _grid = torch.meshgrid(torch.arange(H).float(), torch.arange(W).float(), indexing="ij")

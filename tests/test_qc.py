@@ -6,6 +6,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import torch
+    if not hasattr(torch, "arange"):
+        # 合集运行时 test_node_structure 的假 torch stub 可能已在 sys.modules——视为无 torch
+        raise ImportError
     from qc import (frame_scores, pick_backtrack, seam_metrics,
                     smoothstep_blend_head, smoothstep_fade_head, loudness_align_head)
 except ImportError:
