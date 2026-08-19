@@ -36,9 +36,15 @@ def safe_relfile(rel):
 
 
 def add_routes(routes):
-    """挂到 PromptServer routes（aiohttp）；由 __init__.py 的扩展钩子调用。"""
+    """把删除路由挂到 routes 对象（aiohttp）。
 
-    @routes.post("/h3chain/delete")
+    routes 可能是：
+    - web.RouteTableDef（自定义节点标准写法，支持 routes.post 装饰器）
+    - app.router（UrlDispatcher，运行中的真实路由表，用 add_post 方法）——
+      ComfyUI 0.33.x 在 custom node 导入前已 app.add_routes(routes)，
+      直接挂到 app.router 才能绕过挂载时序问题。
+    """
+
     async def delete(request):
         data = await request.json()
         if "file" not in data:
@@ -51,7 +57,6 @@ def add_routes(routes):
         os.remove(target)
         return web.json_response({"ok": True})
 
-    @routes.post("/h3chain/delete_archive")
     async def delete_archive(request):
         data = await request.json()
         name = safe_name(data.get("dir"))
@@ -77,6 +82,18 @@ def add_routes(routes):
         if not deleted:
             return web.json_response({"error": "存档目录不存在"}, status=404)
         return web.json_response({"ok": True, "deleted": deleted})
+
+    # 兼容 RouteTableDef（.post 装饰器）与 UrlDispatcher（app.router，add_post 方法）
+    if hasattr(routes, "add_post"):
+        # 运行中真实路由表（ComfyUI 0.33.x 优先走这里）
+        routes.add_post("/h3chain/delete", delete)
+        routes.add_post("/h3chain/delete_archive", delete_archive)
+    elif hasattr(routes, "post"):
+        # RouteTableDef 装饰器写法（旧版 ComfyUI）
+        routes.post("/h3chain/delete")(delete)
+        routes.post("/h3chain/delete_archive")(delete_archive)
+    else:
+        raise TypeError("add_routes: 不支持的 routes 类型 %r" % type(routes))
 
 
 def register(routes=None):

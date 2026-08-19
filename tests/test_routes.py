@@ -200,6 +200,42 @@ def test_register_prefers_app_router():
             del sys.modules["server"]
 
 
+class _RouterAddPost:
+    """模拟 aiohttp 的 UrlDispatcher（app.router）：只有 add_post，没有 .post 装饰器。"""
+    def __init__(self):
+        self.table = {}
+
+    def add_post(self, path, handler):
+        self.table[path] = handler
+
+
+def test_add_routes_on_app_router():
+    """add_routes 应支持 UrlDispatcher（app.router）的 add_post，而非仅 RouteTableDef.post。
+
+    此前用 @routes.post 装饰器，对 app.router 会抛 AttributeError 并回退到未装载的
+    RouteTableDef，导致 404。此测试保证 app.router 路径真正挂上 handler。
+    """
+    with _server_env():
+        router = _RouterAddPost()
+        from ComfyUI_H3_SeamlessChain import routes
+        routes.add_routes(router)
+        assert set(router.table) == {"/h3chain/delete", "/h3chain/delete_archive"}
+        # handler 真实可用：缺参 400
+        assert asyncio.run(router.table["/h3chain/delete"](_Req({})))["status"] == 400
+        # 不存在的存档 404
+        assert asyncio.run(router.table["/h3chain/delete_archive"](_Req({"dir": "nope"})))["status"] == 404
+
+
+def test_add_routes_rejects_unknown_type():
+    with _server_env():
+        from ComfyUI_H3_SeamlessChain import routes
+        try:
+            routes.add_routes(object())
+            assert False, "expected TypeError"
+        except TypeError:
+            pass
+
+
 if __name__ == "__main__":
     _install_stubs(with_audio_support=False)
     for name, fn in sorted(globals().items()):
