@@ -7,8 +7,8 @@ $dst = 'D:\本地部署文件集合\comfyui\comfy shili\ComfyUI\ComfyUI\custom_n
 
 if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Force -Path $dst | Out-Null }
 
-# Clear the target first (keep the folder itself) to avoid stale old files
-Get-ChildItem $dst -Recurse -Force | Remove-Item -Recurse -Force
+# Clear the target first (keep the folder itself and its .git) to avoid stale old files
+Get-ChildItem $dst -Force | Where-Object { $_.Name -ne '.git' } | Remove-Item -Recurse -Force
 
 $dirs = @('', 'web', 'tests', 'example_workflows')
 foreach ($d in $dirs) {

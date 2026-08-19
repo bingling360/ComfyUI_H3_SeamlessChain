@@ -2,12 +2,17 @@
  *
  * 打开导演台时若画布上没有 H3SeamlessChainSampler，可一键载入本模板：
  * - 模型加载器（ref2va UNET / Qwen3-VL CLIP / 视频+音频 VAE）+ 主节点 + 成片保存
+ * - 提示词×3（PrimitiveStringMultiline 隐藏预连线到「提示词组」）：导演台 JSON 优先，
+ *   画布节点作为镜像/兜底——没有导演台状态也能直接跑
+ * - 分段输出链：分段图像+分段音频 → Create Video → Save Video，
+ *   每段自动落盘 output/h3_segments/seg_*.mp4（output list 逐段展开）
  * - 「素材池 · 自动管理」节点组：首帧图 + 参考图×9 + 参考视频×3 + 参考音频×3
  *   全部预连线到主节点对应输入槽；不用时 mode=2(Never)+折叠 = 隐藏但连线常驻，
  *   导演台上传/删除素材时点亮/隐藏对应节点（连线与配置保留，不动态建线）
- * - 提示词不走画布（状态驱动：导演台 JSON 优先），故不预置提示词节点
  *
- * 注意：主节点 widgets_values 顺序须与 nodes.py define_schema 的 widget 顺序一致。
+ * 注意：主节点 widgets_values 顺序须与 nodes.py define_schema 的 widget 顺序一致；
+ *      inputs 数组顺序与 define_schema 的输入槽位顺序一致（模型/编码器/VAE×2/
+ *      首帧/起始视频/起始音轨/提示词组/参考图片组/参考视频组/参考音轨组/参考音频组）。
  */
 (function () {
   "use strict";
@@ -31,11 +36,8 @@
     return Object.assign({ name, type, link }, extra || {});
   }
 
-  function refSlot(idx, type, link) {
+  function refSlot(group, idx, type, link) {
     // autogrow 组输入槽：label=短名，name=组.槽名
-    const group = type === "IMAGE" && idx.startsWith("参考图片") ? "参考图片组"
-      : idx.startsWith("参考视频音轨") ? "参考视频音轨组"
-        : idx.startsWith("参考视频") ? "参考视频组" : "参考音频组";
     return { label: idx, name: `${group}.${idx}`, shape: 7, type, link };
   }
 
@@ -75,16 +77,22 @@
   };
   nodes.push(unet, clip, vaeV, vaeA);
 
-  // ---- 主节点：预声明全部素材输入槽（连线常驻） ----
+  // ---- 主节点：全部输入槽按 schema 顺序预声明（连线常驻） ----
+  // 槽位：0 模型 1 文本编码器 2 视频VAE 3 音频VAE 4 首帧图片 5 起始视频 6 起始视频音轨
+  //       7..9 提示词_0..2（autogrow 全组 0 起编号）  10..18 参考图片_0..8
+  //       19..21 参考视频_0..2  22..24 参考视频音轨_0..2  25..27 参考音频_0..2
   const h3Inputs = [
     inp("模型", "MODEL", L(1, 0, 10, 0, "MODEL")),
     inp("文本编码器", "CLIP", L(2, 0, 10, 1, "CLIP")),
     inp("视频VAE", "VAE", L(3, 0, 10, 2, "VAE")),
     inp("音频VAE", "VAE", L(4, 0, 10, 3, "VAE")),
+    inp("首帧图片", "IMAGE", null),
+    inp("起始视频", "IMAGE", null),
+    inp("起始视频音轨", "AUDIO", null),
   ];
   const h3 = {
     id: 10, type: H3, title: "H3 Seamless Chain · 导演台主节点",
-    pos: [40, 40], size: [720, 1020], flags: {}, order: 10, mode: 0,
+    pos: [40, 40], size: [720, 1180], flags: {}, order: 10, mode: 0,
     inputs: h3Inputs,
     outputs: [
       inp("图像", "IMAGE", null),
@@ -99,7 +107,7 @@
   };
   nodes.push(h3);
 
-  // ---- 成片保存 ----
+  // ---- 成片保存（完整链） ----
   const saver = {
     id: 11, type: "H3ChainSaver", title: "成片保存（自动落盘+画廊）",
     pos: [900, 120], size: [380, 220], flags: {}, order: 11, mode: 0,
@@ -113,6 +121,27 @@
   };
   nodes.push(saver);
 
+  // ---- 分段输出链：分段图像/音频（output list 逐段展开）→ CreateVideo → SaveVideo ----
+  nodes.push({
+    id: 60, type: "CreateVideo", title: "分段打包（每段一个视频）",
+    pos: [900, 420], size: [340, 180], flags: {}, order: 12, mode: 0,
+    inputs: [
+      inp("images", "IMAGE", L(10, 4, 60, 0, "IMAGE")),
+      inp("audio", "AUDIO", L(10, 5, 60, 1, "AUDIO")),
+    ],
+    outputs: [inp("VIDEO", "VIDEO", null)],
+    properties: { "Node name for S&R": "CreateVideo" },
+    widgets_values: [24.0, 8],
+  });
+  nodes.push({
+    id: 61, type: "SaveVideo", title: "分段落盘 → output/h3_segments/",
+    pos: [900, 640], size: [340, 200], flags: {}, order: 13, mode: 0,
+    inputs: [inp("video", "VIDEO", L(60, 0, 61, 0, "VIDEO"))],
+    outputs: [inp("video", "VIDEO", null)],
+    properties: { "Node name for S&R": "SaveVideo" },
+    widgets_values: ["h3_segments/seg", "auto"],
+  });
+
   // ---- 素材池 · 自动管理（mode=2 隐藏 + 折叠，连线常驻） ----
   function hiddenNode(id, type, title, pos, widgets, outputs) {
     return {
@@ -125,34 +154,45 @@
     inp("MASK", "MASK", null),
   ];
 
-  // 首帧图（槽位 4）
-  nodes.push(hiddenNode(20, "LoadImage", "首帧图", [40, 1160], ["", "image"],
-    imgOut(L(20, 0, 10, 4, "IMAGE"))));
-  h3Inputs.push(inp("首帧图片", "IMAGE", null));
+  // 提示词×3（槽位 7..9，autogrow 槽名 0 起编号：提示词_0..2）：导演台 JSON 优先，画布为镜像/兜底
+  for (let i = 0; i < 3; i++) {
+    const id = 50 + i;
+    const lid = L(id, 0, 10, 7 + i, "STRING");
+    nodes.push(hiddenNode(id, "PrimitiveStringMultiline", `提示词·${i + 1}`,
+      [40 + i * 330, 1330], [i === 0 ? "示例段落：黄昏的海边小镇，海浪轻拍礁石，镜头缓缓推近灯塔" : ""],
+      [inp("STRING", "STRING", lid)]));
+    h3Inputs.push(refSlot("提示词组", `提示词_${i}`, "STRING", lid));
+  }
 
-  // 参考图·1..9（槽位 5..13）
+  // 首帧图（槽位 4，输入已在主节点预声明，这里回填连线）
+  const ffLid = L(20, 0, 10, 4, "IMAGE");
+  h3Inputs[4].link = ffLid;
+  nodes.push(hiddenNode(20, "LoadImage", "首帧图", [40, 1660], ["", "image"],
+    imgOut(ffLid)));
+
+  // 参考图·1..9（槽位 10..18）
   for (let i = 0; i < 9; i++) {
     const id = 21 + i;
     const col = i % 3, row = Math.floor(i / 3);
-    const slot = 5 + i;
-    const lid = L(id, 0, 10, slot, "IMAGE");
+    const lid = L(id, 0, 10, 10 + i, "IMAGE");
     nodes.push(hiddenNode(id, "LoadImage", `参考图·${i + 1}`,
-      [380 + col * 320, 1160 + row * 340], ["", "image"], imgOut(lid)));
-    h3Inputs.push(refSlot(`参考图片_${i}`, "IMAGE", lid));
+      [380 + col * 320, 1660 + row * 340], ["", "image"], imgOut(lid)));
+    h3Inputs.push(refSlot("参考图片组", `参考图片_${i}`, "IMAGE", lid));
   }
 
-  // 参考视频×3 + 配套 GetVideoComponents（槽位 14..16 图像 / 17..19 音轨）
+  // 参考视频×3 + 配套 GetVideoComponents（槽位 19..21 图像 / 22..24 音轨，先视频组后音轨组）
   for (let k = 0; k < 3; k++) {
     const lvId = 30 + k, gvcId = 33 + k;
-    const imgLid = L(gvcId, 0, 10, 14 + k, "IMAGE");
-    const audLid = L(gvcId, 1, 10, 17 + k, "AUDIO");
+    const imgLid = L(gvcId, 0, 10, 19 + k, "IMAGE");
+    const audLid = L(gvcId, 1, 10, 22 + k, "AUDIO");
+    const lvLid = L(lvId, 0, gvcId, 0, "VIDEO");
     nodes.push(hiddenNode(lvId, "LoadVideo", `参考视频·${k + 1}`,
-      [1380, 1160 + k * 240], [""],
-      [inp("video", "VIDEO", L(lvId, 0, gvcId, 0, "VIDEO"))]));
+      [1380, 1660 + k * 240], [""],
+      [inp("video", "VIDEO", lvLid)]));
     nodes.push({
       id: gvcId, type: "GetVideoComponents", title: `拆分视频·${k + 1}`,
-      pos: [1700, 1160 + k * 240], size: [280, 150], flags: { collapsed: true }, order: 6, mode: 2,
-      inputs: [inp("video", "VIDEO", null)],
+      pos: [1700, 1660 + k * 240], size: [280, 150], flags: { collapsed: true }, order: 6, mode: 2,
+      inputs: [inp("video", "VIDEO", lvLid)],
       outputs: [
         inp("images", "IMAGE", imgLid),
         inp("audio", "AUDIO", audLid),
@@ -161,45 +201,67 @@
       ],
       properties: { "Node name for S&R": "GetVideoComponents" }, widgets_values: [],
     });
-    h3Inputs.push(refSlot(`参考视频_${k}`, "IMAGE", imgLid));
-    h3Inputs.push(refSlot(`参考视频音轨_${k}`, "AUDIO", audLid));
+  }
+  // 槽位顺序须与后端 schema 声明一致：参考视频组 0..2 先、参考视频音轨组 0..2 后
+  for (let k = 0; k < 3; k++) {
+    const gvcId = 33 + k;
+    h3Inputs.push(refSlot("参考视频组", `参考视频_${k}`, "IMAGE",
+      links.find((l) => l[1] === gvcId && l[2] === 0 && l[3] === 10)[0]));
+  }
+  for (let k = 0; k < 3; k++) {
+    const gvcId = 33 + k;
+    h3Inputs.push(refSlot("参考视频音轨组", `参考视频音轨_${k}`, "AUDIO",
+      links.find((l) => l[1] === gvcId && l[2] === 1 && l[3] === 10)[0]));
   }
 
-  // 参考音频×3（槽位 20..22）
+  // 参考音频×3（槽位 25..27）
   for (let k = 0; k < 3; k++) {
     const id = 36 + k;
-    const lid = L(id, 0, 10, 20 + k, "AUDIO");
+    const lid = L(id, 0, 10, 25 + k, "AUDIO");
     nodes.push(hiddenNode(id, "LoadAudio", `参考音频·${k + 1}`,
-      [2040, 1160 + k * 240], [""], [inp("audio", "AUDIO", lid), inp("name", "STRING", null)]));
-    h3Inputs.push(refSlot(`参考音频_${k}`, "AUDIO", lid));
+      [2040, 1660 + k * 240], [""], [inp("audio", "AUDIO", lid), inp("name", "STRING", null)]));
+    h3Inputs.push(refSlot("参考音频组", `参考音频_${k}`, "AUDIO", lid));
   }
 
   // ---- 使用说明 ----
   nodes.push({
     id: 40, type: "MarkdownNote", title: "导演台使用说明",
-    pos: [40, 2320], size: [620, 320], flags: {}, order: 12, mode: 0,
+    pos: [40, 2820], size: [620, 380], flags: {}, order: 14, mode: 0,
     inputs: [], outputs: [], properties: {}, widgets_values: [
       "# H3 长片导演台 · 配套工作流\n\n" +
       "- 生成控制在左侧「长片导演台」侧栏：提示词/素材/参数一体化，无需手动连点节点\n" +
+      "- 提示词走导演台状态（JSON 优先）；「提示词·1..3」隐藏节点是画布镜像兼兜底，" +
+      "没有导演台状态时按画布内容直接跑\n" +
       "- 「素材池 · 自动管理」组的节点由导演台自动点亮/隐藏：**连线常驻，不用时只是隐藏**，请勿删除\n" +
+      "- 每段结果两条路可见：output/h3_segments/seg_*.mp4（分段落盘链）与" +
+      "output/h3_auto/（审片/自动保存）；导演台段卡片可直接预览\n" +
       "- 默认 ref2va UNET（多参模式）；纯文生/首帧模式请在导演台切换，或把 UNETLoader 换成 fl2va 权重\n" +
       "- 每段时长/宽高比/百万像素/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」",
     ],
   });
 
+  // 源输出槽回指连线 id（links 数组为现代格式，link 为兼容旧版/校验用）
+  for (const [lid, sid, sslot] of links) {
+    const src = nodes.find((n) => n.id === sid);
+    if (src && src.outputs[sslot]) {
+      src.outputs[sslot].link = lid;
+      src.outputs[sslot].links = [lid];
+    }
+  }
+
   window.H3_DEFAULT_WORKFLOW = {
     id: "h3-chain-director-default",
-    revision: 0,
-    last_node_id: 40,
+    revision: 1,
+    last_node_id: 61,
     last_link_id: linkId,
     nodes,
     links,
     groups: [
       { id: 1, title: "模型加载", bounding: [-760, 0, 720, 620], color: "#3f789e", flags: {} },
-      { id: 2, title: "导演台主链", bounding: [0, 0, 820, 1100], color: "#88A", flags: {} },
+      { id: 2, title: "导演台主链", bounding: [0, 0, 1260, 1100], color: "#88A", flags: {} },
       {
-        id: 3, title: "素材池 · 自动管理（导演台控制，勿删；隐藏=未使用）",
-        bounding: [0, 1100, 2360, 1180], color: "#b58b2a", flags: {},
+        id: 3, title: "素材池与提示词 · 自动管理（导演台控制，勿删；隐藏=未使用）",
+        bounding: [0, 1290, 2360, 1450], color: "#b58b2a", flags: {},
       },
     ],
     config: {},

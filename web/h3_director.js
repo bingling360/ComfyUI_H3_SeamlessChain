@@ -1,33 +1,36 @@
 /**
  * H3 Seamless Chain —— 「长片导演台」（全屏一体化控制台 + 侧栏迷你入口）
  *
- * 参照「H3 一体化总控导演台」状态驱动架构：所有输入（模式/提示词/首帧/参考图）
- * 存入节点「导演台状态」JSON widget，节点 execute 读取 JSON 加载素材，
- * 不在画布上创建/连接任何辅助节点（LoadImage / PrimitiveStringMultiline）。
+ * 参照「H3 一体化总控导演台」状态驱动架构：所有输入（模式/提示词/首帧/参考素材）
+ * 存入节点「导演台状态」JSON widget，节点 execute 读取 JSON 加载素材；
+ * 画布节点只作镜像/兜底（配套工作流的常驻隐藏节点），不在画布上动态建线。
  *
  * 状态 JSON schema v2（存入「导演台状态」widget）：
  *   { mode:"文生视频"|"首帧视频"|"多参视频",
  *     prompts:["段1文本","段2文本",...],
  *     first_frame:"input目录下的文件名",
- *     ref_assets:[ { file:"文件名", label:"角色1" }, ... ],   // 标签素材池（真源）
- *     ref_images:["文件名1",...],                             // 兼容保留 = ref_assets 的文件序列
+ *     ref_assets:[ { file:"文件名", kind:"image"|"video"|"audio", label:"角色1" }, ... ],
+ *                                // 标签素材池（真源，三类混排；官方单段上限 图9/视3/音3）
+ *     ref_images:["文件名1",...], // 兼容保留 = ref_assets 中图片类文件的序列
  *     segments:[
  *       { scene_prompt:"场景描述", character_prompt:"角色描述",
  *         seconds:6.5,        // 本段时长（秒），null=跟随节点「每段时长」默认
- *         refs:["角色1","场景1"] },  // 本段引用的素材标签，[]=引用全部
+ *         refs:["角色1","场景1"] },  // 本段引用的素材标签（跨类别），[]=引用全部
  *       ...
  *     ] }
  *
- * 标签引用：提示词写 [[角色1]]，后端按段压实重编号为 <Picture k>；
- * 原生 <Picture N> 写法继续兼容。v1 状态（只有 ref_images）自动迁移默认标签「图片N」。
+ * 标签引用：提示词写 [[角色1]]，后端按段按类别压实重编号（图→<Picture k>、视→<Video k>、
+ * 音→<Audio j>）；原生 token 写法继续兼容。v1 状态（只有 ref_images）自动迁移为图片类。
+ * 段级注入：未勾选的素材完全不进该段 conditioning；参考视频的原声自动配对成 <Audio j>。
  *
  * 模式互斥在 JSON 层完成：切模式即清空不相容字段，后端复验不匹配报错。
  * 分段处理中心：segments 与 prompts 等长，每段的 scene_prompt/character_prompt
  * 由后端组合到该段主提示词前（scene → character → 主提示词），不影响核心采样。
  *
  * 配套工作流（web/h3_default_workflow.js）：画布无 H3 节点时可一键载入官方风格
- * 预置工作流；「素材池 · 自动管理」组的 LoadImage 常驻预连，导演台上传素材时
- * 点亮对应节点（mode=0），删除时隐藏（mode=2+折叠）——连线始终存在，只做显隐。
+ * 预置工作流（含提示词×3 镜像 + 分段输出链 CreateVideo→SaveVideo）；
+ * 「素材池 · 自动管理」组的 LoadImage/LoadVideo/LoadAudio 常驻预连，导演台上传
+ * 素材时点亮对应节点（mode=0），删除时隐藏（mode=2+折叠）——连线始终存在，只做显隐。
  */
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
@@ -49,6 +52,13 @@ const AR_LIST = ["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"];
 const AR_RATIO = { "21:9": 21 / 9, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4, "1:1": 1 };
 const MP_LIST = ["0.25", "0.5", "0.75", "1.0"];
 const QUICK_LABELS = ["角色1", "角色2", "场景1", "场景2", "风格", "道具"];
+/* 素材类别：与后端 REF_CAPS/_KIND_NAME 对齐（官方单段上限 图9/视3/音3） */
+const KIND_LIST = ["image", "video", "audio"];
+const KIND_NAME = { image: "图片", video: "视频", audio: "音频" };
+const KIND_ICON = { image: "🖼", video: "🎞", audio: "🎵" };
+const KIND_TOKEN = { image: "Picture", video: "Video", audio: "Audio" };
+const KIND_CAPS = { image: 9, video: 3, audio: 3 };
+const KIND_ACCEPT = { image: "image/*", video: "video/*", audio: "audio/*" };
 /* 引用语模板库：插入到提示词光标处，[[标签]] 由后端按段压实为 <Picture k> */
 const REF_TEMPLATES = [
     ["插入 [[标签]]", (l) => `[[${l}]]`],
@@ -61,7 +71,7 @@ const REF_TEMPLATES = [
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
     ["首帧视频", "首帧", "首帧图片起手，fl2va UNET"],
-    ["多参视频", "多参", "参考图片，ref2va UNET，提示词用 <Picture 1..9>"],
+    ["多参视频", "多参", "参考图/视频/音频，ref2va UNET，[[标签]] 引用"],
 ];
 const MODE_DEFAULT = "文生视频";
 const MAX_SEG = 64;
@@ -71,7 +81,6 @@ let miniBox = null;
 let desk = null;
 let pendingReset = false;
 let refreshTimer = null;
-let deleteRouteOk = true;
 let ledPhase = "idle";
 let ledText = "待命";
 
@@ -326,18 +335,25 @@ function getDs(node) {
         const raw = w.value ? JSON.parse(w.value) : {};
         const prompts = Array.isArray(raw.prompts) && raw.prompts.length ? raw.prompts.map(String) : [""];
 
-        /* v2 标签素材池；v1（只有 ref_images）自动迁移默认标签「图片N」 */
+        /* v2 标签素材池（含 kind 三类）；v1（只有 ref_images）自动迁移为图片 */
         let refAssets = Array.isArray(raw.ref_assets)
             ? raw.ref_assets.filter((a) => a && typeof a === "object" && a.file)
-                .map((a) => ({ file: String(a.file), label: cleanLabel(a.label) || "" }))
+                .map((a) => ({
+                    file: String(a.file),
+                    kind: KIND_LIST.includes(a.kind) ? a.kind : "image",
+                    label: cleanLabel(a.label) || "",
+                }))
             : null;
         if (!refAssets) {
             const legacy = Array.isArray(raw.ref_images) ? raw.ref_images.filter(String).map(String) : [];
-            refAssets = legacy.map((file, i) => ({ file, label: `图片${i + 1}` }));
+            refAssets = legacy.map((file) => ({ file, kind: "image", label: "" }));
         }
+        const kindCount = { image: 0, video: 0, audio: 0 };
+        refAssets.forEach((a) => {
+            if (!a.label) { kindCount[a.kind] += 1; a.label = `${KIND_NAME[a.kind]}${kindCount[a.kind]}`; }
+        });
         const taken = new Set();
         refAssets.forEach((a) => {
-            a.label = cleanLabel(a.label) || `图片${taken.size + 1}`;
             a.label = uniqueLabelFrom(taken, a.label);
             taken.add(a.label);
         });
@@ -359,7 +375,7 @@ function getDs(node) {
             mode: MODES.some(([m]) => m === raw.mode) ? raw.mode : MODE_DEFAULT,
             prompts,
             first_frame: typeof raw.first_frame === "string" ? raw.first_frame : "",
-            ref_images: refAssets.map((a) => a.file),
+            ref_images: refAssets.filter((a) => a.kind === "image").map((a) => a.file),
             ref_assets: refAssets,
             segments,
         };
@@ -371,10 +387,11 @@ function getDs(node) {
 function setDs(node, ds) {
     const w = (node.widgets || []).find((x) => x.name === W_DS);
     if (!w) return false;
-    /* ref_images 兼容字段 = ref_assets 文件序列（旧版前端/后端仍可读） */
+    /* ref_images 兼容字段 = ref_assets 图片类文件序列（旧版前端/后端仍可读） */
     if (Array.isArray(ds.ref_assets)) {
         ds.ref_assets = ds.ref_assets.filter((a) => a && a.file);
-        ds.ref_images = ds.ref_assets.map((a) => String(a.file));
+        ds.ref_images = ds.ref_assets.filter((a) => (a.kind || "image") === "image")
+            .map((a) => String(a.file));
     }
     w.value = JSON.stringify(ds);
     if (typeof w.callback === "function") {
@@ -382,6 +399,7 @@ function setDs(node, ds) {
     }
     node.setDirtyCanvas(true, true);
     node.graph?.change?.();
+    syncMirrors(node, ds);   // 状态写入统一同步画布镜像（提示词/首帧/素材，幂等）
     return true;
 }
 
@@ -486,15 +504,29 @@ function setSegmentSeconds(node, idx, v) {
     return true;
 }
 
-/** 勾选/取消本段引用的素材标签；全部取消 = 引用全部（与后端约定一致） */
+/** 勾选/取消本段引用的素材标签；全部取消 = 引用全部（与后端约定一致）。
+ *  勾选时按类别校验官方单段上限（图9/视3/音3），超限拦截并提示。 */
 function toggleSegmentRef(node, idx, label) {
     const ds = getDs(node);
     if (idx < 0 || idx >= (ds.segments || []).length) return;
     const seg = ds.segments[idx];
     if (!Array.isArray(seg.refs)) seg.refs = [];
     const pos = seg.refs.indexOf(label);
-    if (pos >= 0) seg.refs.splice(pos, 1);
-    else seg.refs.push(label);
+    if (pos >= 0) {
+        seg.refs.splice(pos, 1);
+    } else {
+        const asset = (ds.ref_assets || []).find((a) => a.label === label);
+        const kind = asset ? asset.kind : "image";
+        const sameKind = seg.refs.filter((l) => {
+            const a = (ds.ref_assets || []).find((x) => x.label === l);
+            return a && a.kind === kind;
+        }).length;
+        if (sameKind >= KIND_CAPS[kind]) {
+            alert(`本段引用${KIND_NAME[kind]}素材已达官方上限 ${KIND_CAPS[kind]} 个：请先取消一个再勾选「${label}」`);
+            return;
+        }
+        seg.refs.push(label);
+    }
     setDs(node, ds);
 }
 
@@ -508,12 +540,14 @@ function setFirstFrame(node, filename) {
     scheduleRefresh(120);
 }
 
-function addRefImage(node, filename) {
+function addAsset(node, kind, filename) {
+    const k = KIND_LIST.includes(kind) ? kind : "image";
     const ds = getDs(node);
-    if (ds.ref_assets.length >= 9) { alert("参考图片最多 9 张"); return; }
+    const sameKind = ds.ref_assets.filter((a) => a.kind === k).length;
+    if (sameKind >= KIND_CAPS[k]) { alert(`${KIND_NAME[k]}素材最多 ${KIND_CAPS[k]} 个（官方单段上限）`); return; }
     const taken = new Set(ds.ref_assets.map((a) => a.label));
-    const label = uniqueLabelFrom(taken, `图片${ds.ref_assets.length + 1}`);
-    ds.ref_assets.push({ file: filename, label });
+    const label = uniqueLabelFrom(taken, `${KIND_NAME[k]}${sameKind + 1}`);
+    ds.ref_assets.push({ file: filename, kind: k, label });
     setDs(node, ds);
     syncMirrors(node, ds);
     scheduleRefresh(120);
@@ -560,37 +594,61 @@ function removeFirstFrame(node) {
     scheduleRefresh(120);
 }
 
-/* ---- 配套工作流：素材节点镜像（连线常驻，仅切换 点亮/隐藏） ---- */
+/* ---- 配套工作流：素材/提示词节点镜像（连线常驻，仅切换 点亮/隐藏） ---- */
 
 function mirrorNodeByTitle(title) {
     return (app.graph?._nodes || []).find((n) => n.getTitle?.() === title || n.title === title) || null;
 }
 
-/** 点亮/隐藏配套工作流的素材节点：有图=mode0+展开，无图=mode2+折叠（连线与配置保留） */
-function setMirrorImage(title, filename) {
+/** 点亮/隐藏配套工作流节点并同步其值：有值=mode0+展开，无值=mode2+折叠（连线与配置保留）。
+ *  widgetNames 为候选控件名列表（LoadImage=image / LoadVideo=file / LoadAudio=audio / Primitive=value），
+ *  都找不到时退回第一个控件。 */
+function setMirrorNode(title, value, widgetNames) {
     const m = mirrorNodeByTitle(title);
     if (!m) return false;
-    const w = (m.widgets || []).find((x) => x.name === "image") || (m.widgets || [])[0];
-    if (w && filename && String(w.value ?? "") !== String(filename)) {
-        w.value = filename;
-        if (typeof w.callback === "function") { try { w.callback(filename); } catch (e) { /* 可选 */ } }
+    let w = null;
+    for (const n of (widgetNames || [])) {
+        w = (m.widgets || []).find((x) => x.name === n);
+        if (w) break;
     }
-    const want = filename ? 0 : 2;
+    w = w || (m.widgets || [])[0];
+    if (w && value && String(w.value ?? "") !== String(value)) {
+        w.value = value;
+        if (typeof w.callback === "function") { try { w.callback(value); } catch (e) { /* 可选 */ } }
+    }
+    const want = value ? 0 : 2;
     if (m.mode !== want) m.mode = want;
     m.flags = m.flags || {};
-    m.flags.collapsed = !filename;
+    m.flags.collapsed = !value;
     m.setDirtyCanvas?.(true, true);
     return true;
 }
 
-/** 全量同步镜像：首帧图 + 参考图·1..9（仅导演台素材操作时调用，不动手摆工作流） */
+/** 全量同步镜像：首帧图 + 参考图·1..9 + 参考视频·1..3（联动拆分视频）+ 参考音频·1..3 + 提示词·1..3。
+ *  仅导演台素材/提示词操作时调用，不动手摆工作流（找不到同名节点=手摆，静默跳过）。 */
 function syncMirrors(node, ds) {
     if (!node || !ds) return;
-    setMirrorImage("首帧图", ds.mode === "首帧视频" ? (ds.first_frame || "") : "");
-    const refs = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+    const byKind = (k) => (Array.isArray(ds.ref_assets) ? ds.ref_assets.filter((a) => a.kind === k) : []);
+    setMirrorNode("首帧图", ds.mode === "首帧视频" ? (ds.first_frame || "") : "", ["image"]);
+    const multi = ds.mode === "多参视频";
+    const imgs = multi ? byKind("image") : [];
     for (let i = 0; i < 9; i++) {
-        const active = ds.mode === "多参视频" && refs[i] ? String(refs[i].file) : "";
-        setMirrorImage(`参考图·${i + 1}`, active);
+        setMirrorNode(`参考图·${i + 1}`, imgs[i] ? String(imgs[i].file) : "", ["image"]);
+    }
+    const vids = multi ? byKind("video") : [];
+    for (let i = 0; i < 3; i++) {
+        const f = vids[i] ? String(vids[i].file) : "";
+        setMirrorNode(`参考视频·${i + 1}`, f, ["file"]);
+        setMirrorNode(`拆分视频·${i + 1}`, f);   // 与 LoadVideo 同步点亮/隐藏（hidden=断链）
+    }
+    const auds = multi ? byKind("audio") : [];
+    for (let i = 0; i < 3; i++) {
+        setMirrorNode(`参考音频·${i + 1}`, auds[i] ? String(auds[i].file) : "", ["audio"]);
+    }
+    const prompts = Array.isArray(ds.prompts) ? ds.prompts.map((p) => String(p || "")) : [];
+    for (let i = 0; i < 3; i++) {
+        const t = prompts[i] && prompts[i].trim() ? prompts[i] : "";
+        setMirrorNode(`提示词·${i + 1}`, t, ["value"]);
     }
 }
 
@@ -614,12 +672,14 @@ async function loadDefaultWorkflow() {
     scheduleRefresh(300);
 }
 
-async function pickImage(target) {
+/** 文件选择 + 上传：target="first"=首帧图；kind=image/video/audio=入素材池。
+ *  上传统一走 /upload/image（服务端按原样字节写入 input 目录，不限图片）。 */
+async function pickAsset(target, kind) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = "image/*";
+    input.accept = target === "first" ? "image/*" : KIND_ACCEPT[kind] || "image/*";
     input.onchange = async () => {
         const f = input.files && input.files[0];
         if (!f) return;
@@ -628,7 +688,7 @@ async function pickImage(target) {
             if (target === "first") {
                 setFirstFrame(node, name);
             } else {
-                addRefImage(node, name);
+                addAsset(node, kind, name);
             }
         } catch (e) {
             alert(`上传失败：${e}`);
@@ -775,6 +835,13 @@ function rememberProject(dir) {
     } catch (e) { /* 隐私模式等场景静默降级 */ }
 }
 
+function forgetProject(dir) {
+    try {
+        const arr = lsProjects().filter((d) => d !== dir);
+        localStorage.setItem(LS_PROJECTS, JSON.stringify(arr));
+    } catch (e) { /* 静默降级 */ }
+}
+
 /* ---------- 动作 ---------- */
 
 function doReroll(segNo) {
@@ -784,6 +851,72 @@ function doReroll(segNo) {
     setWidgetValue(node, W_SEED, Math.floor(Math.random() * 2 ** 48));
     pendingReset = okReroll;
     queuePrompt();
+}
+
+/** 只跑某一段：审片模式（每次运行只生成一段即返回）+ 重跑起始段组合。
+ *  segNo ≤ done：重跑起始段=segNo → 重做该段后暂停（其后段落存档被截断，继续时重新生成）；
+ *  segNo = done+1：不设重跑 → 顺序生成下一段后暂停（无损）；
+ *  segNo > done+1：链式续拍必须按顺序，拦截并说明。
+ *  队列提交后立即还原控件（提示词快照已在服务端，用户界面不残留临时值）。 */
+async function doRunOnly(segNo, done) {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    if (!Number.isInteger(segNo) || segNo < 1) return;
+    if (segNo > done + 1) {
+        alert(`链式续拍需按顺序生成：段 ${done + 1} 尚未完成。\n`
+            + `请先连续生成到段 ${done + 1}（普通「▶ 继续」每次一段），或对已完成段用「重摇此段」。`);
+        return;
+    }
+    if (segNo <= done
+        && !confirm(`重做段 ${segNo}？该段及其后的断点存档会被丢弃，确认满意后继续跑会逐段重新生成。`)) return;
+    const prevReview = getWidgetValue(node, "审片模式") ?? "关闭";
+    const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
+    if (!setWidgetValue(node, "审片模式", "逐段确认")) {
+        alert("节点上没有「审片模式」控件：请重新载入配套工作流");
+        return;
+    }
+    setWidgetValue(node, W_REROLL, segNo <= done ? segNo : 0);
+    const ds = getDs(node);
+    setDs(node, ds);
+    syncModeWidget(node, ds.mode);
+    setLed("running", `只跑段 ${segNo} 已提交`);
+    try {
+        await app.queuePrompt();
+    } catch (e) {
+        console.warn("[h3-director] queue failed:", e);
+    }
+    setWidgetValue(node, "审片模式", prevReview);
+    setWidgetValue(node, W_REROLL, prevReroll);
+    scheduleRefresh();
+}
+
+/** 删除项目存档：后端删 checkpoints/<名> 与 h3_auto/<名>；当前链被删时服务端自动清状态指针 */
+async function deleteArchive(dir) {
+    if (!dir) return;
+    if (!confirm(`删除存档「${dir}」？\n\n`
+        + `将删除：output/checkpoints/${dir}（断点 latent/缩略图/清单）\n`
+        + `　　　　output/h3_auto/${dir}（分段视频/成片）\n\n不可恢复，继续？`)) return;
+    try {
+        const r = await api.fetchApi("/h3chain/delete_archive", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dir }),
+        });
+        if (r.status === 404 || r.status === 405) {
+            alert(`删除路由未注册（HTTP ${r.status}）：请重启 ComfyUI（日志应出现「路由已注册」）后刷新浏览器重试。`);
+            return;
+        }
+        if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            alert(`删除失败：${j.error || `HTTP ${r.status}`}`);
+            return;
+        }
+        forgetProject(dir);
+        setLed("idle", "存档已删除");
+        scheduleRefresh(300);
+    } catch (e) {
+        alert(`删除失败：${e}`);
+    }
 }
 
 function switchProject(dir) {
@@ -882,7 +1015,14 @@ async function collectData() {
     }
     if (!plan || !plan.length) {
         const total = (state && state.total) ?? (mf && mf.total) ?? 0;
-        if (total) {
+        if (total && node) {
+            // 采纳存档提示词进导演台状态：卡片可编辑（此前回退成只读历史段，导致无法输入）
+            const dsAdopt = getDs(node);
+            dsAdopt.prompts = Array.from({ length: total }, (_v, i) => String(((mf && mf.prompts) || [])[i] ?? ""));
+            dsAdopt.segments = Array.from({ length: total }, (_v, i) => dsAdopt.segments?.[i] ?? defaultSegment());
+            setDs(node, dsAdopt);
+            ({ plan, drafts, ds } = planFromDs(node));
+        } else if (total) {
             plan = Array.from({ length: total }, (_v, i) => {
                 const ins = ((mf && mf.inserts) || []).find((x) => x.slot === i);
                 return ins ? { kind: "insert", pos: i + 1, file: ins.file || "" }
@@ -926,39 +1066,39 @@ function injectStyles() {
     const style = el("style");
     style.id = STYLE_ID;
     style.textContent = `
-    :root{--h3d-ink:#0b0d17;--h3d-panel:#141726;--h3d-panel2:#1a1e32;--h3d-line:#2a2f4a;--h3d-cyan:#a78bfa;--h3d-copper:#e6b566;--h3d-bone:#eef0fa;--h3d-muted:#9aa0be;--h3d-ok:#5fd4a2;--h3d-warn:#f0a35e;--h3d-danger:#f27d7d}
+    :root{--h3d-ink:#1c2128;--h3d-panel:#22272e;--h3d-panel2:#2d333b;--h3d-line:#444c56;--h3d-cyan:#6cb6ff;--h3d-copper:#daaa3f;--h3d-bone:#cdd9e1;--h3d-muted:#909dab;--h3d-ok:#57ab5a;--h3d-warn:#e0823d;--h3d-danger:#e5534b}
     .h3d-page *,.h3d-mini *,.h3d-dialog *{box-sizing:border-box}
     @keyframes h3d-blink{50%{opacity:.35}}
     .h3d-led{display:inline-flex;gap:7px;align-items:center;color:var(--h3d-muted);font-size:12px;white-space:nowrap}
-    .h3d-led i{width:8px;height:8px;border-radius:50%;background:#6a6f8f;flex:none}
-    .h3d-led.running i{background:var(--h3d-cyan);box-shadow:0 0 10px #a78bfacc;animation:h3d-blink 1s infinite}
-    .h3d-led.done i{background:var(--h3d-ok);box-shadow:0 0 12px #5fd4a288}
-    .h3d-led.error i{background:var(--h3d-warn);box-shadow:0 0 12px #f0a35e88}
-    .h3d-btn{cursor:pointer;border:1px solid #343a5e;border-radius:6px;background:#171b2e;color:var(--h3d-bone);padding:6px 11px;font-size:12px;font-family:inherit;transition:border-color .12s,filter .12s}
+    .h3d-led i{width:8px;height:8px;border-radius:50%;background:#636e7b;flex:none}
+    .h3d-led.running i{background:var(--h3d-cyan);box-shadow:0 0 10px #6cb6ffcc;animation:h3d-blink 1s infinite}
+    .h3d-led.done i{background:var(--h3d-ok);box-shadow:0 0 12px #57ab5a88}
+    .h3d-led.error i{background:var(--h3d-warn);box-shadow:0 0 12px #e0823d88}
+    .h3d-btn{cursor:pointer;border:1px solid #444c56;border-radius:6px;background:#2d333b;color:var(--h3d-bone);padding:6px 11px;font-size:12px;font-family:inherit;transition:border-color .12s,filter .12s}
     .h3d-btn:hover{filter:brightness(1.18)}
     .h3d-btn:disabled{opacity:.5;cursor:not-allowed;filter:none}
-    .h3d-btn-cyan{border-color:#565092;background:#242045;color:#bfaeff}
-    .h3d-btn-danger{border-color:#6e3a4a;background:#2e1826;color:#ff9a9a}
+    .h3d-btn-cyan{border-color:#316dca;background:#1f2f45;color:#9ecbff}
+    .h3d-btn-danger{border-color:#9a4144;background:#3a2225;color:#f0a0a4}
     .h3d-btn-cta{border:0;background:linear-gradient(135deg,#f0c274,#e6b566 55%,#d99e4a);color:#1a1408;font-weight:700;box-shadow:0 2px 14px #e6b56633}
     .h3d-btn-cta:hover{filter:brightness(1.08);box-shadow:0 3px 18px #e6b56644}
-    .h3d-chip{font-size:10.5px;padding:2px 8px;border-radius:10px;border:1px solid #3a4066;background:#1d2138;color:#b6bcdc;white-space:nowrap}
-    .h3d-chip.ok{border-color:#2f6e57;background:#17342a;color:#7fe0b0}
+    .h3d-chip{font-size:10.5px;padding:2px 8px;border-radius:10px;border:1px solid #444c56;background:#2d333b;color:#adbac7;white-space:nowrap}
+    .h3d-chip.ok{border-color:#2ea04366;background:#12261e;color:#7ee2a8}
     .h3d-chip.media{border-color:#7a5f36;background:#352a19;color:#e9c07a}
-    .h3d-chip.cyan{border-color:#565092;background:#242045;color:#bfaeff}
-    .h3d-chip.warn{border-color:#6e3a4a;background:#45202c;color:#ff8585}
+    .h3d-chip.cyan{border-color:#316dca;background:#1f2f45;color:#9ecbff}
+    .h3d-chip.warn{border-color:#9a4144;background:#402227;color:#f0a0a4}
 
     /* ---- 侧栏迷你入口卡 ---- */
-    .h3d-mini{display:flex;flex-direction:column;gap:9px;padding:10px;font-size:12px;color:var(--h3d-bone);background:linear-gradient(150deg,#131626,#1c2038);border:1px solid #31375a;border-radius:10px}
+    .h3d-mini{display:flex;flex-direction:column;gap:9px;padding:10px;font-size:12px;color:var(--h3d-bone);background:linear-gradient(150deg,#22272e,#2d333b);border:1px solid #444c56;border-radius:10px}
     .h3d-mini-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
     .h3d-mini-brand{font-weight:700;letter-spacing:.04em;min-width:0}
     .h3d-mini-brand small{display:block;margin-top:3px;color:var(--h3d-cyan);font-weight:500;font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .h3d-mini-rail{display:flex;gap:3px}
-    .h3d-mini-rail span{flex:1;height:4px;border-radius:4px;background:#33385a}
+    .h3d-mini-rail span{flex:1;height:4px;border-radius:4px;background:#444c56}
     .h3d-mini-rail span.done{background:var(--h3d-cyan)}
-    .h3d-mini-rail span.next{background:#4d4680;animation:h3d-blink 1.2s infinite}
+    .h3d-mini-rail span.next{background:#6e7b8c;animation:h3d-blink 1.2s infinite}
     .h3d-mini-cards{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}
-    .h3d-mini-card{min-height:62px;padding:9px;border:1px solid #2f3352;border-radius:8px;background:#10131f;font-size:11px;color:var(--h3d-muted);line-height:1.65;overflow:hidden}
-    .h3d-mini-count{display:grid;place-items:center;padding:9px 10px;min-width:66px;border:1px solid #2f3352;border-radius:8px;background:#10131f;font:700 20px/1.15 ui-monospace,Consolas;color:var(--h3d-cyan);text-align:center}
+    .h3d-mini-card{min-height:62px;padding:9px;border:1px solid #3f4854;border-radius:8px;background:#1b2027;font-size:11px;color:var(--h3d-muted);line-height:1.65;overflow:hidden}
+    .h3d-mini-count{display:grid;place-items:center;padding:9px 10px;min-width:66px;border:1px solid #3f4854;border-radius:8px;background:#1b2027;font:700 20px/1.15 ui-monospace,Consolas;color:var(--h3d-cyan);text-align:center}
     .h3d-mini-count small{font-size:10px;color:var(--h3d-muted);font-weight:400}
     .h3d-mini-foot{display:flex;flex-direction:column;gap:8px}
     .h3d-mini-params{color:var(--h3d-muted);font:10.5px ui-monospace,Consolas;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -966,130 +1106,134 @@ function injectStyles() {
 
     /* ---- 全屏导演台 ---- */
     .h3d-page{position:fixed;inset:0;z-index:1000000;background:var(--h3d-ink);color:var(--h3d-bone);font:13px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif;display:grid;grid-template-rows:58px 1fr 58px}
-    .h3d-topbar{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;padding:0 20px;border-bottom:1px solid var(--h3d-line);background:linear-gradient(90deg,#10131f,#171b30)}
+    .h3d-topbar{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;padding:0 20px;border-bottom:1px solid var(--h3d-line);background:linear-gradient(90deg,#22272e,#262c36)}
     .h3d-top-left{min-width:0;display:flex;gap:14px;align-items:center}
     .h3d-kicker{color:var(--h3d-copper);font:700 11px/1 ui-monospace,Consolas;letter-spacing:.18em;white-space:nowrap}
     .h3d-title{font-size:17px;font-weight:700;white-space:nowrap}
     .h3d-sub{min-width:0;color:var(--h3d-muted);font-family:ui-monospace,Consolas;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .h3d-top-right{display:flex;gap:14px;align-items:center;justify-self:end}
-    .h3d-close{width:36px;height:36px;border:1px solid var(--h3d-line);border-radius:7px;background:#181c30;color:var(--h3d-bone);cursor:pointer;font-size:15px}
+    .h3d-close{width:36px;height:36px;border:1px solid var(--h3d-line);border-radius:7px;background:#2d333b;color:var(--h3d-bone);cursor:pointer;font-size:15px}
     .h3d-close:hover{filter:brightness(1.2)}
     .h3d-stage{min-height:0;display:grid;grid-template-columns:minmax(255px,300px) minmax(400px,1fr) minmax(255px,300px);gap:1px;background:var(--h3d-line)}
     .h3d-col{min-width:0;min-height:0;background:var(--h3d-panel);overflow:auto}
-    .h3d-sechead{position:sticky;top:0;z-index:3;padding:14px 16px 10px;background:#141726ed;backdrop-filter:blur(8px);border-bottom:1px solid #272c47}
+    .h3d-sechead{position:sticky;top:0;z-index:3;padding:14px 16px 10px;background:#22272eee;backdrop-filter:blur(8px);border-bottom:1px solid #3f4854}
     .h3d-sechead strong{display:block}
     .h3d-sechead small{color:var(--h3d-muted)}
 
     .h3d-projlist{display:grid;gap:7px;padding:12px}
-    .h3d-proj{display:grid;gap:3px;padding:9px 10px 9px 13px;border:1px solid #2f3352;border-radius:8px;background:#10131f;cursor:pointer;box-shadow:inset 3px 0 0 #33385a;text-align:left;font-family:inherit;color:inherit}
-    .h3d-proj:hover{background:#151929}
-    .h3d-proj.active{box-shadow:inset 3px 0 0 var(--h3d-cyan);border-color:#565092}
+    .h3d-projrow{display:flex;gap:6px;align-items:stretch}
+    .h3d-projrow .h3d-proj{flex:1;min-width:0}
+    .h3d-proj-del{flex:none;width:30px;border:1px solid #4c3a3d;border-radius:8px;background:#2a2225;color:#b08a8e;cursor:pointer;font-size:13px;line-height:1;transition:.15s}
+    .h3d-proj-del:hover{border-color:#c2565f;background:#3a2429;color:#ffb3b8}
+    .h3d-proj{display:grid;gap:3px;padding:9px 10px 9px 13px;border:1px solid #3f4854;border-radius:8px;background:#262c36;cursor:pointer;box-shadow:inset 3px 0 0 #444c56;text-align:left;font-family:inherit;color:inherit}
+    .h3d-proj:hover{background:#2a313b}
+    .h3d-proj.active{box-shadow:inset 3px 0 0 var(--h3d-cyan);border-color:#316dca}
     .h3d-proj-name{font-weight:700;word-break:break-all;font-size:12.5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;color:var(--h3d-bone)}
     .h3d-proj-meta{color:var(--h3d-muted);font-size:11px;font-family:ui-monospace,Consolas}
     .h3d-newrow{display:flex;gap:8px;padding:0 12px 12px;flex-wrap:wrap}
-    .h3d-meter{margin:0 12px 12px;padding:11px;border:1px solid #343a5e;border-radius:8px;background:#10131f}
+    .h3d-meter{margin:0 12px 12px;padding:11px;border:1px solid #444c56;border-radius:8px;background:#262c36}
     .h3d-meter strong{display:block;color:var(--h3d-cyan);font:700 16px/1.3 ui-monospace,Consolas}
     .h3d-meter p{margin:4px 0 0;color:var(--h3d-muted);font-size:11px}
     .h3d-drafts{margin:0 12px 12px;color:var(--h3d-muted);font-size:11px;line-height:1.7}
 
     .h3d-center-pad{padding:14px 18px 20px}
-    .h3d-statusbar{display:flex;align-items:center;gap:10px;padding:10px 13px;border:1px solid #565092;border-radius:8px;background:linear-gradient(90deg,#242045,#1a1e32);line-height:1.6}
+    .h3d-statusbar{display:flex;align-items:center;gap:10px;padding:10px 13px;border:1px solid #316dca;border-radius:8px;background:linear-gradient(90deg,#1f2f45,#22272e);line-height:1.6}
     .h3d-statusbar .h3d-st-text{flex:1;min-width:0}
     .h3d-statusbar .h3d-chip{align-self:center}
     .h3d-refresh{padding:4px 10px;flex:none}
     .h3d-rail{display:flex;gap:4px;margin:12px 0 14px}
-    .h3d-rail span{flex:1;height:5px;border-radius:4px;background:#33385a}
+    .h3d-rail span{flex:1;height:5px;border-radius:4px;background:#444c56}
     .h3d-rail span.done{background:var(--h3d-cyan)}
-    .h3d-rail span.next{background:#4d4680;animation:h3d-blink 1.2s infinite}
+    .h3d-rail span.next{background:#6e7b8c;animation:h3d-blink 1.2s infinite}
     .h3d-cards{display:grid;gap:10px}
-    .h3d-card{display:grid;grid-template-columns:150px minmax(0,1fr);gap:11px;padding:10px;border:1px solid #2f3352;border-radius:9px;background:#10131f}
+    .h3d-card{display:grid;grid-template-columns:150px minmax(0,1fr);gap:11px;padding:10px;border:1px solid #3f4854;border-radius:9px;background:#262c36}
     .h3d-card.todo{opacity:.72}
     .h3d-card.todo:hover{opacity:1}
-    .h3d-thumb{width:150px;aspect-ratio:16/9;border-radius:6px;overflow:hidden;background:#080a12;display:grid;place-items:center;color:#565b78;font:700 11px ui-monospace,Consolas}
+    .h3d-thumb{width:150px;aspect-ratio:16/9;border-radius:6px;overflow:hidden;background:#10151c;display:grid;place-items:center;color:#636e7b;font:700 11px ui-monospace,Consolas}
     .h3d-thumb video,.h3d-thumb img{width:100%;height:100%;object-fit:cover}
     .h3d-thumb video.h3d-segvideo{object-fit:contain;background:#000}
     .h3d-cbody{min-width:0;display:flex;flex-direction:column;gap:5px}
     .h3d-ctitle{display:flex;gap:7px;align-items:center;flex-wrap:wrap;font-weight:700}
     .h3d-cmeta{color:var(--h3d-muted);font:11px ui-monospace,Consolas;word-break:break-all}
-    .h3d-cprompt{color:#c6cbe4;font-size:12px;line-height:1.65;word-break:break-word}
-    .h3d-ta{width:100%;min-height:84px;resize:vertical;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:8px 9px;font:12.5px/1.65 "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none;box-sizing:border-box}
-    .h3d-ta:focus{border-color:#b3a1ff;box-shadow:0 0 0 2px #a78bfa33}
-    .h3d-ta:disabled{color:#565b78;cursor:not-allowed;background:#0d0f1a}
+    .h3d-cprompt{color:#b6c2cf;font-size:12px;line-height:1.65;word-break:break-word}
+    .h3d-ta{width:100%;min-height:84px;resize:vertical;border:1px solid #444c56;border-radius:6px;background:#2d333b;color:var(--h3d-bone);padding:8px 9px;font:12.5px/1.65 "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none;box-sizing:border-box}
+    .h3d-ta:focus{border-color:#6cb6ff;box-shadow:0 0 0 2px #6cb6ff33}
+    .h3d-ta:disabled{color:#636e7b;cursor:not-allowed;background:#22272e}
     .h3d-ta-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px}
     .h3d-ta-hint{color:var(--h3d-muted);font-size:10.5px}
     .h3d-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:2px}
     .h3d-hint{color:var(--h3d-muted);font-size:11px;align-self:center}
-    .h3d-editor{display:grid;gap:7px;margin-top:4px;padding:10px;border:1px solid #3a4066;border-radius:8px;background:#0f1220}
-    .h3d-editor textarea{width:100%;min-height:96px;resize:vertical;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:9px;font:13px/1.7 "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none}
-    .h3d-editor textarea:focus{border-color:#b3a1ff;box-shadow:0 0 0 2px #a78bfa33}
+    .h3d-editor{display:grid;gap:7px;margin-top:4px;padding:10px;border:1px solid #444c56;border-radius:8px;background:#20262e}
+    .h3d-editor textarea{width:100%;min-height:96px;resize:vertical;border:1px solid #444c56;border-radius:6px;background:#2d333b;color:var(--h3d-bone);padding:9px;font:13px/1.7 "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none}
+    .h3d-editor textarea:focus{border-color:#6cb6ff;box-shadow:0 0 0 2px #6cb6ff33}
     .h3d-editor-row{display:flex;gap:7px;flex-wrap:wrap}
     .h3d-addrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-    .h3d-drawer{margin-top:14px;border:1px solid #303656;border-radius:8px;background:#10131f}
+    .h3d-drawer{margin-top:14px;border:1px solid #3f4854;border-radius:8px;background:#262c36}
     .h3d-drawer summary{padding:10px 12px;cursor:pointer;color:var(--h3d-cyan)}
-    .h3d-drawer pre{margin:0;padding:0 12px 12px;white-space:pre-wrap;font-size:11.5px;max-height:300px;overflow:auto;color:#bcc3de}
+    .h3d-drawer pre{margin:0;padding:0 12px 12px;white-space:pre-wrap;font-size:11.5px;max-height:300px;overflow:auto;color:#b6c2cf}
 
     .h3d-hist{padding:12px;display:grid;gap:10px;align-content:start}
-    .h3d-empty{padding:16px 10px;border:1px dashed #3a4066;border-radius:8px;color:var(--h3d-muted);text-align:center;background:#10131f;line-height:1.8}
-    .h3d-result{padding:8px;border:1px solid #363c60;border-radius:9px;background:#0f1220}
-    .h3d-result.current{border-color:#565092}
-    .h3d-result video{display:block;width:100%;max-height:230px;border-radius:6px;background:#05060c}
+    .h3d-empty{padding:16px 10px;border:1px dashed #444c56;border-radius:8px;color:var(--h3d-muted);text-align:center;background:#262c36;line-height:1.8}
+    .h3d-result{padding:8px;border:1px solid #3f4854;border-radius:9px;background:#20262e}
+    .h3d-result.current{border-color:#316dca}
+    .h3d-result video{display:block;width:100%;max-height:230px;border-radius:6px;background:#0a0d12}
     .h3d-result-meta{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-top:7px}
-    .h3d-result-name{min-width:0;color:#bcc3de;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .h3d-result-name{min-width:0;color:#b6c2cf;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .h3d-result-info{color:var(--h3d-muted);font:10.5px ui-monospace,Consolas;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .h3d-result-acts{display:flex;gap:6px;flex:none}
-    .h3d-dl{padding:4px 8px;border:1px solid #565092;border-radius:6px;color:#bfaeff;text-decoration:none;background:#242045;font-size:11px}
+    .h3d-dl{padding:4px 8px;border:1px solid #316dca;border-radius:6px;color:#9ecbff;text-decoration:none;background:#1f2f45;font-size:11px}
     .h3d-dl:hover{filter:brightness(1.15)}
     .h3d-foot{padding:2px 16px 14px;color:var(--h3d-muted);font-size:10.5px;word-break:break-all;line-height:1.8}
 
     /* ---- 分段处理中心面板 ---- */
-    .h3d-seg-panel{margin-top:6px;border:1px solid #303656;border-radius:7px;background:#0e1122;overflow:hidden}
+    .h3d-seg-panel{margin-top:6px;border:1px solid #37332b;border-radius:7px;background:#181712;overflow:hidden}
     .h3d-seg-panel summary{padding:7px 10px;cursor:pointer;color:var(--h3d-cyan);font-size:11.5px;font-weight:600;user-select:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
     .h3d-seg-panel summary::-webkit-details-marker{display:none}
     .h3d-seg-panel summary::before{content:"▸";font-size:10px;transition:transform .15s}
     .h3d-seg-panel[open] summary::before{transform:rotate(90deg)}
-    .h3d-seg-panel.has-content{border-color:#565092}
+    .h3d-seg-panel.has-content{border-color:#46604f}
     .h3d-seg-body{display:grid;gap:7px;padding:0 10px 10px}
     .h3d-seg-label{display:block;margin-bottom:2px;color:var(--h3d-muted);font-size:10.5px;font-weight:600}
     .h3d-seg-ta{min-height:48px !important;font-size:12px !important;line-height:1.55 !important}
 
     /* ---- 每段时长 + 段级引用素材 ---- */
-    .h3d-secs{width:58px;border:1px solid #333a5c;border-radius:5px;background:#131626;color:var(--h3d-bone);padding:2px 4px;font:11px ui-monospace,Consolas;text-align:right;outline:none}
-    .h3d-secs:focus{border-color:#b3a1ff}
+    .h3d-secs{width:58px;border:1px solid #3a352c;border-radius:5px;background:#211f1a;color:var(--h3d-bone);padding:2px 4px;font:11px ui-monospace,Consolas;text-align:right;outline:none}
+    .h3d-secs:focus{border-color:#a8d8bd}
     .h3d-secs-hint{color:var(--h3d-muted);font:10px ui-monospace,Consolas;white-space:nowrap}
-    .h3d-refrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:7px 8px;border:1px solid #303656;border-radius:7px;background:#0e1122}
+    .h3d-refrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:7px 8px;border:1px solid #37332b;border-radius:7px;background:#181712}
     .h3d-refrow>label{color:var(--h3d-muted);font-size:10.5px;font-weight:600;flex:none}
-    .h3d-refchip{display:inline-flex;gap:5px;align-items:center;padding:3px 8px 3px 3px;border:1px solid #343a5e;border-radius:12px;background:#171b2e;color:#9aa3c4;cursor:pointer;font-size:11px;font-family:inherit}
-    .h3d-refchip:hover{border-color:#565092}
+    .h3d-refchip{display:inline-flex;gap:5px;align-items:center;padding:3px 8px 3px 3px;border:1px solid #3a352c;border-radius:12px;background:#25221c;color:#a8a294;cursor:pointer;font-size:11px;font-family:inherit}
+    .h3d-refchip:hover{border-color:#46604f}
     .h3d-refchip.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
-    .h3d-refchip img{width:20px;height:20px;border-radius:9px;object-fit:cover;background:#080a12}
-    .h3d-reftpl{max-width:118px;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:3px 4px;font-size:11px;outline:none;margin-left:auto}
-    .h3d-reftpl:focus{border-color:#b3a1ff}
+    .h3d-refchip img{width:20px;height:20px;border-radius:9px;object-fit:cover;background:#0d0c0a}
+    .h3d-reftpl{max-width:118px;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:3px 4px;font-size:11px;outline:none;margin-left:auto}
+    .h3d-reftpl:focus{border-color:#a8d8bd}
 
     /* ---- 素材标签编辑 ---- */
-    .h3d-labelinp{width:100%;border:1px solid #333a5c;border-radius:5px;background:#131626;color:var(--h3d-bone);padding:4px 6px;font:600 12px "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none}
-    .h3d-labelinp:focus{border-color:#b3a1ff;box-shadow:0 0 0 2px #a78bfa33}
+    .h3d-labelinp{width:100%;border:1px solid #3a352c;border-radius:5px;background:#211f1a;color:var(--h3d-bone);padding:4px 6px;font:600 12px "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none}
+    .h3d-labelinp:focus{border-color:#a8d8bd;box-shadow:0 0 0 2px #8cc9a833}
     .h3d-quicklbl{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px}
-    .h3d-quicklbl button{padding:2px 7px;border:1px solid #343a5e;border-radius:10px;background:#171b2e;color:#9aa0be;cursor:pointer;font-size:10px;font-family:inherit}
-    .h3d-quicklbl button:hover{border-color:#565092;color:#d6dcf5}
+    .h3d-quicklbl button{padding:2px 7px;border:1px solid #3a352c;border-radius:10px;background:#25221c;color:#a39d90;cursor:pointer;font-size:10px;font-family:inherit}
+    .h3d-quicklbl button:hover{border-color:#46604f;color:#d9d4c9}
     .h3d-asset-usage{margin-top:5px;display:flex;gap:4px;flex-wrap:wrap}
 
     /* ---- 链参数：换算徽章 + 高级设置折叠 ---- */
-    .h3d-convbadge{grid-column:1/-1;margin:-4px 0 0;padding:8px 10px;border:1px dashed #565092;border-radius:7px;background:#1e1c38;color:#bfaeff;font:11.5px ui-monospace,Consolas;word-break:break-all}
-    .h3d-adv{grid-column:1/-1;border:1px solid #303656;border-radius:8px;background:#0e1120;overflow:hidden}
+    .h3d-convbadge{grid-column:1/-1;margin:-4px 0 0;padding:8px 10px;border:1px dashed #46604f;border-radius:7px;background:#1f2a23;color:#c2e0cd;font:11.5px ui-monospace,Consolas;word-break:break-all}
+    .h3d-adv{grid-column:1/-1;border:1px solid #37332b;border-radius:8px;background:#181712;overflow:hidden}
     .h3d-adv summary{padding:8px 10px;cursor:pointer;color:var(--h3d-muted);font-size:11.5px;font-weight:600;user-select:none}
-    .h3d-adv summary:hover{color:#d6dcf5}
+    .h3d-adv summary:hover{color:#d9d4c9}
     .h3d-adv summary::-webkit-details-marker{display:none}
     .h3d-adv summary::before{content:"⚙ ";}
-    .h3d-adv[open] summary{border-bottom:1px solid #272c47;color:var(--h3d-cyan)}
+    .h3d-adv[open] summary{border-bottom:1px solid #302c25;color:var(--h3d-cyan)}
     .h3d-adv-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px}
     .h3d-adv .h3d-param{margin:0}
     .h3d-param{margin:0}
     .h3d-param .h3d-hint{display:block;margin-top:4px}
 
-    .h3d-loadwf{display:flex;flex-direction:column;gap:10px;align-items:center;padding:22px 14px;border:1px dashed #565092;border-radius:10px;background:#1e1c38;text-align:center;line-height:1.9}
+    .h3d-loadwf{display:flex;flex-direction:column;gap:10px;align-items:center;padding:22px 14px;border:1px dashed #46604f;border-radius:10px;background:#1f2a23;text-align:center;line-height:1.9}
     .h3d-loadwf p{margin:0;color:var(--h3d-muted);font-size:11.5px}
 
-    .h3d-footer{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 20px;border-top:1px solid var(--h3d-line);background:#10131f}
+    .h3d-footer{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 20px;border-top:1px solid var(--h3d-line);background:#1b1a16}
     .h3d-footinfo{display:flex;gap:16px;color:var(--h3d-muted);flex-wrap:wrap;min-width:0;font-size:11.5px;align-items:center}
     .h3d-footinfo b{color:var(--h3d-bone)}
     .h3d-run{min-width:150px;padding:11px 18px}
@@ -1097,16 +1241,16 @@ function injectStyles() {
     /* ---- 素材与参考 / 链参数 ---- */
     .h3d-lsec,.h3d-rsec{display:flex;flex-direction:column;min-height:0}
     .h3d-col.left .h3d-sechead,.h3d-col.right .h3d-sechead{position:static;backdrop-filter:none}
-    .h3d-modebar{display:flex;gap:6px;padding:10px 12px 6px;border-bottom:1px solid var(--h3d-line);background:#0d0f1a}
-    .h3d-mode{flex:1;min-width:0;padding:8px 4px;border:1px solid #2f3352;border-radius:7px;background:#10131f;color:#9aa3c4;cursor:pointer;font:700 12px "Microsoft YaHei UI","Segoe UI",sans-serif;transition:all .12s}
-    .h3d-mode:hover{border-color:#565092;color:#d6dcf5}
-    .h3d-mode.active{color:#16102e;background:var(--h3d-cyan);border-color:var(--h3d-cyan);box-shadow:0 0 0 1px var(--h3d-cyan) inset,0 0 14px #a78bfa44}
+    .h3d-modebar{display:flex;gap:6px;padding:10px 12px 6px;border-bottom:1px solid var(--h3d-line);background:#171612}
+    .h3d-mode{flex:1;min-width:0;padding:8px 4px;border:1px solid #332f27;border-radius:7px;background:#1b1a16;color:#a8a294;cursor:pointer;font:700 12px "Microsoft YaHei UI","Segoe UI",sans-serif;transition:all .12s}
+    .h3d-mode:hover{border-color:#46604f;color:#d9d4c9}
+    .h3d-mode.active{color:#12241c;background:var(--h3d-cyan);border-color:var(--h3d-cyan);box-shadow:0 0 0 1px var(--h3d-cyan) inset,0 0 14px #8cc9a844}
     .h3d-mode small{display:block;font-weight:400;font-size:9.5px;opacity:.72;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .h3d-mode.active small{opacity:.85}
     .h3d-assets{display:grid;gap:8px;padding:12px}
-    .h3d-asset{display:grid;grid-template-columns:64px minmax(0,1fr) auto;gap:9px;align-items:center;padding:8px;border:1px solid #2f3352;border-radius:8px;background:#10131f;box-shadow:inset 3px 0 0 #33385a}
+    .h3d-asset{display:grid;grid-template-columns:64px minmax(0,1fr) auto;gap:9px;align-items:center;padding:8px;border:1px solid #332f27;border-radius:8px;background:#1b1a16;box-shadow:inset 3px 0 0 #3a352c}
     .h3d-asset.on{box-shadow:inset 3px 0 0 var(--h3d-cyan)}
-    .h3d-asset-thumb{width:64px;height:52px;border-radius:5px;background:#1e2238;display:grid;place-items:center;overflow:hidden;color:#6a6f8f;font:700 10px ui-monospace,Consolas}
+    .h3d-asset-thumb{width:64px;height:52px;border-radius:5px;background:#262319;display:grid;place-items:center;overflow:hidden;color:#77705f;font:700 10px ui-monospace,Consolas}
     .h3d-asset-thumb img{width:100%;height:100%;object-fit:cover}
     .h3d-asset-copy{min-width:0}
     .h3d-asset-copy strong{display:block;font-size:12px}
@@ -1114,27 +1258,32 @@ function injectStyles() {
     .h3d-asset-acts{display:flex;gap:5px}
     .h3d-asset-acts .h3d-btn{padding:4px 8px;font-size:11px}
     .h3d-addasset{justify-self:start;padding:6px 12px}
+    .h3d-upload-row{display:flex;gap:7px;flex-wrap:wrap}
+    .h3d-upload-row .h3d-btn{flex:1;min-width:84px}
+    .h3d-upload-row .h3d-btn:disabled{opacity:.38;cursor:not-allowed}
+    .h3d-kindmark{font-size:12px;line-height:1}
+    .h3d-kindmark.big{font-size:22px}
     .h3d-params{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:12px}
     .h3d-param label{display:block;margin-bottom:4px;color:var(--h3d-muted);font-size:11px}
-    .h3d-select,.h3d-seedrow input{width:100%;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:6px 7px;font-size:12px;outline:none;font-family:inherit}
-    .h3d-select:focus,.h3d-seedrow input:focus{border-color:#b3a1ff}
+    .h3d-select,.h3d-seedrow input{width:100%;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:6px 7px;font-size:12px;outline:none;font-family:inherit}
+    .h3d-select:focus,.h3d-seedrow input:focus{border-color:#a8d8bd}
     .h3d-seedrow{display:flex;gap:5px}
     .h3d-seedrow input{flex:1;min-width:0}
     .h3d-seedrow .h3d-btn{padding:4px 8px;flex:none}
     .h3d-psec .h3d-foot,.h3d-asec .h3d-foot,.h3d-projsec .h3d-foot{padding:0 16px 14px}
 
     /* ---- 新建项目模态 ---- */
-    .h3d-overlay{position:fixed;z-index:1000003;inset:0;display:grid;place-items:center;padding:24px;background:#07060fd0;backdrop-filter:blur(10px)}
-    .h3d-dialog{width:min(470px,calc(100vw - 40px));border:1px solid #3f4570;border-radius:14px;background:linear-gradient(160deg,#1c2038,#12141f 62%);box-shadow:0 22px 64px #000b;padding:20px;color:var(--h3d-bone);font:13px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif}
+    .h3d-overlay{position:fixed;z-index:1000003;inset:0;display:grid;place-items:center;padding:24px;background:#0a0906d0;backdrop-filter:blur(10px)}
+    .h3d-dialog{width:min(470px,calc(100vw - 40px));border:1px solid #464033;border-radius:14px;background:linear-gradient(160deg,#242019,#191712 62%);box-shadow:0 22px 64px #000b;padding:20px;color:var(--h3d-bone);font:13px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif}
     .h3d-dialog h3{margin:0 0 6px;font-size:16px}
     .h3d-dialog .h3d-lead{color:var(--h3d-muted);margin:0 0 14px;line-height:1.75;font-size:12px}
-    .h3d-dialog input[type=text]{width:100%;border:1px solid #333a5c;border-radius:6px;background:#131626;color:var(--h3d-bone);padding:9px 10px;font:13px ui-monospace,Consolas;outline:none;margin-bottom:6px}
-    .h3d-dialog input[type=text]:focus{border-color:#b3a1ff}
-    .h3d-err{color:#ff8585;font-size:11px;min-height:16px;margin-bottom:6px}
+    .h3d-dialog input[type=text]{width:100%;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:9px 10px;font:13px ui-monospace,Consolas;outline:none;margin-bottom:6px}
+    .h3d-dialog input[type=text]:focus{border-color:#a8d8bd}
+    .h3d-err{color:#e89090;font-size:11px;min-height:16px;margin-bottom:6px}
     .h3d-check{display:flex;gap:8px;align-items:center;color:var(--h3d-muted);font-size:12px;margin-bottom:14px;cursor:pointer}
     .h3d-dialog-row{display:flex;gap:8px;justify-content:flex-end}
 
-    .h3d-fab{position:fixed;right:16px;top:120px;z-index:80;width:44px;height:44px;border-radius:50%;border:1px solid #565092;background:#242045;color:#bfaeff;cursor:pointer;font-size:17px}
+    .h3d-fab{position:fixed;right:16px;top:120px;z-index:80;width:44px;height:44px;border-radius:50%;border:1px solid #46604f;background:#1f2a23;color:#c2e0cd;cursor:pointer;font-size:17px}
     .h3d-fab:hover{filter:brightness(1.2)}
 
     @media(max-width:1200px){.h3d-sub{display:none}}
@@ -1330,6 +1479,7 @@ function renderLeftColumn(sec, data) {
     }
     for (const p of projects) {
         const active = state?.dir && p.dir === state.dir;
+        const row = el("div", "h3d-projrow");
         const btn = el("button", "h3d-proj" + (active ? " active" : ""));
         const nodeDir = node ? getDirValue(node) : "";
         btn.innerHTML = `
@@ -1340,7 +1490,13 @@ function renderLeftColumn(sec, data) {
             <span class="h3d-proj-meta">${p.done ?? "?"}/${p.total ?? "?"} 段${p.updated_at ? " · " + escapeHtml(fmtTime(p.updated_at)) : ""}</span>`;
         btn.title = "点击把「存档目录」切到该项目（共享参数需与其一致，否则后端会提示换链）";
         btn.onclick = () => switchProject(p.dir);
-        list.append(btn);
+        row.append(btn);
+        const del = el("button", "h3d-proj-del", "🗑");
+        del.type = "button";
+        del.title = `删除该存档（output/checkpoints/${p.dir} 与 output/h3_auto/${p.dir}，不可恢复）`;
+        del.onclick = (e) => { e.stopPropagation(); deleteArchive(p.dir); };
+        row.append(del);
+        list.append(row);
     }
     sec.append(list);
 
@@ -1572,25 +1728,37 @@ function buildCards(data) {
             }
             body.append(ta);
 
-            /* 引用素材：勾选本段用哪些图（后端按勾选顺序压实 <Picture k>） */
+            /* 引用素材：勾选本段用哪些（图/视/音混排，后端按类别独立编号压实 token） */
             if (node && it.idx !== undefined && data.ds.mode === "多参视频" && pool.length) {
                 const seg = data.ds.segments[it.idx] || defaultSegment();
                 const row = el("div", "h3d-refrow");
                 row.append(el("label", "", "引用素材"));
+                const pickedByKind = { image: 0, video: 0, audio: 0 };
                 pool.forEach((a) => {
+                    const k = a.kind || "image";
                     const on = (seg.refs || []).includes(a.label);
+                    if (on) pickedByKind[k] += 1;
                     const chip = el("button", "h3d-refchip" + (on ? " on" : ""));
                     chip.type = "button";
-                    chip.title = `勾选后本段仅引用这些图（按勾选顺序编号 <Picture k>）；提示词写 [[${a.label}]] 引用`;
-                    const im = document.createElement("img");
-                    im.loading = "lazy";
-                    im.src = inputViewUrl(a.file);
-                    im.onerror = () => im.remove();
-                    chip.append(im, document.createTextNode(a.label));
+                    chip.title = `${KIND_NAME[k]}素材：勾选后本段引用它（同类按勾选顺序编号 <${KIND_TOKEN[k]} k>）；`
+                        + `提示词写 [[${a.label}]] 引用；单段上限 图${KIND_CAPS.image}/视${KIND_CAPS.video}/音${KIND_CAPS.audio}`;
+                    if (k === "image") {
+                        const im = document.createElement("img");
+                        im.loading = "lazy";
+                        im.src = inputViewUrl(a.file);
+                        im.onerror = () => im.remove();
+                        chip.append(im);
+                    } else {
+                        chip.insertAdjacentHTML("afterbegin", `<span class="h3d-kindmark">${KIND_ICON[k]}</span>`);
+                    }
+                    chip.append(document.createTextNode(a.label));
                     chip.onclick = () => { toggleSegmentRef(node, it.idx, a.label); scheduleRefresh(80); };
                     row.append(chip);
                 });
                 if ((seg.refs || []).length) {
+                    row.insertAdjacentHTML("beforeend",
+                        `<span class="h3d-secs-hint">图${pickedByKind.image}/${KIND_CAPS.image}`
+                        + ` 视${pickedByKind.video}/${KIND_CAPS.video} 音${pickedByKind.audio}/${KIND_CAPS.audio}</span>`);
                     const reset = el("button", "h3d-btn", "↺ 全部");
                     reset.type = "button";
                     reset.style.padding = "3px 8px";
@@ -1696,6 +1864,13 @@ function buildCards(data) {
             }
             if (canInsert) actions.append(insertButton("在此段后插入", idx + 2));
         } else {
+            const runOne = el("button", "h3d-btn h3d-btn-cyan",
+                isDone ? "▶ 重跑这段" : "▶ 只跑这段");
+            runOne.title = isDone
+                ? `重做段 ${idx + 1} 后暂停（审片模式+重跑起始段=${idx + 1}），满意再继续`
+                : `只生成段 ${idx + 1} 后暂停（审片模式）：预览单段效果，满意再继续整链`;
+            runOne.onclick = () => doRunOnly(idx + 1, done);
+            actions.append(runOne);
             if (isDone) {
                 const rerollBtn = el("button", "h3d-btn", "🎲 重摇此段");
                 rerollBtn.title = `设「重跑起始段」=${idx + 1} 并换种子重新生成该段及之后`;
@@ -1753,18 +1928,24 @@ function assetCard(title, file, onRemove) {
     return card;
 }
 
-/** 多参模式：带标签编辑的素材卡（重命名同步所有段级引用） */
+/** 多参模式：带标签编辑的素材卡（重命名同步所有段级引用；图/视/音三类混排） */
 function labeledAssetCard(node, ds, idx) {
     const a = ds.ref_assets[idx];
     const file = a.file;
+    const kind = a.kind || "image";
     const card = el("div", "h3d-asset on");
     const thumb = el("div", "h3d-asset-thumb");
-    const im = document.createElement("img");
-    im.loading = "lazy";
-    im.src = inputViewUrl(file);
-    im.alt = a.label;
-    im.onerror = () => { thumb.replaceChildren(el("span", "", "⚠")); };
-    thumb.append(im);
+    if (kind === "image") {
+        const im = document.createElement("img");
+        im.loading = "lazy";
+        im.src = inputViewUrl(file);
+        im.alt = a.label;
+        im.onerror = () => { thumb.replaceChildren(el("span", "", "⚠")); };
+        thumb.append(im);
+    } else {
+        thumb.innerHTML = `<span class="h3d-kindmark big">${KIND_ICON[kind]}</span>`;
+        thumb.title = `${KIND_NAME[kind]}素材：${file}`;
+    }
 
     const copy = el("div", "h3d-asset-copy");
     const labelInp = document.createElement("input");
@@ -1798,11 +1979,12 @@ function labeledAssetCard(node, ds, idx) {
     const usage = el("div", "h3d-asset-usage");
     const usedBy = (ds.segments || []).filter((s) => (s.refs || []).includes(a.label)).length;
     const defaultAll = (ds.segments || []).every((s) => !(s.refs || []).length);
-    usage.innerHTML = `<span class="h3d-chip">全局图${idx + 1}</span>`
+    const sameKind = ds.ref_assets.filter((x) => (x.kind || "image") === kind).length;
+    usage.innerHTML = `<span class="h3d-chip">${KIND_ICON[kind]}${KIND_NAME[kind]}·${sameKind}/${KIND_CAPS[kind]}</span>`
         + (usedBy ? `<span class="h3d-chip ok">${usedBy} 段指定</span>` : "")
         + (defaultAll && (ds.segments || []).length ? '<span class="h3d-chip cyan">默认全段引用</span>' : "");
     copy.append(labelInp, quick, usage,
-        el("small", "", `${escapeHtml(file)} · 提示词写 [[${escapeHtml(a.label)}]]`));
+        el("small", "", `${escapeHtml(file)} · 提示词写 [[${escapeHtml(a.label)}]] → &lt;${KIND_TOKEN[kind]} k&gt;`));
 
     const acts = el("div", "h3d-asset-acts");
     const rm = el("button", "h3d-btn h3d-btn-danger", "✕");
@@ -1861,25 +2043,35 @@ function renderAssetsZone(sec, data) {
         const acts = card.querySelector(".h3d-asset-acts") || el("div", "h3d-asset-acts");
         const up = el("button", "h3d-btn h3d-btn-cyan", file ? "替换" : "上传");
         up.title = "上传图片到 input 目录，文件名存入导演台状态，画布「首帧图」节点同步点亮";
-        up.onclick = () => pickImage("first");
+        up.onclick = () => pickAsset("first");
         acts.insertBefore(up, acts.firstChild);
         if (!card.querySelector(".h3d-asset-acts")) card.append(acts);
         box.append(card);
     } else {
-        /* 多参：标签素材池（状态驱动 + 画布镜像） */
+        /* 多参：标签素材池（图/视/音三类，状态驱动 + 画布镜像） */
         ds.ref_assets.forEach((_a, i) => {
             box.append(labeledAssetCard(node, ds, i));
         });
-        if (ds.ref_assets.length < 9) {
-            const add = el("button", "h3d-btn h3d-addasset", "＋ 添加参考图片");
-            add.title = "上传图片 → 存入标签素材池（配套工作流对应节点自动点亮；手摆工作流不受影响）";
-            add.onclick = () => pickImage("ref");
-            box.append(add);
+        const upRow = el("div", "h3d-upload-row");
+        for (const k of KIND_LIST) {
+            const sameKind = ds.ref_assets.filter((a) => (a.kind || "image") === k).length;
+            const full = sameKind >= KIND_CAPS[k];
+            const b = el("button", "h3d-btn h3d-addasset", `＋ ${KIND_NAME[k]}`);
+            b.disabled = full;
+            b.title = full
+                ? `${KIND_NAME[k]}素材已达上限 ${KIND_CAPS[k]} 个（官方单段上限）`
+                : `上传${KIND_NAME[k]} → 存入标签素材池（提示词写 [[标签]] → &lt;${KIND_TOKEN[k]} k&gt;；`
+                    + `配套工作流对应节点自动点亮，手摆工作流不受影响）`;
+            b.onclick = () => pickAsset("pool", k);
+            upRow.append(b);
         }
+        box.append(upRow);
     }
     sec.append(box);
     sec.append(el("div", "h3d-foot",
-        "标签素材池：每张图打标签（角色1 / 场景1…），段落卡片里勾选本段引用哪些，提示词写 [[标签]] 引用（后端按段重编号为 &lt;Picture k&gt;）。<br>"
+        "标签素材池（图 ≤9 / 视 ≤3 / 音 ≤3，官方单段上限）：每类素材打标签（角色1 / 场景1…），"
+        + "段落卡片里勾选本段引用哪些——未勾选的素材不进该段（后端按段压实重编号），提示词写 [[标签]] 引用"
+        + "（图→&lt;Picture k&gt;、视→&lt;Video k&gt;、音→&lt;Audio j&gt;）。参考视频的原声自动配对，无需单独传音轨。<br>"
         + "配套工作流下素材节点由导演台点亮/隐藏——连线常驻，只是隐藏，请勿删除。"));
 }
 
@@ -2022,33 +2214,29 @@ function renderHistoryZone(sec, data) {
             const dl = el("a", "h3d-dl", "⬇ 下载");
             dl.href = url; dl.download = it.file;
             acts.append(open, dl);
-            if (deleteRouteOk) {
-                const del = el("button", "h3d-btn h3d-btn-danger", "🗑 删除");
-                del.title = "删除成片文件（二次确认）";
-                del.onclick = async () => {
-                    if (del.dataset.armed !== "1") {
-                        del.dataset.armed = "1";
-                        del.textContent = "确认删除？";
-                        setTimeout(() => { del.dataset.armed = ""; del.textContent = "🗑 删除"; }, 2500);
-                        return;
-                    }
-                    try {
-                        const r = await fetch("/h3chain/delete", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ file: `${prefix}/${it.file}` }),
-                        });
-                        if (r.ok) { refresh(); return; }
-                        if (r.status === 404) { deleteRouteOk = false; alert("删除路由不可用：当前引擎分支未合并 /h3chain/delete，已隐藏删除按钮"); refresh(); return; }
-                        alert("删除失败（文件可能已被移动）");
-                    } catch (e) {
-                        deleteRouteOk = false;
-                        alert("删除路由不可用：已隐藏删除按钮");
-                        refresh();
-                    }
-                };
-                acts.append(del);
-            }
+            const del = el("button", "h3d-btn h3d-btn-danger", "🗑 删除");
+            del.title = "删除成片文件（二次确认）";
+            del.onclick = async () => {
+                if (del.dataset.armed !== "1") {
+                    del.dataset.armed = "1";
+                    del.textContent = "确认删除？";
+                    setTimeout(() => { del.dataset.armed = ""; del.textContent = "🗑 删除"; }, 2500);
+                    return;
+                }
+                try {
+                    const r = await fetch("/h3chain/delete", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ file: `${prefix}/${it.file}` }),
+                    });
+                    if (r.ok) { refresh(); return; }
+                    if (r.status === 404 || r.status === 405) { alert("删除路由未注册（HTTP " + r.status + "）：请重启 ComfyUI（日志应出现「路由已注册」）后刷新浏览器重试。"); return; }
+                    alert("删除失败（文件可能已被移动）");
+                } catch (e) {
+                    alert("删除请求失败：" + e);
+                }
+            };
+            acts.append(del);
             meta.append(acts);
             card.append(meta);
             box.append(card);

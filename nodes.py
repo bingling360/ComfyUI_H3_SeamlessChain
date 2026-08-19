@@ -253,6 +253,30 @@ def _load_input_image(filename):
     return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
 
 
+def _load_input_video(filename):
+    """input 目录视频 -> (帧张量, 音轨)：与 LoadVideo+GetVideoComponents 画布链同格式。
+
+    音轨与帧同源自同一文件，即「参考视频音轨」自动配对，无需单独上传。
+    """
+    from comfy_api.latest import InputImpl
+    video_path = folder_paths.get_annotated_filepath(str(filename))
+    comps = InputImpl.VideoFromFile(video_path).get_components()
+    if comps.images is None or not getattr(comps.images, "shape", None):
+        raise ValueError(f"参考视频「{filename}」解不出画面帧：请确认是可解码的 24fps 视频（2-15 秒）")
+    if comps.audio is None:
+        import torch as _t
+        comps.audio = {"waveform": _t.zeros(1, 1, 0), "sample_rate": 24000}
+    return comps.images, comps.audio
+
+
+def _load_input_audio(filename):
+    """input 目录音频 -> AUDIO dict（与 LoadAudio 节点输出同格式）。"""
+    from comfy_extras.nodes_audio import load
+    audio_path = folder_paths.get_annotated_filepath(str(filename))
+    waveform, sample_rate = load(audio_path)
+    return {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
+
+
 def _parse_director_state(raw):
     """解析导演台状态 JSON。空/非法时返回空 dict，不影响原有画布接线工作流。"""
     if not raw:
@@ -292,25 +316,51 @@ def _snap_seconds(seconds):
     return 17 * k + 5
 
 
-def _apply_label_tokens(prompt, label_order):
-    """把提示词中的 [[标签]] 替换为该段压实编号后的 <Picture k>。
+REF_CAPS = {"image": 9, "video": 3, "audio": 3}   # 官方单段参考上限（nodes_minimax_h3 autogrow max）
+_KIND_NAME = {"image": "图片", "video": "视频", "audio": "音频"}
 
-    label_order 为该段按序引用的标签（第 j 个 → <Picture j+1>）；长标签先替换，
-    防「角色1」吃掉「角色10」前缀；剩余未知 [[..]] 报错并列出可用标签。
+
+def _normalize_order(label_order):
+    """段引用顺序 -> [(kind, 标签)]；纯字符串元素按旧格式视为 image（兼容旧调用/旧测试）。"""
+    out = []
+    for x in label_order:
+        out.append(("image", x) if isinstance(x, str) else (str(x[0]), str(x[1])))
+    return out
+
+
+def _kind_tokens(label_order):
+    """[(kind, 标签)] -> 按类别独立编号的 {标签: token}（图 <Picture k> / 视 <Video k> / 音 <Audio j>）。"""
+    counters = {"image": 0, "video": 0, "audio": 0}
+    mapping = {}
+    for kind, lbl in label_order:
+        counters[kind] = counters.get(kind, 0) + 1
+        token = {"image": "<Picture {}>", "video": "<Video {}>", "audio": "<Audio {}>"}.get(kind)
+        if token is None:
+            raise ValueError(f"未知素材类别「{kind}」：必须是 image / video / audio")
+        mapping[lbl] = token.format(counters[kind])
+    return mapping
+
+
+def _apply_label_tokens(prompt, label_order):
+    """把提示词中的 [[标签]] 替换为该段压实编号后的 <Picture k>/<Video k>/<Audio j>。
+
+    label_order 为该段按序引用的 (kind, 标签)（或旧格式纯标签=image）；各类别独立从 1
+    编号；长标签先替换，防「角色1」吃掉「角色10」前缀；剩余未知 [[..]] 报错并列出可用标签。
     """
-    mapping = {lbl: f"<Picture {j + 1}>" for j, lbl in enumerate(label_order)}
+    mapping = _kind_tokens(_normalize_order(label_order))
     out = prompt
     for lbl in sorted(mapping, key=len, reverse=True):
         out = out.replace(f"[[{lbl}]]", mapping[lbl])
     unknown = _LABEL_TOKEN.findall(out)
     if unknown:
-        raise ValueError(f"提示词引用了未知素材标签「{unknown[0].strip()}」：可用标签 {list(label_order)}")
+        raise ValueError(f"提示词引用了未知素材标签「{unknown[0].strip()}」：可用标签 {list(mapping)}")
     return out
 
 
 def _reference_header(label_order):
-    """段首自动注入的参考映射行（官方建议显式指派每个参考的职责）。"""
-    return "参考：" + "，".join(f"<Picture {j + 1}>={lbl}" for j, lbl in enumerate(label_order)) + "。"
+    """段首自动注入的参考映射行（官方建议显式指派每个参考的职责），三类 token 各自编号。"""
+    mapping = _kind_tokens(_normalize_order(label_order))
+    return "参考：" + "，".join(f"{tok}={lbl}" for lbl, tok in mapping.items()) + "。"
 
 
 class H3SeamlessChainSampler(io.ComfyNode):
@@ -471,32 +521,43 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if not seg_prompts:
             raise ValueError("提示词不能为空：请在导演台填写提示词，或在「提示词组」里每段添加一个输入框并填写内容")
 
-        # 素材池（标签->文件）：ref_assets 为 v2 真源；旧 ref_images 自动补默认标签「图片N」
-        pool_files = []
+        # 素材池（标签->文件，分 图/视/音 三类）：ref_assets 为 v2 真源；旧 ref_images 视为图片
+        pool_files = []   # [(kind, label, file)]
+        _kind_n = {"image": 0, "video": 0, "audio": 0}
         if isinstance(ds.get("ref_assets"), list) and ds["ref_assets"]:
             for item in ds["ref_assets"]:
-                if isinstance(item, dict) and item.get("file"):
-                    label = str(item.get("label") or "").strip() or f"图片{len(pool_files) + 1}"
-                    pool_files.append((label[:24], str(item["file"])))
+                if not (isinstance(item, dict) and item.get("file")):
+                    continue
+                _k = str(item.get("kind") or "image")
+                if _k not in _KIND_NAME:
+                    _k = "image"
+                label = str(item.get("label") or "").strip()
+                if not label:
+                    # 缺省标签只对未命名素材按类别计数（与前端 getDs 一致）
+                    _kind_n[_k] += 1
+                    label = f"{_KIND_NAME[_k]}{_kind_n[_k]}"
+                pool_files.append((_k, label[:24], str(item["file"])))
         elif ds.get("ref_images") and isinstance(ds["ref_images"], list):
-            pool_files = [(f"图片{i + 1}", str(fn)) for i, fn in enumerate(ds["ref_images"]) if fn]
+            pool_files = [("image", f"图片{i + 1}", str(fn)) for i, fn in enumerate(ds["ref_images"]) if fn]
         _seen = set()
-        for _i, (_lbl, _fn) in enumerate(pool_files):
+        for _i, (_k, _lbl, _fn) in enumerate(pool_files):
             _base, _n = _lbl, 2
             while _lbl in _seen:
                 _lbl = f"{_base}{_n}"
                 _n += 1
             _seen.add(_lbl)
-            pool_files[_i] = (_lbl, _fn)
-        pool_labels = [lbl for lbl, _ in pool_files]
+            pool_files[_i] = (_k, _lbl, _fn)
+        pool_labels = [lbl for _, lbl, _ in pool_files]
+        pool_kind = {lbl: k for k, lbl, _ in pool_files}
+        pool_file_of = {lbl: fn for _, lbl, fn in pool_files}
 
         segments = ds.get("segments") if isinstance(ds.get("segments"), list) else []
 
-        # 分段处理中心：组合场景/角色提示词；[[标签]] -> <Picture k>；段首自动参考映射行
+        # 分段处理中心：组合场景/角色提示词；[[标签]] -> <Picture>/<Video>/<Audio>；段首自动参考映射行
         seg_composed = 0
         seg_custom_refs = 0
-        seg_label_orders = [[] for _ in seg_prompts]
-        if segments:
+        seg_label_orders = [[] for _ in seg_prompts]   # 每段 [(kind, 标签)]，按勾选顺序
+        if segments or pool_files:
             composed_prompts = []
             for i, prompt in enumerate(seg_prompts):
                 seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
@@ -504,26 +565,38 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 char = str(seg.get("character_prompt", "")).strip()
                 parts = [p for p in (scene, char, prompt) if p]
                 full = "\n".join(parts)
-                if pool_labels:
+                if pool_files:
                     refs_sel = seg.get("refs")
+                    order = []
                     if isinstance(refs_sel, list) and refs_sel:
-                        order = []
                         for r in refs_sel:
                             lbl = str(r).strip()
                             if lbl not in pool_labels:
                                 raise ValueError(f"段{i + 1} 引用了未知素材标签「{lbl}」：可用标签 {pool_labels}")
-                            if lbl not in order:
-                                order.append(lbl)
-                        seg_label_orders[i] = order
+                            item = (pool_kind[lbl], lbl)
+                            if item not in order:
+                                order.append(item)
                         seg_custom_refs += 1
+                        # 提示词里 [[标签]] 提到但没勾选的素材：按出现顺序并入，防勾选/文本失配报错
+                        for tok in _LABEL_TOKEN.findall(full):
+                            lbl = tok.strip()
+                            if lbl in pool_labels and (pool_kind[lbl], lbl) not in order:
+                                order.append((pool_kind[lbl], lbl))
                     else:
-                        seg_label_orders[i] = list(pool_labels)
-                    # refs 缺省/显式空 = 引用全部素材（与旧行为一致，避免 ref2va 链空参考段）
-                    if seg_label_orders[i]:
-                        has_pic = "<Picture" in full
-                        full = _apply_label_tokens(full, seg_label_orders[i])
+                        # refs 缺省/显式空 = 引用全部素材（与旧行为一致，避免 ref2va 链空参考段）
+                        order = [(k, lbl) for k, lbl, _ in pool_files]
+                    # 官方单段上限：图 9 / 视 3 / 音 3（超了报错并指出勾选明细）
+                    for _k, _cap in REF_CAPS.items():
+                        _picked = [lbl for k, lbl in order if k == _k]
+                        if len(_picked) > _cap:
+                            raise ValueError(f"段{i + 1} 引用{_KIND_NAME[_k]}素材 {len(_picked)} 个，"
+                                             f"超过官方单段上限 {_cap} 个（{_picked}）：请在段卡片少勾几个")
+                    seg_label_orders[i] = order
+                    if order:
+                        has_pic = "<Picture" in full or "<Video" in full or "<Audio" in full
+                        full = _apply_label_tokens(full, order)
                         if not has_pic:
-                            full = _reference_header(seg_label_orders[i]) + "\n" + full
+                            full = _reference_header(order) + "\n" + full
                 if scene or char:
                     seg_composed += 1
                 composed_prompts.append(full)
@@ -543,22 +616,32 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if ds.get("first_frame"):
             首帧图片 = _load_input_image(ds["first_frame"])
 
-        # 参考图片素材池（标签->张量）：JSON 池优先，空则回退画布 autogrow（按位补默认标签）
-        if pool_files:
-            pool_tensors = {lbl: _load_input_image(fn) for lbl, fn in pool_files}
-        else:
-            _canvas_imgs = _autogrow_items(参考图片组, "ref_image_")
-            pool_tensors = {f"图片{j + 1}": v for j, v in enumerate(_canvas_imgs.values())}
-            if pool_tensors:
-                pool_labels = list(pool_tensors.keys())
-                seg_label_orders = [list(pool_labels) for _ in seg_prompts]
-
+        # 素材池张量（按类别）：JSON 池各类别独立加载；图片池空时回退画布 autogrow（全段共用）
+        pool_tensors = {"image": {}, "video": {}, "audio": {}}
+        for _k, _lbl, _fn in pool_files:
+            if _k == "image":
+                pool_tensors["image"][_lbl] = _load_input_image(_fn)
+            elif _k == "video":
+                pool_tensors["video"][_lbl] = _load_input_video(_fn)   # (帧张量, 同源音轨)
+            else:
+                pool_tensors["audio"][_lbl] = _load_input_audio(_fn)
         refs = {
             "ref_videos": _autogrow_items(参考视频组, "ref_video_"),
             "ref_video_audios": _autogrow_items(参考视频音轨组, "ref_video_audio_"),
             "ref_audios": _autogrow_items(参考音频组, "ref_audio_"),
         }
-        has_refs = bool(pool_tensors) or any(refs.values())
+        if not pool_tensors["image"]:
+            _canvas_imgs = _autogrow_items(参考图片组, "ref_image_")
+            pool_tensors["image"] = {f"图片{j + 1}": v for j, v in enumerate(_canvas_imgs.values())}
+            if pool_tensors["image"]:
+                pool_labels = list(pool_tensors["image"].keys())
+                seg_label_orders = [[("image", l) for l in pool_labels] for _ in seg_prompts]
+        # 状态池某类非空时该类覆盖画布接线（视频/音频与图片同规则），另一类画布接线仍生效
+        if pool_tensors["video"]:
+            refs["ref_videos"], refs["ref_video_audios"] = {}, {}
+        if pool_tensors["audio"]:
+            refs["ref_audios"] = {}
+        has_refs = any(pool_tensors.values()) or any(refs.values())
         if 首帧图片 is not None and has_refs:
             raise ValueError("首帧图片（i2v，fl2va UNET）与参考素材（r2v，ref2va UNET）不能同时使用")
         if 起始视频 is not None and 首帧图片 is not None:
@@ -604,13 +687,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if seg_composed:
             report.append(f"分段处理：{seg_composed}/{len(seg_prompts)} 段含场景/角色提示词（已组合到主提示词前）")
         if has_refs:
-            _pool_names = {lbl: dict(pool_files).get(lbl, "画布") for lbl in pool_tensors}
+            _k_short = {"image": "图", "video": "视", "audio": "音"}
             _parts = []
-            if pool_tensors:
-                _parts.append("、".join(f"{lbl}（{_fn}）" for lbl, _fn in _pool_names.items()))
+            if pool_files:
+                _stat = "、".join(f"{_k_short[k]}×{sum(1 for kk, _, _ in pool_files if kk == k)}"
+                                  for k in ("image", "video", "audio")
+                                  if any(kk == k for kk, _, _ in pool_files))
+                _names = "、".join(f"{_k_short[k]}·{lbl}（{pool_file_of.get(lbl, '画布')}）"
+                                   for k, lbl, _f in pool_files)
+                _parts.append(f"池 {_stat}（{_names}）")
             counts = " ".join(f"{k}={len(v)}" for k, v in refs.items() if v)
             if counts:
-                _parts.append(counts)
+                _parts.append(f"画布接线 {counts}")
             if seg_custom_refs:
                 _parts.append(f"段级子集 {seg_custom_refs}/{len(seg_prompts)} 段自定义")
             report.append("参考素材：" + " | ".join(_parts))
@@ -645,12 +733,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
             "sampler": 采样器, "scheduler": 调度器, "chain": chain,
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
-        # 逐段哈希：默认时长的段哈希与旧公式一致（旧存档续跑不受影响）；
-        # 改过时长的段把帧数并入哈希 → 自动从该段重做
-        seg_hashes = [
-            checkpoint.prompt_hash(p if seg_lengths[i] == length else f"{seg_lengths[i]}|{p}")
-            for i, p in enumerate(seg_prompts)
-        ]
+        # 逐段哈希：默认时长且未自定义段级引用的段哈希与旧公式一致（旧存档续跑不受影响）；
+        # 改过时长/引用的段把帧数/引用串并入哈希 → 自动从该段重做（否则只改勾选不触发重做）
+        _hash_refs = bool(pool_files)   # 仅状态池段级引用进哈希；画布回退不进（保旧档兼容）
+        seg_hashes = []
+        for i, p in enumerate(seg_prompts):
+            tag = p
+            if seg_lengths[i] != length:
+                tag = f"{seg_lengths[i]}|{tag}"
+            if _hash_refs and seg_label_orders[i]:
+                tag = f"{','.join(lbl for _k, lbl in seg_label_orders[i])}|{tag}"
+            seg_hashes.append(checkpoint.prompt_hash(tag))
         prologue_hash = None
         if 起始视频 is not None:
             f0 = 起始视频[0].detach().float().cpu()
@@ -789,11 +882,29 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 first_free = (i == 0 and off == 0)  # 无序章时首段无重叠桥
                 seg_len = seg_lengths[i] + (0 if first_free else ctx)
                 if has_refs:
-                    seg_refs = dict(refs)
-                    seg_refs["ref_images"] = {
-                        f"ref_image_{j}": pool_tensors[lbl]
-                        for j, lbl in enumerate(seg_label_orders[i]) if lbl in pool_tensors
-                    }
+                    # 段级注入：只把本段勾选的素材压实进 conditioning（未勾选的根本不进本段），
+                    # 三类各自独立编号 ref_image_/ref_video_/ref_audio_（<Picture>/<Video>/<Audio>）
+                    seg_refs = {"ref_images": {}, "ref_videos": {}, "ref_video_audios": {}, "ref_audios": {}}
+                    _n = {"image": 0, "video": 0, "audio": 0}
+                    for _k, _lbl in seg_label_orders[i]:
+                        if _lbl not in pool_tensors.get(_k, {}):
+                            continue
+                        if _k == "image":
+                            seg_refs["ref_images"][f"ref_image_{_n['image']}"] = pool_tensors["image"][_lbl]
+                        elif _k == "video":
+                            _imgs, _aud = pool_tensors["video"][_lbl]
+                            seg_refs["ref_videos"][f"ref_video_{_n['video']}"] = _imgs
+                            seg_refs["ref_video_audios"][f"ref_video_audio_{_n['video']}"] = _aud
+                        else:
+                            seg_refs["ref_audios"][f"ref_audio_{_n['audio']}"] = pool_tensors["audio"][_lbl]
+                        _n[_k] += 1
+                    # 未被状态池接管的画布接线类别：沿用旧行为全段共用，编号接在状态素材之后
+                    for j, v in enumerate(refs["ref_videos"].values()):
+                        seg_refs["ref_videos"][f"ref_video_{_n['video'] + j}"] = v
+                    for j, v in enumerate(refs["ref_video_audios"].values()):
+                        seg_refs["ref_video_audios"][f"ref_video_audio_{_n['video'] + j}"] = v
+                    for j, v in enumerate(refs["ref_audios"].values()):
+                        seg_refs["ref_audios"][f"ref_audio_{_n['audio'] + j}"] = v
                     out = MiniMaxH3ReferenceToVideo.execute(
                         clip=clip, vae=video_vae, audio_vae=audio_vae,
                         prompt=prompt, width=width, height=height, length=seg_len,

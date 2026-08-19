@@ -90,6 +90,8 @@ function buildGallery(node) {
                     body: JSON.stringify({ file: `${pre}/${it.file}` }),
                 });
                 if (r.ok) renderHistory();
+                else if (r.status === 404 || r.status === 405)
+                    alert("删除路由未注册（HTTP " + r.status + "）：请重启 ComfyUI 加载修复后的插件后刷新浏览器");
                 else alert("删除失败（路由不可用或文件已被移动）");
             };
             body.append(card);

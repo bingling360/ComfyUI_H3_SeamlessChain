@@ -18,19 +18,21 @@ from test_node_structure import _install_stubs
 
 
 def test_safe_name():
-    from ComfyUI_H3_SeamlessChain import routes
-    for ok in ("链A", "h3chain_864x480", "20260818_120000_x", "a"):
-        assert routes.safe_name(ok) == ok
-    for bad in ("", "  ", ".", "..", "a/b", "a\\b", "c:d", ".hidden", "../up", None):
-        assert routes.safe_name(bad) is None
+    with _server_env():
+        from ComfyUI_H3_SeamlessChain import routes
+        for ok in ("链A", "h3chain_864x480", "20260818_120000_x", "a"):
+            assert routes.safe_name(ok) == ok
+        for bad in ("", "  ", ".", "..", "a/b", "a\\b", "c:d", ".hidden", "../up", None):
+            assert routes.safe_name(bad) is None
 
 
 def test_safe_relfile():
-    from ComfyUI_H3_SeamlessChain import routes
-    assert routes.safe_relfile("h3_chain/final_1.mp4") == "h3_chain/final_1.mp4"
-    for bad in ("h3_chain", "a/b/c.mp4", "../h3_chain/x.mp4", "h3_chain/noext",
-                "", ".hidden/x.mp4", "/abs/path.mp4"):
-        assert routes.safe_relfile(bad) is None                # 恒两级、可读名、带扩展名
+    with _server_env():
+        from ComfyUI_H3_SeamlessChain import routes
+        assert routes.safe_relfile("h3_chain/final_1.mp4") == "h3_chain/final_1.mp4"
+        for bad in ("h3_chain", "a/b/c.mp4", "../h3_chain/x.mp4", "h3_chain/noext",
+                    "", ".hidden/x.mp4", "/abs/path.mp4"):
+            assert routes.safe_relfile(bad) is None                # 恒两级、可读名、带扩展名
 
 
 class _Req:
@@ -78,12 +80,16 @@ def _server_env():
         yield out, router
     finally:
         del sys.modules["folder_paths"], sys.modules["aiohttp"]
+        # 插件模块也一并出缓存：routes 顶层绑定了 folder_paths.get_output_directory，
+        # 不清的话第二个用例会拿到已 rmtree 的旧临时目录
+        for k in [k for k in sys.modules if k.startswith("ComfyUI_H3_SeamlessChain")]:
+            del sys.modules[k]
         shutil.rmtree(out)
 
 
 def test_routes_endpoints():
     with _server_env() as (out, router):
-        assert set(router.table) == {"/h3chain/delete"}
+        assert set(router.table) == {"/h3chain/delete", "/h3chain/delete_archive"}
 
         # delete 文件：限 output 内两级路径
         fdir = os.path.join(out, "h3_chain")
@@ -97,6 +103,71 @@ def test_routes_endpoints():
             assert resp["status"] == 404
         resp = asyncio.run(router.table["/h3chain/delete"](_Req({})))
         assert resp["status"] == 400                              # 缺参数
+
+
+def test_delete_archive():
+    with _server_env() as (out, router):
+        handler = router.table["/h3chain/delete_archive"]
+        # 同时存在 checkpoints 与 h3_auto 下的同名存档：一起删除
+        for sub in ("checkpoints", "h3_auto"):
+            d = os.path.join(out, sub, "链A")
+            os.makedirs(d)
+            open(os.path.join(d, "x.bin"), "wb").close()
+        # checkpoints/链A 还带状态指针 -> 删除后指针一并清掉
+        state = os.path.join(out, "checkpoints", "h3chain_state.json")
+        with open(state, "w", encoding="utf-8") as f:
+            f.write('{"dir": "链A"}')
+        resp = asyncio.run(handler(_Req({"dir": "链A"})))
+        assert resp["json"]["ok"] is True
+        assert set(resp["json"]["deleted"]) == {"checkpoints/链A", "h3_auto/链A"}
+        assert not os.path.exists(os.path.join(out, "checkpoints", "链A"))
+        assert not os.path.exists(os.path.join(out, "h3_auto", "链A"))
+        assert not os.path.exists(state)                          # 指向被删目录的状态指针已清
+
+        # 无效名 / 缺参数 -> 400；不存在的存档 -> 404
+        for bad in ({"dir": "../up"}, {"dir": "a/b"}, {}):
+            assert asyncio.run(handler(_Req(bad)))["status"] == 400
+        assert asyncio.run(handler(_Req({"dir": "nope"})))["status"] == 404
+
+        # 删除别的存档不清别人的指针
+        os.makedirs(os.path.join(out, "checkpoints", "链B"))
+        with open(state, "w", encoding="utf-8") as f:
+            f.write('{"dir": "链B"}')
+        asyncio.run(handler(_Req({"dir": "链A"})))                # 链A 已不存在 -> 404，指针不动
+        assert asyncio.run(handler(_Req({"dir": "链A"})))["status"] == 404
+        assert os.path.exists(state)
+
+
+def test_register_promptserver():
+    """register()：server stub 注入 -> 挂到 PromptServer.instance.routes；幂等不重复挂。"""
+    import types as _types
+    with _server_env():
+        router2 = _Router()
+        srv = _types.ModuleType("server")
+
+        class _PS:
+            instance = _types.SimpleNamespace(routes=router2)
+
+        srv.PromptServer = _PS
+        sys.modules["server"] = srv
+        try:
+            from ComfyUI_H3_SeamlessChain import routes as r1
+            assert r1.register() is True
+            assert set(router2.table) == {"/h3chain/delete", "/h3chain/delete_archive"}
+            assert r1.register() is True                     # 幂等：防重复注册
+            assert len(router2.table) == 2
+            resp = asyncio.run(router2.table["/h3chain/delete_archive"](_Req({"dir": "nope"})))
+            assert resp["status"] == 404                     # 挂载的 handler 真实可用
+        finally:
+            del sys.modules["server"]
+
+
+def test_register_no_server_module():
+    """测试环境（无 server 模块）：register() 返回 False 且不抛异常。"""
+    with _server_env():
+        from ComfyUI_H3_SeamlessChain import routes as r2
+        sys.modules.pop("server", None)
+        assert r2.register() is False
 
 
 if __name__ == "__main__":
