@@ -1399,6 +1399,8 @@ function injectStyles() {
     .h3d-select:focus,.h3d-seedrow input:focus{border-color:#a8d8bd}
     .h3d-seedrow{display:flex;gap:5px}
     .h3d-seedrow input{flex:1;min-width:0}
+    .h3d-seedrow input::-webkit-outer-spin-button,.h3d-seedrow input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+    .h3d-seedrow input[type=number]{-moz-appearance:textfield;appearance:textfield}
     .h3d-seedrow .h3d-btn{padding:4px 8px;flex:none}
     .h3d-psec .h3d-foot,.h3d-asec .h3d-foot,.h3d-projsec .h3d-foot{padding:0 16px 14px}
 
@@ -2305,12 +2307,13 @@ function renderWidgetField(node, name, labelOverride) {
         if (w.options && Number.isFinite(w.options.min)) inp.min = w.options.min;
         if (w.options && Number.isFinite(w.options.max)) inp.max = w.options.max;
         inp.onchange = () => setWidgetValue(node, name, Number(inp.value));
+        inp.addEventListener("wheel", (e) => e.preventDefault(), { passive: false });   // 滚轮滚动面板时不改数值
         row.append(inp);
         if (name === W_MP) {
             row.append(el("span", "h3d-secs-hint", "MP"));
-            inp.title = "目标总像素 0.1–2.0MP（步进0.1，箭头微调；官方口径 1MP=1024×1024）："
+            inp.title = "目标总像素 0.1–2.0MP，直接输入数字（官方口径 1MP=1024×1024）："
                 + "0.2 草稿(608×352) / 0.5 预览(960×544) / 0.98 H3原生(1344×768) / 1.0(1376×768) / 2.0(1920×1088)";
-            inp.min = inp.min || 0.1;   // 控件 options 未下发时兜底，防箭头越界
+            inp.min = inp.min || 0.1;   // 控件 options 未下发时兜底
             inp.max = inp.max || 2.0;
         }
         if (name === W_SEED) {
