@@ -209,6 +209,7 @@ def test_structure():
     assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
     assert by_id["种子"].kwargs.get("control_after_generate") is True
     assert by_id["自动存档"].kwargs.get("options") == ["关闭", "自动存档"]
+    assert by_id["自动存档"].kwargs.get("advanced") is True   # 自动保存默认开已覆盖其作用，收进高级参数
     assert by_id["自动保存"].kwargs.get("options") == ["关闭", "分段+成片"]
     assert by_id["自动保存"].kwargs.get("default") == "分段+成片"
     assert "提示词清单" not in ids                   # 控制台已回退，清单输入随之移除

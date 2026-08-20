@@ -476,8 +476,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Float.Input("CFG", default=1.0, min=0.0, max=100.0, step=0.1),
                 io.Combo.Input("采样器", options=comfy.samplers.KSampler.SAMPLERS, default="res_multistep"),
                 io.Combo.Input("调度器", options=comfy.samplers.KSampler.SCHEDULERS, default="simple"),
-                io.Combo.Input("自动存档", options=["关闭", "自动存档"], default="关闭",
-                               tooltip="自动存档：每段采样后立即落盘 latent 存档（约5MB/段），中断后重跑自动跳过已完成段，结果与一次跑完一致"),
+                io.Combo.Input("自动存档", options=["关闭", "自动存档"], default="关闭", advanced=True,
+                               tooltip="自动存档：每段采样后立即落盘 latent 存档（约5MB/段），中断后重跑自动跳过已完成段，结果与一次跑完一致。"
+                                       "注意：「自动保存」默认开（分段+成片）且「审片模式」都会自动启用存档，"
+                                       "本开关仅在两者全关时才有独立作用（纯 latent 续跑、不出 mp4 的调试场景）"),
                 io.String.Input("存档目录", default="",
                                 tooltip="项目名：output/h3_projects/<项目名>/ 一个项目一个文件夹（视频/提示词/成片/latent 全在内）。"
                                         "空=按参数指纹自动命名；填了名字即固定项目：中断重跑、改词重跑都续在这个文件夹"),
