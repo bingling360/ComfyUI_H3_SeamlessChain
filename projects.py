@@ -176,6 +176,46 @@ def delete_project(name: str):
     return f"h3_projects/{name}"
 
 
+def upscale_reset(name, seg):
+    """清掉某段的二采记录与产物文件（下次开启二采运行时该段重做）。
+
+    只动 manifest.upscale.segs[seg-1] 与 upseg_* 文件，不碰基础链的段存档、
+    finals 与 merges；段号是 1-based 全局槽位（含序章/插入视频段，与前端
+    段落卡片链位一致）。项目/段号非法抛 ValueError。
+    """
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    try:
+        g = int(seg) - 1
+    except (TypeError, ValueError):
+        raise ValueError(f"段号必须是整数：{seg!r}") from None
+    if g < 0:
+        raise ValueError("段号从 1 开始（1-based 全局槽位）")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    total = int(manifest.get("total") or 0)
+    if total and g >= total:
+        raise ValueError(f"段号 {g + 1} 越界（有效范围 1-{total}）")
+    up = dict(manifest.get("upscale") or {})
+    segs = [x if isinstance(x, dict) else None for x in (up.get("segs") or [])]
+    while len(segs) <= g:
+        segs.append(None)
+    segs[g] = None
+    up["segs"] = segs
+    manifest["upscale"] = up
+    manifest["updated_at"] = time.time()
+    checkpoint.save_manifest(root, manifest)
+    for f in checkpoint.upseg_paths(root, g).values():
+        try:
+            os.remove(os.path.join(root, f))
+        except OSError:
+            pass
+    return manifest
+
+
 def _merge_sources(root: str, manifest: dict, items):
     """合并清单 -> 按序绝对路径列表。非法/缺失抛 ValueError。
 

@@ -361,7 +361,12 @@ function fixInvalidArWidget(node) {
 /* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
 
 function defaultDs() {
-    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [] };
+    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], upscale: defaultUpscale() };
+}
+
+function defaultUpscale() {
+    /* 潜空间放大二采：独立后处理通道（主链完成后清扫），参数不进基础链指纹 */
+    return { on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.45, steps: 15, cfg: 1.0, precision: "fp32", include: [] };
 }
 
 function defaultSegment() {
@@ -424,6 +429,26 @@ function getDs(node) {
             .filter((x) => (insSeen.has(x.pos) ? false : insSeen.add(x.pos)))
             .map((x) => ({ pos: Number(x.pos), file: x.file.trim() }))
             .sort((a, b) => a.pos - b.pos);
+        /* 潜空间放大二采配置（v3 新增；旧 JSON 无此键=默认关闭，后端 parse_state 同口径） */
+        const upRaw = raw.upscale && typeof raw.upscale === "object" ? raw.upscale : {};
+        const upNum = (v, def, lo, hi) => {
+            const n = Number(v);
+            const x = isFinite(n) ? n : def;
+            return Math.min(hi, Math.max(lo, x));
+        };
+        const upscale = {
+            on: upRaw.on !== false,
+            mode: UP_MODES.includes(upRaw.mode) ? upRaw.mode : "关闭",
+            model: typeof upRaw.model === "string" ? upRaw.model : "",
+            arch: upRaw.arch === "3D" ? "3D" : "2D",
+            scale: upNum(upRaw.scale, 2.0, 1.0, 4.0),
+            denoise: upNum(upRaw.denoise, 0.45, 0.05, 1.0),
+            steps: Math.round(upNum(upRaw.steps, 15, 1, 100)),
+            cfg: upNum(upRaw.cfg, 1.0, 0.0, 100.0),
+            precision: UP_PRECISIONS.includes(upRaw.precision) ? upRaw.precision : "fp32",
+            include: (Array.isArray(upRaw.include) ? upRaw.include : [])
+                .map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 0),
+        };
         return {
             mode: MODES.some(([m]) => m === raw.mode) ? raw.mode : MODE_DEFAULT,
             prompts,
@@ -433,6 +458,7 @@ function getDs(node) {
             ref_assets: refAssets,
             segments,
             inserts,
+            upscale,
         };
     } catch (e) {
         return defaultDs();
@@ -664,6 +690,73 @@ function setLastFrame(node, filename) {
 
 function removeLastFrame(node) {
     setLastFrame(node, "");
+}
+
+/* ---- 潜空间放大二采：状态读写（ds.upscale，主链完成后由后端清扫执行） ---- */
+
+const UP_MODES = ["关闭", "跟随生成", "手动选择"];
+const UP_PRECISIONS = ["fp32", "fp16", "bf16"];
+
+function setUpscaleField(node, field, value) {
+    const ds = getDs(node);
+    if (field === "mode") {
+        ds.upscale.mode = value;
+        if (value !== "手动选择") ds.upscale.include = [];   // 切模式清勾选，避免残留误导
+    } else {
+        ds.upscale[field] = value;
+    }
+    setDs(node, ds);
+    scheduleRefresh(60);
+}
+
+/** 手动选择模式：勾/取消某段（slot=0-based 全局槽位，含序章/插入段） */
+function toggleUpscaleInclude(node, slot) {
+    const ds = getDs(node);
+    const inc = new Set(ds.upscale.include || []);
+    if (inc.has(slot)) inc.delete(slot);
+    else inc.add(slot);
+    ds.upscale.include = [...inc].sort((a, b) => a - b);
+    setDs(node, ds);
+    scheduleRefresh(60);
+}
+
+/** 目标画布估算（与后端 target_hw 同口径：latent 偶数对齐=像素 32 倍数） */
+function upTargetCanvas(node, scale) {
+    const w = Number(getWidgetValue(node, W_WIDTH));
+    const h = Number(getWidgetValue(node, W_HEIGHT));
+    if (!isFinite(w) || !isFinite(h) || !w || !h) return "";
+    const even = (x) => { const v = Math.max(2, Math.round(x)); return v + v % 2; };
+    return `${even(w / 16 * scale) * 16}×${even(h / 16 * scale) * 16}`;
+}
+
+/** 清掉某段的二采记录与产物（POST /h3chain/upscale_reset） */
+async function doUpscaleReset(btn, dir, segNo) {
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "重置中…";
+    try {
+        const r = await api.fetchApi("/h3chain/upscale_reset", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dir, seg: segNo }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok && j.ok) {
+            setLed("done", `段${segNo} 二采记录已清除`);
+            scheduleRefresh(300);
+            return;
+        }
+        if (r.status === 404 || r.status === 405) {
+            setApiError(`二采接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`);
+        } else {
+            alert(`重置失败：${j.error || `HTTP ${r.status}`}`);
+        }
+    } catch (e) {
+        alert("重置请求失败：" + e);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = old;
+    }
 }
 
 /* ---- 配套工作流：素材/提示词节点镜像（连线常驻，仅切换 点亮/隐藏） ---- */
@@ -1227,9 +1320,12 @@ async function collectData() {
     /* 诊断 + 项目列表（后端实时扫描磁盘，一个项目一个文件夹） */
     const ping = await apiGet("/h3chain/ping");
     let projects = [];
+    let upscaleModels = [];
     if (ping.ok) {
         const r = await apiGet("/h3chain/projects");
         if (r.ok) projects = r.data?.projects || [];
+        const um = await apiGet("/h3chain/upscale_models");
+        if (um.ok) upscaleModels = um.data?.models || [];
     }
     setApiError(ping.ok ? "" :
         `项目存档接口未注册（HTTP ${ping.status || "??"}）：请重启 ComfyUI 并检查控制台是否出现`
@@ -1296,7 +1392,7 @@ async function collectData() {
             plan = [];
         }
     }
-    return { node, state, mf, plan, drafts, history, prefix, ds, projects, apiOk: ping.ok };
+    return { node, state, mf, plan, drafts, history, prefix, ds, projects, apiOk: ping.ok, upscaleModels };
 }
 
 function statusLine(state, mf, plan) {
@@ -1508,6 +1604,13 @@ function injectStyles() {
     .h3d-adv[open] summary{border-bottom:1px solid #302c25;color:var(--h3d-cyan)}
     .h3d-adv-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px}
     .h3d-adv .h3d-param{margin:0}
+    .h3d-updet{border-color:#2c4a52;background:#141d21}
+    .h3d-updet summary::before{content:"✦ "}
+    .h3d-updet.on{border-color:#316dca80;box-shadow:inset 0 0 0 1px #316dca26}
+    .h3d-updet[open] summary{color:#9ecbff}
+    .h3d-upwarn{grid-column:1/-1;padding:7px 10px;border:1px solid #9a4144;border-radius:7px;background:#402227;color:#f0a0a4;font-size:11.5px;line-height:1.6}
+    .h3d-upcb{width:15px;height:15px;margin:4px 2px 0 0;accent-color:#316dca;cursor:pointer;flex:none}
+    .h3d-card.upable{grid-template-columns:auto 150px minmax(0,1fr);align-items:start}
     .h3d-param{margin:0}
     .h3d-param .h3d-hint{display:block;margin-top:4px}
 
@@ -1658,8 +1761,9 @@ function openDesk() {
         "<strong>段落流水线</strong><small>卡片 = 生成顺序（1–64 段不限，「＋ 添加一段」即可加段；「提示词·1..3」只是画布镜像）；✏ 改词 · 🎲 重摇 · 📎 插视频 · 🎬 分段处理（场景/角色）</small>"));
     const colR = el("aside", "h3d-col right");
     const rParams = el("section", "h3d-rsec h3d-psec");
+    const rUpscale = el("section", "h3d-rsec h3d-upsec");
     const rHist = el("section", "h3d-rsec h3d-hsec");
-    colR.append(rParams, rHist);
+    colR.append(rParams, rUpscale, rHist);
     stage.append(colL, colC, colR);
 
     /* 页脚 */
@@ -1678,7 +1782,7 @@ function openDesk() {
             project: sub,
             colC,
             lProj, lAssets,
-            rParams, rHist,
+            rParams, rUpscale, rHist,
             footInfo, run,
         },
         cardsSig: "",
@@ -1738,12 +1842,17 @@ function updateDesk(data) {
     /* 中栏：状态条 + 进度轨 + 段落卡片（有编辑器/播放中时跳过重渲） */
     renderCenterColumn(z.colC, data);
 
-    /* 右栏：链参数（编辑中不重建）+ 成片历史（播放中不重建） */
+    /* 右栏：链参数（编辑中不重建）+ 二采面板（编辑中不重建）+ 成片历史（播放中不重建） */
     const psig = paramsSig(node);
     const pgrid = z.rParams.querySelector(".h3d-params");
     if (!(pgrid && pgrid.contains(document.activeElement)) && z.rParams.dataset.sig !== psig) {
         z.rParams.dataset.sig = psig;
         renderParamsZone(z.rParams, data);
+    }
+    const usig = upscaleSig(data);
+    if (!z.rUpscale.contains(document.activeElement) && z.rUpscale.dataset.sig !== usig) {
+        z.rUpscale.dataset.sig = usig;
+        renderUpscaleZone(z.rUpscale, data);
     }
     const histSig = prefix + "|" + (history ? history.length + ":" + (history[0]?.file ?? "") : "-")
         + "|" + (state?.dir ?? "") + "|" + (mf?.finals || []).join(",")
@@ -2023,8 +2132,11 @@ function buildCards(data) {
             : isHead ? badge("片头（上传）", "media")
             : isInsert ? badge("插入段", "media") : badge("已完成", "ok");
         const unlinkChip = !isInsert && segData?.unlink ? badge("独立镜头", "warn") : "";
+        const upRec = isDone ? (mf?.upscale?.segs || [])[idx] : null;
+        const upChip = upRec?.done
+            ? badge(`二采${upRec.size?.length ? ` ${upRec.size[0]}×${upRec.size[1]}` : "✓"}`, "cyan") : "";
         const title = el("div", "h3d-ctitle",
-            `<span>段 ${idx + 1}${isInsert ? `（位置 ${it.pos}）` : ""}</span>${stateChip}${unlinkChip}`);
+            `<span>段 ${idx + 1}${isInsert ? `（位置 ${it.pos}）` : ""}</span>${stateChip}${unlinkChip}${upChip}`);
 
         /* 合并模式：已完成段（含序章/插入段）可勾选拼接进 merged_*.mp4 */
         if (mergeSel.on) {
@@ -2045,6 +2157,16 @@ function buildCards(data) {
             } else {
                 card.classList.add("mergeable-off");
             }
+        } else if (data.ds.upscale?.mode === "手动选择" && node && isDone) {
+            /* 手动选择二采：已完成段（含插入视频/序章）勾选后随下次运行二采 */
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.className = "h3d-upcb";
+            cb.checked = (data.ds.upscale.include || []).includes(idx);
+            cb.title = "勾选后点「开始生成」对本段执行潜空间放大二采（外部素材段同样可二采）";
+            cb.onchange = () => toggleUpscaleInclude(node, idx);
+            card.classList.add("upable");
+            card.prepend(cb);
         }
 
         /* 每段时长（秒）：留空=跟随节点默认；显示吸附后的帧数 */
@@ -2287,6 +2409,13 @@ function buildCards(data) {
                 rm.onclick = () => removePromptSegment(node, it.idx);
                 actions.append(rm);
             }
+        }
+        /* 已有二采产物：一键清记录（下次二采运行重做该段；基础链不受影响） */
+        if (upRec?.done && node && state?.dir) {
+            const rst = el("button", "h3d-btn", "↺ 重置二采");
+            rst.title = "清掉本段二采记录与 upseg_* 高清产物（下次二采运行时重做该段；基础链与成片不受影响）";
+            rst.onclick = () => doUpscaleReset(rst, state.dir, idx + 1);
+            actions.append(rst);
         }
         body.append(actions);
 
@@ -2609,6 +2738,197 @@ function renderParamsZone(sec, data) {
     sec.append(grid);
     sec.append(el("div", "h3d-foot",
         "全部节点参数已收纳于此：改「高级设置」同样随工作流保存；「生成模式」由左侧模式条控制。"));
+}
+
+/* ---- 潜空间放大二采面板（右栏，独立后处理通道：主链完成后的清扫执行） ---- */
+
+function upscaleSig(data) {
+    const up = data.ds?.upscale || {};
+    return JSON.stringify([
+        up.mode ?? "", up.model ?? "", up.arch ?? "", up.scale ?? 0, up.denoise ?? 0,
+        up.steps ?? 0, up.cfg ?? 0, up.precision ?? "", (up.include || []).join(","),
+        (data.upscaleModels || []).join(","),
+        data.mf?.upscale?.hash ?? "",
+        (data.mf?.upscale?.segs || []).filter((r) => r && r.done).length,
+        data.state?.done ?? 0,
+        `${getWidgetValue(data.node, W_WIDTH) ?? ""}x${getWidgetValue(data.node, W_HEIGHT) ?? ""}`,
+    ]);
+}
+
+/** 单个数值输入（带单位后缀与滚轮防误触） */
+function upNumField(label, value, min, max, step, tip, commit) {
+    const field = el("div", "h3d-param");
+    field.append(el("label", "", label));
+    const row = el("div", "h3d-seedrow");
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.value = value;
+    inp.min = String(min);
+    inp.max = String(max);
+    inp.step = String(step);
+    inp.title = tip || "";
+    inp.addEventListener("wheel", (e) => e.preventDefault(), { passive: false });
+    inp.onchange = () => {
+        const n = Number(inp.value);
+        if (isFinite(n)) commit(Math.min(max, Math.max(min, n)));
+    };
+    row.append(inp);
+    field.append(row);
+    return field;
+}
+
+function renderUpscaleZone(sec, data) {
+    const { node, state, mf } = data;
+    sec.replaceChildren();
+    const up = data.ds.upscale;
+    const on = up.mode !== "关闭";
+    const models = data.upscaleModels || [];
+    const done = mf?.done ?? state?.done ?? 0;
+    const upRecs = mf?.upscale?.segs || [];
+    const upDone = upRecs.filter((r) => r && r.done).length;
+    const upFinals = (mf?.finals || []).filter((f) => String(f).startsWith("final_up_"));
+
+    const det = el("details", "h3d-adv h3d-updet" + (on ? " on" : ""));
+    det.open = on;
+    det.innerHTML = `<summary>✦ 潜空间放大二采${on ? ' <span class="h3d-chip cyan">已开启</span>' : ""}</summary>`;
+    const body = el("div", "h3d-adv-grid h3d-upgrid");
+
+    if (!node) {
+        body.append(el("div", "h3d-empty", "画布上未找到节点，二采面板不可用"));
+        det.append(body);
+        sec.append(det);
+        return;
+    }
+
+    /* 模式：关闭 / 跟随生成 / 手动选择 */
+    const modeField = el("div", "h3d-param");
+    modeField.append(el("label", "", "模式"));
+    const modeSel = document.createElement("select");
+    modeSel.className = "h3d-select";
+    modeSel.title = "跟随生成：主链每段落盘后自动二采（逐段审片时即「生成一段二采一段」）；"
+        + "手动选择：在段落卡片勾选任意已完成段（含插入视频/序章）后运行；关闭：不执行二采。"
+        + "二采参数不进基础链指纹——改参数只重做二采，不动已生成段";
+    for (const m of UP_MODES) {
+        const o = document.createElement("option");
+        o.value = m;
+        o.textContent = m;
+        if (m === up.mode) o.selected = true;
+        modeSel.append(o);
+    }
+    modeSel.onchange = () => setUpscaleField(node, "mode", modeSel.value);
+    modeField.append(modeSel);
+    body.append(modeField);
+
+    if (on) {
+        /* 放大模型（models/latent_upscale_models/ 目录扫描） */
+        const modelField = el("div", "h3d-param");
+        modelField.append(el("label", "", "放大模型"));
+        const modelSel = document.createElement("select");
+        modelSel.className = "h3d-select";
+        modelSel.title = "神经放大权重（HuggingFace LBH-123-AI/Minimax_h3_latent_Upscaler 下载 "
+            + ".pth/.safetensors 放入 models/latent_upscale_models/，刷新后在此选择）";
+        const mo = document.createElement("option");
+        mo.value = "";
+        mo.textContent = models.length ? "（选择权重）" : "（目录为空）";
+        mo.selected = !up.model;
+        modelSel.append(mo);
+        for (const m of models) {
+            const o = document.createElement("option");
+            o.value = m;
+            o.textContent = m;
+            if (m === up.model) o.selected = true;
+            modelSel.append(o);
+        }
+        modelSel.onchange = () => setUpscaleField(node, "model", modelSel.value);
+        modelField.append(modelSel);
+        body.append(modelField);
+
+        /* 网络架构：2D 残差骨干 / 纯 3D 卷积 */
+        const archField = el("div", "h3d-param");
+        archField.append(el("label", "", "网络架构"));
+        const archSel = document.createElement("select");
+        archSel.className = "h3d-select";
+        archSel.title = "2D=残差骨干+时间卷积（快，上游默认）；3D=纯 3D 卷积（时序一致性更好）——"
+            + "须与权重训练结构匹配，加载时按权重自动推断层数";
+        for (const a of ["2D", "3D"]) {
+            const o = document.createElement("option");
+            o.value = a;
+            o.textContent = a;
+            if (a === up.arch) o.selected = true;
+            archSel.append(o);
+        }
+        archSel.onchange = () => setUpscaleField(node, "arch", archSel.value);
+        archField.append(archSel);
+        body.append(archField);
+
+        /* 精度 */
+        const precField = el("div", "h3d-param");
+        precField.append(el("label", "", "精度"));
+        const precSel = document.createElement("select");
+        precSel.className = "h3d-select";
+        precSel.title = "放大网络推理精度：fp32 最稳；fp16/bf16 省显存（放大后重采样仍在原精度）";
+        for (const p of UP_PRECISIONS) {
+            const o = document.createElement("option");
+            o.value = p;
+            o.textContent = p;
+            if (p === up.precision) o.selected = true;
+            precSel.append(o);
+        }
+        precSel.onchange = () => setUpscaleField(node, "precision", precSel.value);
+        precField.append(precSel);
+        body.append(precField);
+
+        body.append(upNumField("放大倍率", up.scale, 1.0, 4.0, 0.1,
+            "latent H/W 同乘（时间维不变）；目标画布见下方徽章。倍率 1.0 = 纯二采不放大",
+            (v) => setUpscaleField(node, "scale", v)));
+        body.append(upNumField("二采强度", up.denoise, 0.05, 1.0, 0.05,
+            "低强度重去噪补回放大丢失的高频细节：0.35-0.55 常用；过高会改写画面内容，过低无细节增益",
+            (v) => setUpscaleField(node, "denoise", v)));
+        body.append(upNumField("二采步数", up.steps, 1, 100, 1,
+            "重去噪步数（总步数×强度的有效步）：15 步起步，追求细节可 20-25",
+            (v) => setUpscaleField(node, "steps", v)));
+        body.append(upNumField("二采 CFG", up.cfg, 0.0, 100.0, 0.1,
+            "重采样 CFG：H3 常用 1.0（官方推荐低 CFG），与主链可不同",
+            (v) => setUpscaleField(node, "cfg", v)));
+
+        /* 目标画布徽章（latent 偶数对齐 = 像素 32 倍数，与后端 target_hw 同口径） */
+        const target = upTargetCanvas(node, up.scale);
+        if (target) {
+            const b = el("div", "h3d-convbadge",
+                `目标画布 ${escapeHtml(target)}（latent 偶数对齐 · 时间维不变）`);
+            b.title = "基础画布 × 倍率后按 latent 偶数（=像素 32 倍数）对齐；"
+                + "超过 2.5MP 时后端会警告显存压力";
+            body.append(b);
+        }
+        if (up.scale > 2.0) {
+            body.append(el("div", "h3d-upwarn",
+                `注意：倍率 ${up.scale}× 目标画布大，二采显存/耗时显著增加，建议先小倍率试一段`));
+        }
+    }
+    det.append(body);
+
+    /* 分区脚注：模式说明 + 当前进度 */
+    const footBits = [];
+    if (!on) {
+        footBits.push("关闭中：主链照常，不做放大重采样（已产出的 upseg_* 不受影响）");
+    } else if (up.mode === "跟随生成") {
+        footBits.push("跟随生成：每次运行后对新增/失效段自动二采；逐段审片=生成一段二采一段");
+    } else {
+        const inc = up.include || [];
+        footBits.push(inc.length
+            ? `手动选择：已勾选 ${inc.length} 段（段 ${inc.map((s) => s + 1).join("、")}），点「开始生成」执行`
+            : "手动选择：在中间段落卡片勾选要二采的段（含插入视频/序章），再点「开始生成」");
+    }
+    if (done > 0) {
+        footBits.push(`已二采 ${upDone}/${done} 段`
+            + (upFinals.length ? ` · 高清成片×${upFinals.length}（final_up_*）` : ""));
+    }
+    footBits.push("产物在项目文件夹：upseg_*.mp4 高清分段 / final_up_*.mp4 高清成片；音轨沿用原声");
+    if (on && !up.model && models.length) footBits.push("⚠ 未选择放大模型：运行时会报错提示");
+    det.insertAdjacentHTML("beforeend",
+        `<div class="h3d-foot">${footBits.map(escapeHtml).join("<br>")}</div>`);
+
+    sec.append(det);
 }
 
 /* ---- 右栏 ---- */

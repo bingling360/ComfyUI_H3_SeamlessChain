@@ -5,7 +5,7 @@ let src = fs.readFileSync(path.join(__dirname, "../web/h3_director.js"), "utf8")
 src = src
     .replace('import { app } from "/scripts/app.js";', "const app = { graph: null, registerExtension() {} };")
     .replace('import { api } from "/scripts/api.js";', "const api = { addEventListener() {}, fetchApi: async () => ({ ok: true }) };");
-const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapV25WidgetValues, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs };")(() => {}, () => true);
+const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapV25WidgetValues, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, toggleUpscaleInclude, upTargetCanvas };")(() => {}, () => true);
 let fails = 0;
 function eq(name, got, want) {
     const ok = JSON.stringify(got) === JSON.stringify(want);
@@ -160,6 +160,47 @@ const nodeD = { widgets: [{ name: "导演台状态", value: JSON.stringify({
     mode: "文生视频", prompts: ["", "b"], inserts: [{ pos: 1, file: "head.mp4" }],
 }) }], setDirtyCanvas() {} };
 eq("插入段不进草稿统计", mod.planFromDs(nodeD).drafts, ["段 1"]);
+
+/* ---- 潜空间放大二采（ds.upscale）：归一化 / 回写 / 勾选 / 目标画布 ---- */
+eq("defaultUpscale 默认关闭", mod.defaultUpscale().mode, "关闭");
+const nodeP = { widgets: [{ name: "导演台状态", value: JSON.stringify({
+    mode: "文生视频", prompts: ["a"],
+    upscale: { mode: "乱写", model: 5, arch: "3d", scale: 9, denoise: 0.01, steps: 0,
+               cfg: -3, precision: "x", include: [1, "2", 2.5, -1, "bad"] },
+}) }], setDirtyCanvas() {} };
+const dsP = mod.getDs(nodeP);
+eq("upscale 非法模式回落关闭", dsP.upscale.mode, "关闭");
+eq("upscale 非法模型名回落空串", dsP.upscale.model, "");
+eq("upscale arch 只认大写 3D", dsP.upscale.arch, "2D");
+eq("upscale scale 钳上限", dsP.upscale.scale, 4);
+eq("upscale denoise 钳下限", dsP.upscale.denoise, 0.05);
+eq("upscale steps 钳下限取整", dsP.upscale.steps, 1);
+eq("upscale cfg 钳下限", dsP.upscale.cfg, 0);
+eq("upscale precision 回落 fp32", dsP.upscale.precision, "fp32");
+eq("upscale include 只留非负整数", dsP.upscale.include, [1, 2]);
+/* 旧 JSON 无 upscale 键 -> 默认注入（关闭，与后端 parse_state 同口径） */
+const nodeO = { widgets: [{ name: "导演台状态", value: JSON.stringify({ mode: "文生视频", prompts: ["a"] }) }], setDirtyCanvas() {} };
+eq("旧 JSON 注入默认二采配置", mod.getDs(nodeO).upscale, mod.defaultUpscale());
+
+/* setUpscaleField：切入手动模式保留已有勾选、切出清空；参数字段直写 */
+mod.setUpscaleField(nodeP, "mode", "手动选择");
+mod.toggleUpscaleInclude(nodeP, 3);
+mod.toggleUpscaleInclude(nodeP, 1);
+eq("手动勾选累积排序", mod.getDs(nodeP).upscale.include, [2, 3]);   // 原 [1,2]，勾3、取消1
+mod.setUpscaleField(nodeP, "scale", 1.5);
+eq("参数字段直写", mod.getDs(nodeP).upscale.scale, 1.5);
+mod.setUpscaleField(nodeP, "mode", "跟随生成");
+eq("切模式清勾选", mod.getDs(nodeP).upscale.include, []);
+mod.toggleUpscaleInclude(nodeP, 2);
+mod.toggleUpscaleInclude(nodeP, 2);
+eq("重复勾选=取消", mod.getDs(nodeP).upscale.include, []);
+
+/* upTargetCanvas：latent 偶数对齐（像素 32 倍数），与后端 target_hw 同口径 */
+const nodeC = { widgets: [{ name: "宽度", value: 1344 }, { name: "高度", value: 768 }] };
+eq("目标画布 2x", mod.upTargetCanvas(nodeC, 2), "2688×1536");
+eq("目标画布 1.5x", mod.upTargetCanvas(nodeC, 1.5), "2016×1152");
+eq("目标画布 2.6x 取偶", mod.upTargetCanvas(nodeC, 2.6), "3488×2016");
+eq("目标画布缺控件", mod.upTargetCanvas({}, 2), "");
 
 /* ---- 默认工作流模板结构校验 ---- */
 const tplSrc = fs.readFileSync(path.join(__dirname, "../web/h3_default_workflow.js"), "utf8");

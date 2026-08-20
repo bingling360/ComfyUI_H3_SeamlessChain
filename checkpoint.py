@@ -87,6 +87,8 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
 
     截断即时落盘：截断后立刻崩溃也不会复活旧进度。段文件含 latent(.pt)、
     分段视频(.mp4) 与缩略图(.png)，三者同下标一起清，防止重跑后残留旧画面。
+    二采产物（upseg_*）与 manifest.upscale.segs 记录同段号联动清理：
+    基础段重做后其二采必然失效，链完成后的二采清扫会按新 base_hash 补做。
     返回更新后的 manifest。
     """
     out = dict(manifest)
@@ -95,11 +97,18 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
                 "seams", "bridge_scores", "anchors", "seam_metrics"):
         if key in out:
             out[key] = list(out[key])[:start]
+    up = out.get("upscale")
+    if isinstance(up, dict) and len(up.get("segs") or []) > start:
+        up2 = dict(up)
+        up2["segs"] = list(up.get("segs"))[:start]
+        out["upscale"] = up2
     save_manifest(root, out)
     pat = re.compile(r"seg_(\d{3,})\.(?:pt|mp4)$")
     thumb_pat = re.compile(r"thumb_(\d{3,})\.png$")
+    up_pat = re.compile(r"upseg_(\d{3,})\.(?:pt|mp4)$")
+    up_thumb_pat = re.compile(r"up(?:thumb|last)_(\d{3,})\.png$")
     for name in os.listdir(root):
-        m = pat.match(name) or thumb_pat.match(name)
+        m = pat.match(name) or thumb_pat.match(name) or up_pat.match(name) or up_thumb_pat.match(name)
         if m and int(m.group(1)) >= start:
             os.remove(os.path.join(root, name))
     return out
@@ -190,6 +199,36 @@ def load_segment(root: str, idx: int):
     with open(seg_path(root, idx), "rb") as f:
         payload = torch.load(f, map_location="cpu", weights_only=True)
     return payload["video"], payload["audio"]
+
+
+def upseg_paths(root: str, idx: int) -> dict:
+    """二采段产物相对文件名（与 seg_* 平行的 upseg_* 族，项目目录内）。
+
+    pt=放大重采样后的 AV latent；mp4=高清分段成片；thumb=首帧缩略图；
+    last=尾帧 PNG（下一段二采的接缝平滑锚）。latent 与像素分开存：
+    二采结果本身也可作为链式二采的续接起点。
+    """
+    return {
+        "pt": f"upseg_{idx:03d}.pt",
+        "mp4": f"upseg_{idx:03d}.mp4",
+        "thumb": f"upthumb_{idx:03d}.png",
+        "last": f"uplast_{idx:03d}.png",
+    }
+
+
+def save_upsegment(root: str, idx: int, video_t, audio_t):
+    """二采段 AV latent 原子落盘（与 save_segment 同法，路径换 upseg_*）。"""
+    import torch
+
+    payload = {
+        "video": video_t.detach().cpu().clone(),
+        "audio": audio_t.detach().cpu().clone(),
+    }
+    buf = tempfile.SpooledTemporaryFile(max_size=64 << 20)
+    torch.save(payload, buf)
+    buf.seek(0)
+    _atomic_write(os.path.join(root, upseg_paths(root, idx)["pt"]), buf.read())
+    buf.close()
 
 
 def projects_root() -> str:

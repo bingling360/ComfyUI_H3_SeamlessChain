@@ -766,6 +766,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
             seg_unlink.append(bool(seg.get("unlink")))
 
+        # 潜空间放大二采（独立后处理通道，导演台面板控制）：主循环结束后对
+        # 待做段「神经放大 latent → 低强度重采样 → 解码落盘 upseg_*」；关闭时 None
+        from . import upscale
+        up_cfg = upscale.parse_state(ds)
+        if up_cfg:
+            report.append(f"潜空间放大二采：已开启（{up_cfg['mode']}），主链完成后执行")
+
         # 插入视频段（导演台状态 inserts）：按链位混排进执行序列——画面+原声进成片，
         # 尾帧 latent 桥接指导下一段生成（序章机制的任意段间推广）。
         # 链位 pos = 提示词段+插入段混排后的 1-based 位置（不含序章），与前端 planFromDs 一致
@@ -1069,6 +1076,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if reroll == 0 and seeds:
                     report.append("控件种子仅在「重跑起始段」> 0 时生效，当前沿用存档种子序列")
         full_hashes = ([prologue_hash] if off else []) + exec_hashes
+        # 二采记录沿用：主循环的全量 manifest 覆写必须带上 upscale 键，
+        # 否则每次段落盘都会把之前清扫写入的二采记录清掉（truncate 已联动截断）
+        proj_upscale = (manifest.get("upscale") if isinstance(manifest, dict) else None) \
+            if use_ckpt else None
         if review and autosave:
             report.append(f"审片：分段视频每段落盘 → output/h3_projects/{os.path.basename(root) or '…'}/seg_XXX.mp4，"
                           "成片为运行结束时的已确认部分")
@@ -1126,7 +1137,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "total": total, "thumbs": [], "videos": [], "prompts": prompt_list,
                         "seams": [None], "bridge_scores": [None], "params": ckpt_params,
                         "seam_metrics": [None], "seam_refine": seam_refine,
-                        "inserts": list(proj_inserts)})
+                        "inserts": list(proj_inserts), "upscale": proj_upscale})
                 report.append(f"序章：上传视频编码为段 1/{total}（{fc} 帧"
                               + ("，超长仅取前段" if raw_fc > fc else "")
                               + "，经一次 VAE 重编码，按 24fps 处理"
@@ -1309,6 +1320,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "inserts": list(proj_inserts),
                         "title": proj_title, "created_at": proj_created,
                         "updated_at": time.time(), "finals": list(proj_finals),
+                        "upscale": proj_upscale,
                     })
                 if review and not ins_replay and item_i + 1 < len(exec_items):
                     report.append(f"审片：段 {g + 1}（插入视频）已完成并落盘 → seg_{g:03d}.mp4；"
@@ -1616,6 +1628,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     "inserts": list(proj_inserts),
                     "title": proj_title, "created_at": proj_created,
                     "updated_at": time.time(), "finals": list(proj_finals),
+                    "upscale": proj_upscale,
                 })
 
             pbar.update(1)
@@ -1641,6 +1654,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 "inserts": list(proj_inserts),
                 "title": proj_title, "created_at": proj_created,
                 "updated_at": time.time(), "finals": list(proj_finals),
+                "upscale": proj_upscale,
             })
             if review:
                 if len(seg_frames) == total:
@@ -1666,6 +1680,22 @@ class H3SeamlessChainSampler(io.ComfyNode):
             else:
                 err_detail = f"（{enc_err}）" if enc_err else ""
                 report.append(f"自动保存：成片编码失败{err_detail}，分段 mp4 不受影响")
+        # 潜空间放大二采：主链收尾后的独立清扫（待做段放大→重采样→upseg_* 落盘）。
+        # 放在自动保存之后：run_pass 增量写 manifest 时重读磁盘，不覆盖基础链 finals；
+        # 主输出 images 保持基础链结果（高清产物在项目文件夹，避免全帧驻留内存）
+        if up_cfg and use_ckpt and root:
+            try:
+                upscale.run_pass(
+                    模型, clip, video_vae, audio_vae, negative, root, up_cfg,
+                    exec_items, off, seg_prompts, seg_lengths, seg_unlink,
+                    seg_label_orders, pool_tensors, refs, 首帧图片, ctx,
+                    采样器, 调度器, int(混合帧数), full_bridge, report)
+            except Exception as e:   # 独立后处理通道：任何失败只降级为报告，不丢基础链产物
+                report.append(f"二采失败：{type(e).__name__}: {e}（基础链产物不受影响）")
+            # 状态指针重写：审片面板报告带上二采进度（此前的 save_state 在清扫前）
+            checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
+                                   "review": bool(review), "reroll": reroll,
+                                   "report": "\n".join(report), "updated_at": time.time()})
         # 链路总结：接缝指标一览（seams[i] = [帧差, 响度dB] 或 None）
         measured = [(g, s[0], s[1]) for g, s in enumerate(seams) if s]
         if measured:

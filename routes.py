@@ -9,6 +9,8 @@
 - POST /delete_file     删除项目内单个文件（成片等，限 h3_projects/<项目>/<文件>）
 - POST /delete          删除成片保存节点输出目录中的文件（saver 画廊，限两级路径）
 - POST /merge           按序合并若干段/成片/外部视频 -> merged_*.mp4（流式编码）
+- GET  /upscale_models  列出 latent_upscale_models 目录里的放大权重（二采面板下拉）
+- POST /upscale_reset   清掉某段的二采记录与 upseg_* 产物（下次运行重做该段）
 
 均受限于输出目录内、防目录穿越；无新依赖。
 注册有运行期兜底：ensure_registered() 幂等重试，节点执行时会再调一次，
@@ -38,12 +40,14 @@ ROUTES = [
     ("GET", "/h3chain/ping"),
     ("GET", "/h3chain/projects"),
     ("GET", "/h3chain/project"),
+    ("GET", "/h3chain/upscale_models"),
     ("POST", "/h3chain/create_project"),
     ("POST", "/h3chain/save_prompts"),
     ("POST", "/h3chain/delete"),
     ("POST", "/h3chain/delete_project"),
     ("POST", "/h3chain/delete_file"),
     ("POST", "/h3chain/merge"),
+    ("POST", "/h3chain/upscale_reset"),
 ]
 
 _ROUTES_LOG = ", ".join(f"{m} {p}" for m, p in ROUTES)
@@ -159,16 +163,35 @@ def add_routes(routes):
             "ok": True, "manifest": manifest,
             "file": manifest["merges"][-1]["file"]})
 
+    async def upscale_models(request):
+        """模型目录里的放大权重列表（面板下拉数据源；无 torch/目录时返回空列表）。"""
+        try:
+            from . import upscale_net
+            models = upscale_net.scan_models()
+        except Exception:
+            models = []
+        return web.json_response({"ok": True, "models": models})
+
+    async def upscale_reset(request):
+        data = await request.json()
+        try:
+            manifest = projects.upscale_reset(str(data.get("dir") or ""), data.get("seg"))
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True, "manifest": manifest})
+
     handlers = [
         ("GET", "/h3chain/ping", ping),
         ("GET", "/h3chain/projects", list_projects),
         ("GET", "/h3chain/project", project_detail),
+        ("GET", "/h3chain/upscale_models", upscale_models),
         ("POST", "/h3chain/create_project", create_project),
         ("POST", "/h3chain/save_prompts", save_prompts),
         ("POST", "/h3chain/delete", delete),
         ("POST", "/h3chain/delete_project", delete_project),
         ("POST", "/h3chain/delete_file", delete_file),
         ("POST", "/h3chain/merge", merge),
+        ("POST", "/h3chain/upscale_reset", upscale_reset),
     ]
 
     def _mount(target, method, path, handler):

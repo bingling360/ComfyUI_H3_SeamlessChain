@@ -20,8 +20,9 @@ for _p in (os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE)), _HER
 from test_node_structure import _install_stubs
 
 ROUTE_SET = {"/h3chain/ping", "/h3chain/projects", "/h3chain/project",
-             "/h3chain/create_project", "/h3chain/save_prompts", "/h3chain/delete",
-             "/h3chain/delete_project", "/h3chain/delete_file", "/h3chain/merge"}
+             "/h3chain/upscale_models", "/h3chain/create_project", "/h3chain/save_prompts",
+             "/h3chain/delete", "/h3chain/delete_project", "/h3chain/delete_file",
+             "/h3chain/merge", "/h3chain/upscale_reset"}
 # 新版前端 api.fetchApi() 强制给非 /api 路径加 /api 前缀（ComfyApi.apiURL），
 # 自定义路由必须同时挂 /api 副本，否则新前端全部 404
 API_ROUTE_SET = {"/api" + p for p in ROUTE_SET}
@@ -272,6 +273,41 @@ def test_merge_endpoint_encode_failure_maps_500():
         assert [f for f in os.listdir(pdir) if f.endswith(".part")] == []  # 无半成品
         with open(os.path.join(pdir, "manifest.json"), encoding="utf-8") as f:
             assert "merges" not in json.load(f)                   # 失败不记档
+
+
+def test_upscale_models_endpoint():
+    """二采权重目录列表：无 torch/无目录环境恒 ok（前端下拉数据源兜底空列表）。"""
+    with _server_env() as (out, router):
+        handler = router.table["/h3chain/upscale_models"]
+        resp = asyncio.run(handler(_Req()))
+        assert resp["json"] == {"ok": True, "models": []}       # stub 无模型目录 -> 空
+
+
+def test_upscale_reset_endpoint():
+    """二采记录重置端点：清记录+删产物；项目/段号非法 -> 400。"""
+    with _server_env() as (out, router):
+        handler = router.table["/h3chain/upscale_reset"]
+        pdir = _mk_project(out, "甲", {"schema": "h3seamless/ckpt-v3", "done": 2, "total": 2,
+                                       "prompt_hashes": ["a", "b"], "seeds": [1, 2],
+                                       "upscale": {"segs": [
+                                           {"hash": "h", "base_hash": "a|1", "done": True},
+                                           {"hash": "h", "base_hash": "b|2", "done": True}]}})
+        up = os.path.join(pdir, "upseg_001.mp4")
+        open(up, "wb").close()
+
+        resp = asyncio.run(handler(_Req({"dir": "甲", "seg": 2})))
+        assert resp["json"]["ok"] is True
+        assert resp["json"]["manifest"]["upscale"]["segs"][1] is None    # 记录已清
+        assert resp["json"]["manifest"]["upscale"]["segs"][0] is not None
+        assert not os.path.exists(up)                                   # 产物已删
+
+        # 段号/项目名非法 -> 400（ValueError 映射）
+        for bad in ({"dir": "甲", "seg": "x"}, {"dir": "甲", "seg": 0},
+                    {"dir": "甲", "seg": 3}, {"dir": "nope", "seg": 1},
+                    {"dir": "../up", "seg": 1}, {"dir": "", "seg": 1}, {}):
+            resp = asyncio.run(handler(_Req(bad)))
+            assert resp["status"] == 400, bad
+            assert "error" in resp["json"]
 
 
 def test_register_promptserver():
