@@ -1,7 +1,9 @@
 """游戏式项目存档：output/h3_projects/ 下一个项目一个文件夹。
 
 list_projects 扫描磁盘实时列项目（不依赖索引文件或前端 localStorage，
-永不失真）；delete_project 删项目 = 删整个文件夹（视频/提示词/latent 全删）。
+永不失真）；delete_project 删项目 = 删整个文件夹（视频/提示词/latent 全删）；
+merge_project 按序合并若干段/成片/外部视频 -> merged_*.mp4（只追加产物，
+不动链、不动段存档）。
 本模块不导入 routes（routes 单向导入本模块，避免循环依赖）。
 """
 
@@ -63,6 +65,8 @@ def list_projects() -> list:
             "updated_at": updated,
             "cover": _cover(pdir, manifest),
             "finals": list(manifest.get("finals") or []),
+            "merges": [m.get("file") for m in (manifest.get("merges") or [])
+                       if isinstance(m, dict) and m.get("file")],
             "params": manifest.get("params") or {},
         })
     out.sort(key=lambda p: p["updated_at"] or 0, reverse=True)
@@ -82,9 +86,11 @@ def save_prompts(name: str, prompts):
     """把导演台当前提示词组回写进项目 manifest（提示词的持久源=项目文件夹）。
 
     只更新 prompts / total / updated_at（及 done 超界钳制），不动
-    params / seeds / prompt_hashes / finals——运行时的重做判定依旧按
+    params / seeds / prompt_hashes / finals / merges——运行时的重做判定依旧按
     节点控件提示词 vs prompt_hashes 逐段比对，改词段落照常自动重做。
-    序章项目（has_prologue）自动补回「序章」占位头，与运行时写盘格式一致。
+    manifest.prompts 与磁盘段文件按全局槽位对齐（前端卡片/合并按此索引）：
+    序章项目自动补回「序章」占位头；已有插入视频段在对应槽位补回
+    「[插入视频] 文件名」占位行并计入 total——纯提示词回写不能让槽位错位。
     目录或 manifest 不存在（未跑过的指纹目录）返回 None，调用方按无项目跳过。
     """
     name = safe_name(name)
@@ -96,8 +102,24 @@ def save_prompts(name: str, prompts):
         return None
     seg_prompts = [str(p) for p in prompts][:64]
     off = 1 if manifest.get("has_prologue") else 0
-    manifest["prompts"] = (["「序章（上传视频）」"] if off else []) + seg_prompts
-    manifest["total"] = len(seg_prompts) + off
+    ins_map = {}
+    for x in (manifest.get("inserts") or []):
+        if isinstance(x, dict) and x.get("file"):
+            try:
+                ins_map[int(x["slot"])] = str(x["file"])
+            except (TypeError, ValueError):
+                continue
+    rows, si = [], 0
+    for g in range(off + len(seg_prompts) + len(ins_map)):
+        if g == 0 and off:
+            rows.append("「序章（上传视频）」")
+        elif g in ins_map:
+            rows.append(f"[插入视频] {ins_map[g]}")
+        else:
+            rows.append(seg_prompts[si])
+            si += 1
+    manifest["prompts"] = rows
+    manifest["total"] = len(rows)
     manifest["done"] = min(int(manifest.get("done") or 0), manifest["total"])
     manifest["updated_at"] = time.time()
     checkpoint.save_manifest(root, manifest)
@@ -152,3 +174,105 @@ def delete_project(name: str):
         except OSError:
             pass
     return f"h3_projects/{name}"
+
+
+def _merge_sources(root: str, manifest: dict, items):
+    """合并清单 -> 按序绝对路径列表。非法/缺失抛 ValueError。
+
+    - {"seg": n}：n 为 1-based 全局槽位（含序章/插入视频段），映射
+      manifest.videos[n-1]（seg_NNN.mp4 文件名）——前端段落卡片链位即此编号。
+    - {"file": f}：先查项目目录（final_* / merged_* / 任意 mp4），
+      再查 input 目录（上传外部素材）。f 允许至多两级子目录，
+      每段过 safe_name 防穿越；input 命中再以 realpath+startswith 复核。
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("合并清单为空（至少勾选一个来源）")
+    videos = list(manifest.get("videos") or [])
+    sources = []
+    for it in items:
+        if not isinstance(it, dict):
+            raise ValueError(f"清单项必须是对象：{it!r}")
+        if "seg" in it:
+            try:
+                n = int(it["seg"])
+            except (TypeError, ValueError):
+                raise ValueError(f"段号必须是整数：{it.get('seg')!r}") from None
+            if not 1 <= n <= len(videos):
+                raise ValueError(f"段号 {n} 越界（有效范围 1-{len(videos)}）")
+            fname = videos[n - 1]
+            if not fname:
+                raise ValueError(f"段 {n} 还没有生成视频文件（先跑完该段）")
+            path = os.path.join(root, fname)
+            if not os.path.isfile(path):
+                raise ValueError(f"段 {n} 的视频文件缺失：{fname}")
+            sources.append(path)
+            continue
+        f = str(it.get("file") or "").strip().replace("\\", "/")
+        parts = [p for p in f.split("/") if p and p != "."]
+        if not parts or len(parts) > 2 or not all(safe_name(p) for p in parts):
+            raise ValueError(f"非法文件名：{f!r}")
+        if not os.path.splitext(parts[-1])[1]:
+            raise ValueError(f"文件名缺少扩展名：{f!r}")
+        cand = os.path.join(root, *parts)
+        if os.path.isfile(cand):
+            sources.append(cand)
+            continue
+        try:
+            from folder_paths import get_input_directory
+            in_root = os.path.realpath(get_input_directory())
+        except Exception:
+            in_root = None
+        if in_root:
+            cand2 = os.path.realpath(os.path.join(in_root, *parts))
+            if cand2.startswith(in_root + os.sep) and os.path.isfile(cand2):
+                sources.append(cand2)
+                continue
+        raise ValueError(f"文件不存在（项目目录与 input 目录都没有）：{f}")
+    return sources
+
+
+def merge_project(name, items, fps=24, crf=20):
+    """按序合并 -> 项目目录 merged_%Y%m%d_%H%M%S.mp4，返回更新后的 manifest。
+
+    只追加产物与 manifest.merges 记录，不动链、不动 latent、不动段存档；
+    画幅按 manifest.params.width/height（缺失回退首个源实际尺寸，不缩放）。
+    长耗时编码（PyAV 流式）交由调用方放线程池；这里同步执行便于单测。
+    失败抛 ValueError（清单/缺文件）/RuntimeError（编码失败，详情见
+    media.last_error），.part 临时文件由 concat_av_mp4 自清理。
+    """
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    sources = _merge_sources(root, manifest, items)
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out_name = f"merged_{stamp}.mp4"
+    k = 2
+    while os.path.exists(os.path.join(root, out_name)):
+        out_name = f"merged_{stamp}_{k}.mp4"
+        k += 1
+    params = manifest.get("params") or {}
+    try:
+        from . import media                  # 包内（ComfyUI 运行时）
+    except ImportError:
+        import media                         # 顶层导入（无 ComfyUI 的单测环境）
+    ok = media.concat_av_mp4(sources, os.path.join(root, out_name),
+                             width=params.get("width"), height=params.get("height"),
+                             fps=fps, crf=crf)
+    if not ok:
+        raise RuntimeError(f"合并编码失败：{media.last_error}")
+
+    # 编码耗时较长：写回前重读 manifest，只追加 merges，避免覆盖期间
+    # 生成主循环落盘的新段进度/成片（残余竞态窗口缩到毫秒级）
+    fresh = checkpoint.load_manifest(root)
+    if isinstance(fresh, dict):
+        manifest = fresh
+    manifest.setdefault("merges", []).append({
+        "file": out_name, "items": items, "updated_at": time.time()})
+    manifest["updated_at"] = time.time()
+    checkpoint.save_manifest(root, manifest)
+    return manifest

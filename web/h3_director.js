@@ -39,7 +39,6 @@ const NODE_TYPE = "H3SeamlessChainSampler";
 const SAVER_TYPE = "H3ChainSaver";
 const W_REROLL = "重跑起始段";
 const W_SEED = "种子";
-const W_INSERTS = "插入视频";
 const W_DIR_NAMES = ["存档目录", "断点目录"];
 const W_MODE = "生成模式";
 const W_DS = "导演台状态";
@@ -84,6 +83,10 @@ let refreshTimer = null;
 let ledPhase = "idle";
 let ledText = "待命";
 let apiErrorText = "";
+let lastDir = "";            // 最近一次数据刷新解析出的当前项目目录（合并导出用）
+/* 合并模式（纯内存勾选态，不落 ds / 不触发重做）：勾选已完成段（含序章/插入段，
+ * 按链顺序）+ 可追加上传外部素材 -> 拼接出新 merged_*.mp4，不动链与存档 */
+const mergeSel = { on: false, segs: [], files: [] };
 
 /* ---------- 小工具 ---------- */
 
@@ -281,10 +284,6 @@ function setDirValue(node, value) {
     return true;
 }
 
-function hasInserts(node) {
-    return !!(node && (node.widgets || []).some((w) => w.name === W_INSERTS));
-}
-
 /* ---- 旧工作流迁移：widget 改名/新增后 widgets_values 按位错位，载入前重排 ----
  * 老格式：[宽, 高, 每段帧数, 引导帧数, 种子, (ctrl)?, 步数, CFG, …]
  * 新格式：[宽高比, 百万像素, 宽, 高, 每段时长, 引导帧数, 种子, ctrl, 步数, CFG, …]
@@ -362,11 +361,11 @@ function fixInvalidArWidget(node) {
 /* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
 
 function defaultDs() {
-    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [] };
+    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [] };
 }
 
 function defaultSegment() {
-    return { scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [] };
+    return { scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false };
 }
 
 function getDs(node) {
@@ -413,8 +412,18 @@ function getDs(node) {
                 music: typeof s?.music === "string" ? s.music : "",
                 seconds: (isFinite(sec) && sec > 0) ? Math.min(15, Math.max(0.5, sec)) : null,
                 refs: Array.isArray(s?.refs) ? s.refs.map(String).filter((l) => validLabels.has(l)) : [],
+                unlink: !!s?.unlink,
             };
         });
+        /* 插入视频段：{pos: 1-based 链位（不含序章）, file: input 目录文件名}；
+         * 同位去重保首个、按链位升序（运行时后端会再校验，这里只做展示级归一） */
+        const insSeen = new Set();
+        const inserts = (Array.isArray(raw.inserts) ? raw.inserts : [])
+            .filter((x) => x && typeof x === "object" && typeof x.file === "string"
+                && x.file.trim() && Number.isInteger(Number(x.pos)) && Number(x.pos) >= 1)
+            .filter((x) => (insSeen.has(x.pos) ? false : insSeen.add(x.pos)))
+            .map((x) => ({ pos: Number(x.pos), file: x.file.trim() }))
+            .sort((a, b) => a.pos - b.pos);
         return {
             mode: MODES.some(([m]) => m === raw.mode) ? raw.mode : MODE_DEFAULT,
             prompts,
@@ -423,6 +432,7 @@ function getDs(node) {
             ref_images: refAssets.filter((a) => a.kind === "image").map((a) => a.file),
             ref_assets: refAssets,
             segments,
+            inserts,
         };
     } catch (e) {
         return defaultDs();
@@ -518,9 +528,10 @@ function removePromptSegment(node, idx) {
 function clearPrompts(node) {
     const ds = getDs(node);
     ds.prompts = ds.prompts.map(() => "");
-    // 清文本但保留每段时长/素材引用（结构设置跨项目沿用）
+    // 清文本但保留每段时长/素材引用/断链开关（结构设置跨项目沿用）
     if (ds.segments) ds.segments = ds.segments.map((s) => ({
-        ...defaultSegment(), seconds: s?.seconds ?? null, refs: Array.isArray(s?.refs) ? s.refs : [],
+        ...defaultSegment(), seconds: s?.seconds ?? null,
+        refs: Array.isArray(s?.refs) ? s.refs : [], unlink: !!s?.unlink,
     }));
     setDs(node, ds);
 }
@@ -761,52 +772,35 @@ async function pickAsset(target, kind) {
     input.click();
 }
 
-/* ---- 「插入视频」控件（不变，仍走画布控件） ---- */
+/* ---- 插入视频段（导演台状态 ds.inserts：画面+原声进成片，尾帧桥指导下一段） ---- */
 
-function parseInsertsSpec(text) {
-    const items = [], bad = [];
-    for (const raw of String(text ?? "").split("\n")) {
-        const line = raw.trim();
-        if (!line || line.startsWith("#")) continue;
-        const i = line.indexOf("|");
-        const pos = Number(line.slice(0, i).trim());
-        const file = line.slice(i + 1).trim();
-        if (i < 0 || !Number.isInteger(pos) || pos < 1 || !file) { bad.push(line); continue; }
-        items.push([pos, file]);
-    }
-    items.sort((a, b) => a[0] - b[0]);
-    return { items, bad };
-}
-
-function insertLines(node) {
-    return String(getWidgetValue(node, W_INSERTS) ?? "").split("\n").filter((l) => l.trim());
-}
-
+/** 追加插入段到指定链位（1-based，不含序章）。链位 = 提示词段+插入段混排后的位置：
+ *  pos=2 → 第 1 个提示词段占链位 1，插入视频占链位 2，原第 2 个提示词段顺延链位 3。 */
 function appendInsert(pos, file) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    if (!setWidgetValue(node, W_INSERTS, [...insertLines(node), `${pos}|${file}`].join("\n"))) {
-        alert("节点上没有「插入视频」控件：当前引擎未合并插入视频能力，或旧工作流需重新添加该节点");
-        return;
-    }
+    const ds = getDs(node);
+    const maxPos = ds.prompts.length + ds.inserts.length + 1;
+    pos = Math.max(1, Math.min(Math.round(Number(pos) || 1), maxPos));
+    ds.inserts = ds.inserts.filter((x) => !(x.pos === pos && x.file === file));
+    ds.inserts.push({ pos, file });
+    ds.inserts.sort((a, b) => a.pos - b.pos);
+    setDs(node, ds);
     scheduleRefresh();
 }
 
 function removeInsert(pos, file) {
     const node = findNode();
     if (!node) return;
-    setWidgetValue(node, W_INSERTS,
-        insertLines(node).filter((l) => l.trim() !== `${pos}|${file}`).join("\n"));
+    const ds = getDs(node);
+    ds.inserts = ds.inserts.filter((x) => !(x.pos === pos && x.file === file));
+    setDs(node, ds);
     scheduleRefresh();
 }
 
 function pickInsertVideo(pos) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    if (!hasInserts(node)) {
-        alert("当前引擎分支没有「插入视频」控件：合并插入视频技术改进后此功能自动启用");
-        return;
-    }
     const input = document.createElement("input");
     input.type = "file";
     input.accept = "video/*";
@@ -821,6 +815,65 @@ function pickInsertVideo(pos) {
         }
     };
     input.click();
+}
+
+/* ---- 合并导出（勾选态纯内存，POST /h3chain/merge 流式拼接成 merged_*.mp4） ---- */
+
+/** 上传外部视频追加到合并清单末尾（input 目录，不进链，仅作拼接素材）。 */
+function pickMergeVideo() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "video/*";
+    input.onchange = async () => {
+        const f = input.files && input.files[0];
+        if (!f) return;
+        try {
+            const name = await uploadToInput(f);
+            mergeSel.files = [...(mergeSel.files || []), name];
+            scheduleRefresh(0);
+        } catch (e) {
+            alert(`上传失败：${e}`);
+        }
+    };
+    input.click();
+}
+
+async function doMergeExport(btn) {
+    const dir = lastDir;
+    if (!dir) { alert("没有当前项目目录（先读档或运行一次）"); return; }
+    const items = [
+        ...[...mergeSel.segs].sort((a, b) => a - b).map((s) => ({ seg: s })),
+        ...(mergeSel.files || []).map((f) => ({ file: f })),
+    ];
+    if (!items.length) { alert("先勾选要合并的段（或上传外部视频）"); return; }
+    const oldTxt = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "合并中…";
+    setLed("running", `合并 ${items.length} 项拼接中`);
+    try {
+        const r = await api.fetchApi("/h3chain/merge", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dir, items }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok && j.ok) {
+            setLed("done", `已合并 → ${j.file}`);
+            mergeSel.on = false; mergeSel.segs = []; mergeSel.files = [];
+            refresh();
+            return;
+        }
+        if (r.status === 404 || r.status === 405) {
+            setApiError(`合并接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`);
+        } else {
+            alert(`合并失败：${j.error || `HTTP ${r.status}`}`);
+        }
+    } catch (e) {
+        alert("合并请求失败：" + e);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = oldTxt;
+    }
 }
 
 /* ---- 提示词写回防抖 ---- */
@@ -847,12 +900,12 @@ function debounceSegmentWrite(node, idx, field, text) {
     }, 350));
 }
 
-/* ---- 段落计划（状态驱动） ---- */
+/* ---- 段落计划（状态驱动：提示词段 + 插入视频段按链位混排，不含序章） ---- */
 
 function planFromDs(node) {
     const ds = getDs(node);
     const prompts = ds.prompts.map((t, i) => ({ text: t.trim(), idx: i }));
-    const { items } = parseInsertsSpec(getWidgetValue(node, W_INSERTS));
+    const items = (ds.inserts || []).map((x) => [x.pos, x.file]);   // getDs 已去重排序
     const plan = [];
     let pi = 0;
     for (const [pos, file] of items) {
@@ -868,6 +921,7 @@ function planFromDs(node) {
 }
 
 function queuePrompt() {
+    if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出，再提交生成"); return; }
     const node = findNode();
     if (node) {
         const ds = getDs(node);
@@ -1027,8 +1081,28 @@ async function switchProject(dir) {
         const plist = (mf.prompts || []).slice(off);
         if (plist.length || mf.total) {
             const ds = getDs(node);
-            ds.prompts = Array.from({ length: plist.length }, (_v, i) => String(plist[i] ?? ""));
-            ds.segments = Array.from({ length: plist.length }, (_v, i) => ds.segments?.[i] ?? defaultSegment());
+            /* 重建提示词段与插入段：prompts 行按全局槽位对齐，插入槽是
+             * 「[插入视频] 文件名」占位行——跳过并按 manifest.inserts
+             * （slot → 链位 pos = slot + 1 - off）还原 ds.inserts */
+            const insByPos = {};
+            for (const x of (mf.inserts || [])) {
+                if (x && x.file) {
+                    const pos = Number(x.slot) - off + 1;
+                    if (Number.isInteger(pos) && pos >= 1) insByPos[pos] = String(x.file);
+                }
+            }
+            const texts = [];
+            const inserts = [];
+            let pos = 0;
+            for (const row of plist) {
+                pos += 1;
+                if (insByPos[pos]) { inserts.push({ pos, file: insByPos[pos] }); continue; }
+                if (String(row).startsWith("[插入视频]")) continue;   // 无 inserts 记录的残留占位
+                texts.push(String(row ?? ""));
+            }
+            ds.prompts = texts;
+            ds.segments = Array.from({ length: texts.length }, (_v, i) => ds.segments?.[i] ?? defaultSegment());
+            ds.inserts = inserts;
             setDs(node, ds);
         }
         setLed("idle", `已读档「${mf.title || dir}」（${mf.total ? `${mf.done ?? 0}/${mf.total} 段` : "草稿，未配置段落"}）`);
@@ -1165,6 +1239,7 @@ async function collectData() {
     const stateRaw = await fetchJson("h3_projects", "h3chain_state.json");
     const nodeDir = node ? String(getDirValue(node) || "").trim() : "";
     const dir = nodeDir || stateRaw?.dir || "";
+    lastDir = dir;                                           // 合并导出等即时动作取当前项目
     const mf = dir ? await fetchJson(`h3_projects/${dir}`, "manifest.json") : null;
     const state = stateRaw || {};
     const sameChain = !!stateRaw && dir === stateRaw.dir;
@@ -1185,16 +1260,37 @@ async function collectData() {
         const total = state.total ?? (mf && mf.total) ?? 0;
         if (total && node) {
             // 采纳存档提示词进导演台状态：卡片可编辑（此前回退成只读历史段，导致无法输入）
+            // 插入槽占位行（[插入视频] 文件名）跳过，ds.inserts 按 manifest.inserts 重建
             const dsAdopt = getDs(node);
-            dsAdopt.prompts = Array.from({ length: total }, (_v, i) => String(((mf && mf.prompts) || [])[i] ?? ""));
-            dsAdopt.segments = Array.from({ length: total }, (_v, i) => dsAdopt.segments?.[i] ?? defaultSegment());
+            const off = mf && mf.has_prologue ? 1 : 0;
+            const insByPos = {};
+            for (const x of ((mf && mf.inserts) || [])) {
+                if (x && x.file) {
+                    const p = Number(x.slot) - off + 1;
+                    if (Number.isInteger(p) && p >= 1) insByPos[p] = String(x.file);
+                }
+            }
+            const texts = [];
+            const inserts = [];
+            let pos = 0;
+            for (const row of (mf && mf.prompts || []).slice(off)) {
+                pos += 1;
+                if (insByPos[pos]) { inserts.push({ pos, file: insByPos[pos] }); continue; }
+                if (String(row).startsWith("[插入视频]")) continue;
+                texts.push(String(row ?? ""));
+            }
+            dsAdopt.prompts = texts;
+            dsAdopt.segments = Array.from({ length: texts.length }, (_v, i) => dsAdopt.segments?.[i] ?? defaultSegment());
+            dsAdopt.inserts = inserts;
             setDs(node, dsAdopt);
             ({ plan, drafts, ds } = planFromDs(node));
         } else if (total) {
             plan = Array.from({ length: total }, (_v, i) => {
                 const ins = ((mf && mf.inserts) || []).find((x) => x.slot === i);
+                const row = String(((mf && mf.prompts) || [])[i] || "");
                 return ins ? { kind: "insert", pos: i + 1, file: ins.file || "" }
-                           : { kind: "prompt", text: ((mf && mf.prompts) || [])[i] || "" };
+                    : row.startsWith("[插入视频]") ? { kind: "insert", pos: i + 1, file: row.slice(6).trim() }
+                    : { kind: "prompt", text: row };
             });
         } else {
             plan = [];
@@ -1317,10 +1413,18 @@ function injectStyles() {
     .h3d-rail span{flex:1;height:5px;border-radius:4px;background:#444c56}
     .h3d-rail span.done{background:var(--h3d-cyan)}
     .h3d-rail span.next{background:#6e7b8c;animation:h3d-blink 1.2s infinite}
+    .h3d-rail span.unlink{background:repeating-linear-gradient(135deg,#e0823d 0 4px,#444c56 4px 8px)}
     .h3d-cards{display:grid;gap:10px}
     .h3d-card{display:grid;grid-template-columns:150px minmax(0,1fr);gap:11px;padding:10px;border:1px solid #3f4854;border-radius:9px;background:#262c36}
     .h3d-card.todo{opacity:.72}
     .h3d-card.todo:hover{opacity:1}
+    .h3d-card.mergeable{grid-template-columns:auto 150px minmax(0,1fr);align-items:start}
+    .h3d-card.mergeable-off{opacity:.4}
+    .h3d-mergecb{width:15px;height:15px;margin:4px 0 0 2px;accent-color:#6cb6ff;cursor:pointer;flex:none}
+    .h3d-mergebar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:-2px 0 14px;padding:9px 12px;border:1px solid #7a5f36;border-radius:8px;background:linear-gradient(90deg,#352a19,#2d333b)}
+    .h3d-merge-sum{flex:1;min-width:200px;color:#e9c07a;font-size:11.5px;line-height:1.7;word-break:break-all}
+    .h3d-merge-sum b{color:#f5d9a0}
+    .h3d-merge-sum small{display:block;color:var(--h3d-muted);font:10px ui-monospace,Consolas;word-break:break-all}
     .h3d-thumb{width:150px;aspect-ratio:16/9;border-radius:6px;overflow:hidden;background:#10151c;display:grid;place-items:center;color:#636e7b;font:700 11px ui-monospace,Consolas}
     .h3d-thumb video,.h3d-thumb img{width:100%;height:100%;object-fit:cover}
     .h3d-thumb video.h3d-segvideo{object-fit:contain;background:#000}
@@ -1349,6 +1453,7 @@ function injectStyles() {
     .h3d-empty{padding:16px 10px;border:1px dashed #444c56;border-radius:8px;color:var(--h3d-muted);text-align:center;background:#262c36;line-height:1.8}
     .h3d-result{padding:8px;border:1px solid #3f4854;border-radius:9px;background:#20262e}
     .h3d-result.current{border-color:#316dca}
+    .h3d-result.gone{opacity:.45}
     .h3d-result video{display:block;width:100%;max-height:230px;border-radius:6px;background:#0a0d12}
     .h3d-result-meta{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-top:7px}
     .h3d-result-name{min-width:0;color:#b6c2cf;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1368,6 +1473,9 @@ function injectStyles() {
     .h3d-seg-body{display:grid;gap:7px;padding:0 10px 10px}
     .h3d-seg-label{display:block;margin-bottom:2px;color:var(--h3d-muted);font-size:10.5px;font-weight:600}
     .h3d-seg-ta{min-height:48px !important;font-size:12px !important;line-height:1.55 !important}
+    .h3d-unlink{display:flex;gap:7px;align-items:center;cursor:pointer;padding:6px 8px;border:1px solid #5a3b2e;border-radius:7px;background:#221912;color:#e0a892;font-size:11.5px;font-weight:600;user-select:none}
+    .h3d-unlink:hover{border-color:#8a5a42}
+    .h3d-unlink input{accent-color:#e0823d;cursor:pointer}
 
     /* ---- 每段时长 + 段级引用素材 ---- */
     .h3d-secs{width:58px;border:1px solid #3a352c;border-radius:5px;background:#211f1a;color:var(--h3d-bone);padding:2px 4px;font:11px ui-monospace,Consolas;text-align:right;outline:none}
@@ -1601,10 +1709,13 @@ function cardsSignature(data) {
         reroll: state?.reroll ?? 0,
         plan: (plan || []).map((it) => it.kind === "insert" ? ["i", it.pos, it.file] : ["p", it.text]),
         segs: (ds?.segments || []).map((s) => [s.scene_prompt ?? "", s.character_prompt ?? "",
-                                               s.seconds ?? 0, (s.refs || []).join(",")]),
+                                               s.seconds ?? 0, (s.refs || []).join(","),
+                                               !!s.unlink]),
         labels: (ds?.ref_assets || []).map((a) => a.label),
         mode: ds?.mode ?? "",
         dur: String(getWidgetValue(data.node, W_DUR) ?? ""),
+        merge: [mergeSel.on, [...mergeSel.segs].sort((a, b) => a - b).join(","),
+                (mergeSel.files || []).join(",")],
     });
 }
 
@@ -1635,7 +1746,8 @@ function updateDesk(data) {
         renderParamsZone(z.rParams, data);
     }
     const histSig = prefix + "|" + (history ? history.length + ":" + (history[0]?.file ?? "") : "-")
-        + "|" + (state?.dir ?? "") + "|" + (mf?.finals || []).join(",");
+        + "|" + (state?.dir ?? "") + "|" + (mf?.finals || []).join(",")
+        + "|" + (mf?.merges || []).map((m) => m?.file || "").join(",");
     if (histSig !== desk.histSig || !z.rHist.querySelector(".h3d-hist")) {
         if (!isVideoPlaying(z.rHist)) {
             desk.histSig = histSig;
@@ -1765,6 +1877,20 @@ function buildCenterBody(data) {
     bar.append(el("div", "h3d-st-text", escapeHtml(st.text)));
     if (state?.review) bar.insertAdjacentHTML("beforeend", badge("逐段审片", "cyan"));
     if (state?.reroll > 0) bar.insertAdjacentHTML("beforeend", badge(`重跑起始段=${state.reroll}`, "warn"));
+    if (mergeSel.on) bar.insertAdjacentHTML("beforeend", badge("合并模式", "media"));
+    /* 合并模式：勾选已完成段按链顺序拼接导出（纯内存勾选态，不动链与存档） */
+    if (done > 0) {
+        const mergeBtn = el("button", "h3d-btn" + (mergeSel.on ? " h3d-btn-cyan" : ""),
+            mergeSel.on ? "⧉ 合并模式·开" : "⧉ 合并模式");
+        mergeBtn.title = "开启后勾选若干已完成段（可追加上传外部视频），按链顺序流式拼接成"
+            + " merged_*.mp4 导出到项目文件夹；不动链、不动存档，随时可退出";
+        mergeBtn.onclick = () => {
+            mergeSel.on = !mergeSel.on;
+            if (!mergeSel.on) { mergeSel.segs = []; mergeSel.files = []; }
+            scheduleRefresh(0);
+        };
+        bar.append(mergeBtn);
+    }
     const refreshBtn = el("button", "h3d-btn h3d-refresh", "↻");
     refreshBtn.title = "重新读取节点与存档数据";
     refreshBtn.onclick = refresh;
@@ -1780,12 +1906,47 @@ function buildCenterBody(data) {
             const it = plan[i];
             const sec = it?.kind === "prompt" && it.idx !== undefined
                 ? (data.ds.segments[it.idx]?.seconds ?? def) : def;
-            const sp = el("span", i < done ? "done" : i === done ? "next" : "");
+            const unlinked = it?.kind === "prompt" && it.idx !== undefined
+                && !!(data.ds.segments[it.idx]?.unlink);
+            const sp = el("span", (i < done ? "done" : i === done ? "next" : "")
+                + (unlinked ? " unlink" : ""));
             sp.style.flexGrow = String(Math.max(1, sec));
-            sp.title = `段 ${i + 1} · ${sec}s${it?.kind === "insert" ? "（插入视频，按默认估）" : ""}`;
+            sp.title = `段 ${i + 1} · ${sec}s`
+                + (it?.kind === "insert" ? "（插入视频，按默认估）" : "")
+                + (unlinked ? " · 独立镜头（与上段硬切）" : "");
             rail.append(sp);
         }
         wrap.append(rail);
+    }
+
+    /* 合并清单条：已勾段号（链序）+ 外部上传 + 导出/退出 */
+    if (mergeSel.on) {
+        const mbar = el("div", "h3d-mergebar");
+        const segsSorted = [...mergeSel.segs].sort((a, b) => a - b);
+        const segSum = segsSorted.length
+            ? segsSorted.map((s) => `段${s}`).join("＋") : "未勾选段";
+        const fileSum = (mergeSel.files || []).length
+            ? ` ＋ 外部视频×${mergeSel.files.length}` : "";
+        const sum = el("div", "h3d-merge-sum",
+            `合并清单（按链顺序）：<b>${escapeHtml(segSum + fileSum)}</b>`
+            + (mergeSel.files || []).map((f) => `<small>${escapeHtml(f)}</small>`).join(""));
+        mbar.append(sum);
+        const upBtn = el("button", "h3d-btn", "＋ 上传视频");
+        upBtn.title = "上传外部视频追加到合并清单末尾（input 目录；建议 24fps、画幅与项目一致，"
+            + "不同画幅会自动缩放裁剪到项目画幅）";
+        upBtn.onclick = pickMergeVideo;
+        const goBtn = el("button", "h3d-btn h3d-btn-cta", "⧉ 合并导出");
+        goBtn.title = "按链顺序把勾选项流式拼接为 merged_*.mp4（PyAV 编码，分钟级耗时，期间界面可用）";
+        goBtn.disabled = !(mergeSel.segs.length || (mergeSel.files || []).length);
+        goBtn.onclick = () => doMergeExport(goBtn);
+        const exitBtn = el("button", "h3d-btn", "✕ 退出");
+        exitBtn.title = "退出合并模式并清空勾选（不影响链与存档）";
+        exitBtn.onclick = () => {
+            mergeSel.on = false; mergeSel.segs = []; mergeSel.files = [];
+            scheduleRefresh(0);
+        };
+        mbar.append(upBtn, goBtn, exitBtn);
+        wrap.append(mbar);
     }
 
     /* 未填写提示 */
@@ -1804,12 +1965,10 @@ function buildCenterBody(data) {
         addSeg.title = "新增一段提示词到导演台状态（最多 64 段；「提示词·1..3」画布镜像只显前 3 段，超过 3 段全在导演台管理）";
         addSeg.onclick = () => addPromptSegment(node);
         addrow.append(addSeg);
-        if (hasInserts(node)) {
-            if (total) {
-                const tail = insertButton("尾部插入视频", total + 1);
-                tail.title = `上传视频追加到成片末尾（${total + 1}|文件名）`;
-                addrow.append(tail);
-            }
+        if (total) {
+            const tail = insertButton("尾部插入视频", total + 1);
+            tail.title = `上传视频追加到成片末尾（${total + 1}|文件名）`;
+            addrow.append(tail);
         }
     } else if (window.H3_DEFAULT_WORKFLOW) {
         const wf = el("button", "h3d-btn h3d-btn-cyan", "⚡ 一键载入配套工作流");
@@ -1834,7 +1993,6 @@ function buildCards(data) {
     const seeds = mf?.seeds || [];
     const seams = mf?.seams || [];
     const bridges = mf?.bridge_scores || [];
-    const canInsert = hasInserts(node);
     const wrap = el("div", "h3d-cards");
 
     if (!plan.length) {
@@ -1858,17 +2016,40 @@ function buildCards(data) {
         if (img) img.onerror = () => { img.replaceWith(el("div", "", "⚠ 加载失败")); };
 
         const body = el("div", "h3d-cbody");
+        const segData = (it.idx !== undefined && data.ds.segments)
+            ? (data.ds.segments[it.idx] || defaultSegment()) : null;
         const stateChip = !isDone
             ? badge(isInsert ? "插入段（未跑）" : "待生成", "")
             : isHead ? badge("片头（上传）", "media")
             : isInsert ? badge("插入段", "media") : badge("已完成", "ok");
+        const unlinkChip = !isInsert && segData?.unlink ? badge("独立镜头", "warn") : "";
         const title = el("div", "h3d-ctitle",
-            `<span>段 ${idx + 1}${isInsert ? `（位置 ${it.pos}）` : ""}</span>${stateChip}`);
+            `<span>段 ${idx + 1}${isInsert ? `（位置 ${it.pos}）` : ""}</span>${stateChip}${unlinkChip}`);
+
+        /* 合并模式：已完成段（含序章/插入段）可勾选拼接进 merged_*.mp4 */
+        if (mergeSel.on) {
+            if (isDone) {
+                const cb = document.createElement("input");
+                cb.type = "checkbox";
+                cb.className = "h3d-mergecb";
+                cb.checked = mergeSel.segs.includes(idx + 1);
+                cb.title = `勾选后并入合并导出（链位 ${idx + 1}，按链顺序拼接）`;
+                cb.onchange = () => {
+                    const n = idx + 1;
+                    mergeSel.segs = cb.checked
+                        ? [...mergeSel.segs, n] : mergeSel.segs.filter((x) => x !== n);
+                    scheduleRefresh(0);
+                };
+                card.classList.add("mergeable");
+                card.prepend(cb);
+            } else {
+                card.classList.add("mergeable-off");
+            }
+        }
 
         /* 每段时长（秒）：留空=跟随节点默认；显示吸附后的帧数 */
         let secsHint = null;
         if (node && it.idx !== undefined) {
-            const segData = data.ds.segments[it.idx] || defaultSegment();
             const defRaw = Number(getWidgetValue(node, W_DUR));
             const defSec = isFinite(defRaw) && defRaw > 0 ? defRaw : 5.0;
             const secsInp = document.createElement("input");
@@ -1876,10 +2057,10 @@ function buildCards(data) {
             secsInp.className = "h3d-secs";
             secsInp.min = "0.5"; secsInp.max = "15"; secsInp.step = "0.1";
             secsInp.placeholder = String(defSec);
-            secsInp.value = segData.seconds ?? "";
+            secsInp.value = (segData || defaultSegment()).seconds ?? "";
             secsInp.title = "本段时长（秒）：留空=跟随右栏「每段时长」默认；内部自动吸附 17k+5 帧网格(@24fps)";
             secsHint = el("span", "h3d-secs-hint",
-                `≈${snapFrames(segData.seconds ?? defSec)}帧`);
+                `≈${snapFrames((segData || defaultSegment()).seconds ?? defSec)}帧`);
             const syncHint = (v) => {
                 const num = Number(v);
                 const sec = (v === "" || !isFinite(num) || num <= 0) ? defSec : num;
@@ -2008,7 +2189,8 @@ function buildCards(data) {
             /* 分段处理中心：场景/角色提示词（可展开折叠） */
             if (node && it.idx !== undefined) {
                 const seg = (data.ds.segments && data.ds.segments[it.idx]) || defaultSegment();
-                const hasSeg = !!(seg.scene_prompt || seg.character_prompt || seg.soundscape || seg.music);
+                const hasSeg = !!(seg.scene_prompt || seg.character_prompt || seg.soundscape
+                    || seg.music || seg.unlink);
                 const det = el("details", "h3d-seg-panel" + (hasSeg ? " has-content" : ""));
                 det.open = hasSeg;
                 det.innerHTML = `<summary>分段处理 · 场景 / 角色 / 声音${hasSeg ? ' <span class="h3d-chip cyan">已填写</span>' : ""}</summary>`;
@@ -2042,6 +2224,22 @@ function buildCards(data) {
                     segBody.append(lab, ta);
                 }
 
+                /* 独立镜头：一键断开与上段的全部长视频衔接（硬切转场） */
+                const unlinkRow = el("label", "h3d-unlink");
+                const unlinkCb = document.createElement("input");
+                unlinkCb.type = "checkbox";
+                unlinkCb.checked = !!seg.unlink;
+                unlinkRow.append(unlinkCb, document.createTextNode("🔗 独立镜头（与上段断链）"));
+                unlinkRow.title = "本段与上一段完全断开衔接：不注入上段尾帧引导桥、不裁头、"
+                    + "不做接缝精修/像素混合/接缝测量/响度对齐，上段也不做桥帧门控回退——段间硬切转场。"
+                    + "适用于与上一镜头毫无关联的独立画面。本段尾帧锚定与素材引用不受影响；"
+                    + "切换此开关会使该段起重跑（指纹语义正确）";
+                unlinkCb.onchange = () => {
+                    setSegmentField(node, it.idx, "unlink", unlinkCb.checked);
+                    scheduleRefresh(60);
+                };
+                segBody.append(unlinkRow);
+
                 det.append(segBody);
                 body.append(det);
             }
@@ -2051,17 +2249,15 @@ function buildCards(data) {
         if (!node) {
             actions.append(el("span", "h3d-hint", "只读（画布上未找到节点）"));
         } else if (isInsert) {
-            if (!isDone && canInsert) {
+            if (!isDone) {
                 const rm = el("button", "h3d-btn h3d-btn-danger", "✕ 移除插入");
                 rm.title = "从「插入视频」清单删除这一条（其后段落自动重做）";
                 rm.onclick = () => removeInsert(it.pos, it.file);
                 actions.append(rm);
-            } else if (!isDone) {
-                actions.append(el("span", "h3d-hint", "当前引擎未合并插入能力"));
             } else {
                 actions.append(el("span", "h3d-hint", "更换/移除插入 = 其后重做"));
             }
-            if (canInsert) actions.append(insertButton("在此段后插入", idx + 2));
+            actions.append(insertButton("在此段后插入", idx + 2));
         } else {
             if (isDone) {
                 const cont = el("button", "h3d-btn h3d-btn-cta", "▶ 从这段继续");
@@ -2082,7 +2278,7 @@ function buildCards(data) {
                 rerollBtn.title = `设「重跑起始段」=${idx + 1} 并换种子重新生成该段及之后`;
                 rerollBtn.onclick = () => doReroll(idx + 1);
                 actions.append(rerollBtn);
-            } else if (canInsert) {
+            } else {
                 actions.append(insertButton(`插视频到段 ${idx + 1} 前`, idx + 1));
             }
             if (node && it.idx !== undefined) {
@@ -2479,7 +2675,67 @@ function renderHistoryZone(sec, data) {
         });
     }
 
-    /* 第二区块：成片保存节点（H3ChainSaver）输出历史 */
+    /* 第二区块：合并片段（merged_*.mp4，manifest.merges，最新在前） */
+    const dirM = state?.dir;
+    const merges = (mf?.merges || []).filter((m) => m && m.file).slice(-10).reverse();
+    if (dirM && merges.length) {
+        box.append(el("div", "h3d-hist-head", "合并片段（按序拼接导出）"));
+        merges.forEach((m) => {
+            const file = m.file;
+            const sub = `h3_projects/${dirM}`;
+            const url = viewUrl(sub, file);
+            const card = el("div", "h3d-result");
+            const v = document.createElement("video");
+            v.controls = true;
+            v.preload = "metadata";
+            v.src = url;
+            v.onerror = () => { card.classList.add("gone"); };
+            const segList = (m.items || []).map((it) =>
+                it?.seg != null ? `段${it.seg}` : it?.file || "?").join("＋");
+            card.append(v,
+                el("div", "h3d-result-name", "合并 · " + escapeHtml(file)),
+                el("div", "h3d-result-info",
+                    escapeHtml(`${fmtTime(m.updated_at)} · 来源：${segList || "—"}`)));
+            const meta = el("div", "h3d-result-meta");
+            const acts = el("div", "h3d-result-acts");
+            const open = el("a", "h3d-dl", "↗ 打开");
+            open.href = url; open.target = "_blank";
+            const dl = el("a", "h3d-dl", "⬇ 下载");
+            dl.href = url; dl.download = file;
+            const del = el("button", "h3d-btn h3d-btn-danger", "🗑 删除");
+            del.title = "删除该合并片段文件（二次确认；manifest 里的记录会随之失效）";
+            del.onclick = async () => {
+                if (del.dataset.armed !== "1") {
+                    del.dataset.armed = "1";
+                    del.textContent = "确认删除？";
+                    setTimeout(() => { del.dataset.armed = ""; del.textContent = "🗑 删除"; }, 2500);
+                    return;
+                }
+                try {
+                    const r = await api.fetchApi("/h3chain/delete_file", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ path: `h3_projects/${dirM}/${file}` }),
+                    });
+                    if (r.ok) { refresh(); return; }
+                    if (r.status === 404 || r.status === 405) {
+                        setApiError(`删除接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`);
+                        return;
+                    }
+                    const j = await r.json().catch(() => ({}));
+                    alert(`删除失败：${j.error || `HTTP ${r.status}`}`);
+                } catch (e) {
+                    alert("删除请求失败：" + e);
+                }
+            };
+            acts.append(open, dl, del);
+            meta.append(acts);
+            card.append(meta);
+            box.append(card);
+        });
+    }
+
+    /* 第三区块：成片保存节点（H3ChainSaver）输出历史 */
     const items = (history || []).slice(0, 10);
     if (items.length) {
         if (finals.length) box.append(el("div", "h3d-hist-head", `保存节点历史（output/${escapeHtml(prefix)}/）`));
@@ -2563,12 +2819,15 @@ function renderFooter(z, data) {
     }
     if (state?.review) infos.push("逐段审片：每次排队只生成下一段");
     if (!node) infos.push("只读模式：画布上未找到 H3 Seamless Chain 节点");
-    if (node && !hasInserts(node)) infos.push("当前引擎未合并「插入视频」能力（合并插入分支后自动启用）");
+    if (mergeSel.on) infos.push("合并模式进行中：生成按钮已暂停（退出合并模式后恢复）");
     z.footInfo.innerHTML = infos.map((s) => `<span>${s}</span>`).join("");
 
     const run = z.run;
     run.onclick = queuePrompt;
-    if (!total) {
+    if (mergeSel.on) {
+        run.disabled = true;
+        run.textContent = "⧉ 合并模式进行中（退出后可生成）";
+    } else if (!total) {
         run.disabled = true;
         run.textContent = "▶ 开始生成（先配置段落）";
     } else if (done >= total) {

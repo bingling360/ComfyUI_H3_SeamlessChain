@@ -21,7 +21,7 @@ from test_node_structure import _install_stubs
 
 ROUTE_SET = {"/h3chain/ping", "/h3chain/projects", "/h3chain/project",
              "/h3chain/create_project", "/h3chain/save_prompts", "/h3chain/delete",
-             "/h3chain/delete_project", "/h3chain/delete_file"}
+             "/h3chain/delete_project", "/h3chain/delete_file", "/h3chain/merge"}
 # 新版前端 api.fetchApi() 强制给非 /api 路径加 /api 前缀（ComfyApi.apiURL），
 # 自定义路由必须同时挂 /api 副本，否则新前端全部 404
 API_ROUTE_SET = {"/api" + p for p in ROUTE_SET}
@@ -206,12 +206,72 @@ def test_delete_endpoint():
         open(os.path.join(fdir, "final_1.mp4"), "wb").close()
         assert asyncio.run(router.table["/h3chain/delete"](
             _Req({"file": "h3_chain/final_1.mp4"})))["json"] == {"ok": True}
-        assert not os.path.exists(os.path.join(fdir, "final_1.mp4"))
+        assert not os.path.exists(os.path.join(out, "h3_chain", "final_1.mp4"))
         for bad in ("h3_chain/nope.mp4", "../h3_chain/x.mp4", "h3_chain", "/abs/x.mp4", None):
             resp = asyncio.run(router.table["/h3chain/delete"](_Req({"file": bad})))
             assert resp["status"] == 404
         resp = asyncio.run(router.table["/h3chain/delete"](_Req({})))
         assert resp["status"] == 400                              # 缺参数
+
+
+def test_merge_endpoint_errors():
+    """merge 端点错误路径（不触真实编码）：清单/项目/段号校验 -> 400。"""
+    with _server_env() as (out, router):
+        handler = router.table["/h3chain/merge"]
+        _mk_project(out, "甲", {"schema": "h3seamless/ckpt-v3", "done": 2, "total": 3,
+                                "videos": ["seg_000.mp4", "", "seg_002.mp4"],
+                                "params": {"width": 864, "height": 480}})
+        open(os.path.join(out, "h3_projects", "甲", "seg_000.mp4"), "wb").close()
+        open(os.path.join(out, "h3_projects", "甲", "seg_002.mp4"), "wb").close()
+
+        for bad in ({"dir": "nope", "items": [{"seg": 1}]},          # 项目不存在
+                    {"dir": "../up", "items": [{"seg": 1}]},         # 穿越名
+                    {"dir": "甲", "items": []},                      # 空清单
+                    {"dir": "甲", "items": "not-a-list"},            # 清单类型
+                    {"dir": "甲", "items": [{"seg": 0}]},            # 段号下界（1-based）
+                    {"dir": "甲", "items": [{"seg": 4}]},            # 段号越界（>len(videos)）
+                    {"dir": "甲", "items": [{"seg": 2}]},            # 该段无 mp4（空串占位）
+                    {"dir": "甲", "items": [{"seg": "x"}]},          # 段号非整数
+                    {"dir": "甲", "items": [{"file": "../up.mp4"}]},  # 穿越文件名
+                    {"dir": "甲", "items": [{"file": "noext"}]},     # 缺扩展名
+                    {"dir": "甲", "items": [{"file": "nope.mp4"}]},  # 两目录均无此文件
+                    {"dir": "甲", "items": ["seg1"]}):               # 清单项非对象
+            resp = asyncio.run(handler(_Req(bad)))
+            assert resp["status"] == 400, bad
+            assert "error" in resp["json"]
+
+        # 混合清单里一项缺失 -> 整单 400（乙有 seg_000.mp4 但 missing.mp4 不存在）
+        _mk_project(out, "乙", {"schema": "h3seamless/ckpt-v3", "done": 1,
+                                "videos": ["seg_000.mp4"]})
+        open(os.path.join(out, "h3_projects", "乙", "seg_000.mp4"), "wb").close()
+        resp = asyncio.run(handler(_Req({"dir": "乙",
+                                         "items": [{"seg": 1}, {"file": "missing.mp4"}]})))
+        assert resp["status"] == 400
+        # 失败不落 manifest.merges
+        with open(os.path.join(out, "h3_projects", "乙", "manifest.json"),
+                  encoding="utf-8") as f:
+            assert "merges" not in json.load(f)
+
+
+def test_merge_endpoint_encode_failure_maps_500():
+    """merge 编码失败（0 字节 mp4）-> RuntimeError -> 500，无 .part 残留。
+
+    executor 内异常能传播回 handler 且映射 500；真实成功路径的合成视频
+    断言在 test_merge.py（需要 av）。
+    """
+    with _server_env() as (out, router):
+        handler = router.table["/h3chain/merge"]
+        pdir = _mk_project(out, "丙", {"schema": "h3seamless/ckpt-v3", "done": 2, "total": 2,
+                                       "videos": ["seg_000.mp4", "seg_001.mp4"],
+                                       "params": {"width": 864, "height": 480}})
+        open(os.path.join(pdir, "seg_000.mp4"), "wb").close()
+        open(os.path.join(pdir, "seg_001.mp4"), "wb").close()
+        resp = asyncio.run(handler(_Req({"dir": "丙", "items": [{"seg": 1}, {"seg": 2}]})))
+        assert resp["status"] == 500
+        assert "合并编码失败" in resp["json"]["error"]
+        assert [f for f in os.listdir(pdir) if f.endswith(".part")] == []  # 无半成品
+        with open(os.path.join(pdir, "manifest.json"), encoding="utf-8") as f:
+            assert "merges" not in json.load(f)                   # 失败不记档
 
 
 def test_register_promptserver():

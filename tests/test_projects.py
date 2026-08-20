@@ -152,6 +152,25 @@ def test_save_prompts():
         assert mf4["prompts"] == ["「序章（上传视频）」", "正片1改", "正片2"]
         assert mf4["total"] == 3
 
+        # 插入视频段：占位行按槽位回插、计入 total（纯提示词回写不让槽位错位）
+        _mk_project(out, "丁", {
+            "schema": "h3seamless/ckpt-v3", "done": 3, "total": 4,
+            "inserts": [{"slot": 2, "file": "素材A.mp4"}],
+            "prompts": ["镜头1", "镜头2", "[插入视频] 素材A.mp4"]})
+        mf5 = projects.save_prompts("丁", ["镜头1改", "镜头2改", "镜头3"])
+        assert mf5["prompts"] == ["镜头1改", "镜头2改", "[插入视频] 素材A.mp4", "镜头3"]
+        assert mf5["total"] == 4
+        assert mf5["done"] == 3                                   # total 含插入段，done 不被误钳
+
+        # 序章 + 插入组合：头与占位行都在
+        _mk_project(out, "戊", {
+            "schema": "h3seamless/ckpt-v3", "done": 2, "total": 3, "has_prologue": True,
+            "inserts": [{"slot": 1, "file": "片头.mp4"}],
+            "prompts": ["「序章（上传视频）」", "[插入视频] 片头.mp4", "正片1"]})
+        mf6 = projects.save_prompts("戊", ["正片1改"])
+        assert mf6["prompts"] == ["「序章（上传视频）」", "[插入视频] 片头.mp4", "正片1改"]
+        assert mf6["total"] == 3
+
         # 回写后 list_projects 立即反映新进度
         lst = projects.list_projects()
         by_dir = {p["dir"]: p for p in lst}

@@ -759,6 +759,45 @@ class H3SeamlessChainSampler(io.ComfyNode):
             except (TypeError, ValueError):
                 seg_secs.append(None)
 
+        # 段级独立镜头（断链）：与上段毫无关联的镜头一键全断——不接上段桥、不裁头、
+        # 不做接缝处理/测量/重摇、上段不做桥帧门控与智能切镜、不做响度对齐（硬切转场）
+        seg_unlink = []
+        for i in range(len(seg_prompts)):
+            seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
+            seg_unlink.append(bool(seg.get("unlink")))
+
+        # 插入视频段（导演台状态 inserts）：按链位混排进执行序列——画面+原声进成片，
+        # 尾帧 latent 桥接指导下一段生成（序章机制的任意段间推广）。
+        # 链位 pos = 提示词段+插入段混排后的 1-based 位置（不含序章），与前端 planFromDs 一致
+        insert_specs = []
+        _raw_inserts = ds.get("inserts") if isinstance(ds.get("inserts"), list) else []
+        for it in _raw_inserts:
+            if not (isinstance(it, dict) and str(it.get("file") or "").strip()):
+                continue
+            try:
+                pos = int(it.get("pos"))
+            except (TypeError, ValueError):
+                raise ValueError(f"插入视频位置无效：{it.get('pos')!r}（须为正整数链位）")
+            if not 1 <= pos <= len(seg_prompts) + len(_raw_inserts):
+                raise ValueError(f"插入视频链位 {pos} 越界：有效范围 1-{len(seg_prompts) + len(_raw_inserts)}")
+            insert_specs.append((pos, str(it["file"]).strip()))
+        _seen_pos = set()
+        for pos, _f in insert_specs:
+            if pos in _seen_pos:
+                raise ValueError(f"插入视频链位 {pos} 重复：每个链位只能插入一个视频")
+            _seen_pos.add(pos)
+        insert_specs.sort(key=lambda x: x[0])
+        exec_items = []   # ("prompt", 提示词段索引) | ("insert", 文件名)，链位序
+        _pi = 0
+        for pos, fname in insert_specs:
+            while len(exec_items) + 1 < pos and _pi < len(seg_prompts):
+                exec_items.append(("prompt", _pi))
+                _pi += 1
+            exec_items.append(("insert", fname))
+        while _pi < len(seg_prompts):
+            exec_items.append(("prompt", _pi))
+            _pi += 1
+
         # 首帧图片：导演台 JSON 优先，空则用画布连接
         if ds.get("first_frame"):
             首帧图片 = _load_input_image(ds["first_frame"])
@@ -831,6 +870,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
         report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}，模式 {_mode}，上下文 {ctx} 帧"]
+        if insert_specs:
+            _ins_txt = "、".join(f"链位{p}={f}" for p, f in insert_specs)
+            report.append(f"插入视频：{len(insert_specs)} 段（{_ins_txt}）——画面+原声进成片，尾帧桥指导下一段")
+        _unlink_pos = [str(item_i + 1) for item_i, it in enumerate(exec_items)
+                       if it[0] == "prompt" and seg_unlink[it[1]]]
+        if _unlink_pos:
+            report.append(f"独立镜头：{len(_unlink_pos)} 段与上段断链（无桥接/硬切，段 {'、'.join(_unlink_pos)}）")
         if str(宽高比) != "自定义":
             report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（官方换算，1MP=1024×1024，32 倍数对齐）")
         else:
@@ -943,7 +989,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append("提示：smoothstep像素混合是加权平均（运动残影/糊感来源），建议仅调试对比用；"
                           "正式出片建议「标准」档")
         # 逐段哈希：默认时长且未自定义段级引用的段哈希与旧公式一致（旧存档续跑不受影响）；
-        # 改过时长/引用的段把帧数/引用串并入哈希 → 自动从该段重做（否则只改勾选不触发重做）
+        # 改过时长/引用/断链开关的段把对应标记并入哈希 → 自动从该段重做（否则只改勾选不触发重做）
         _hash_refs = bool(pool_files)   # 仅状态池段级引用进哈希；画布回退不进（保旧档兼容）
         seg_hashes = []
         for i, p in enumerate(seg_prompts):
@@ -952,7 +998,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 tag = f"{seg_lengths[i]}|{tag}"
             if _hash_refs and seg_label_orders[i]:
                 tag = f"{','.join(lbl for _k, lbl in seg_label_orders[i])}|{tag}"
+            if seg_unlink[i]:
+                tag = f"unlink|{tag}"
             seg_hashes.append(checkpoint.prompt_hash(tag))
+
+        # 插入段哈希 = 文件指纹（mtime+size）：换文件/同名覆盖上传 → 从该段起重跑
+        def _insert_hash(fname):
+            try:
+                st = os.stat(folder_paths.get_annotated_filepath(fname))
+                return checkpoint.prompt_hash(f"insert|{fname}|{st.st_mtime_ns}|{st.st_size}")
+            except OSError:
+                return checkpoint.prompt_hash(f"insert|{fname}|missing")
+
+        exec_hashes = [seg_hashes[it[1]] if it[0] == "prompt" else _insert_hash(it[1])
+                       for it in exec_items]
         prologue_hash = None
         if 起始视频 is not None:
             f0 = 起始视频[0].detach().float().cpu()
@@ -960,17 +1019,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 f"prologue:{int(起始视频.shape[0])}:{float(f0.mean()):.4f}:{float(f0.std()):.4f}")
         root, manifest, done, seeds = None, None, 0, []
         proj_title, proj_created, proj_finals = "", None, []
+        proj_inserts = []
         off = 1 if 起始视频 is not None else 0
         if use_ckpt:
             root = checkpoint.ckpt_dir(ckpt_params, 存档目录.strip())
             manifest = checkpoint.load_manifest(root)
-            # 项目元数据：title 首次=目录名、created_at 首次=本次、finals 沿用存档
+            # 项目元数据：title 首次=目录名、created_at 首次=本次、finals/inserts 沿用存档
             proj_title = os.path.basename(root)
             proj_created = time.time()
             if manifest is not None:
                 proj_title = str(manifest.get("title") or proj_title)
                 proj_created = manifest.get("created_at") or proj_created
                 proj_finals = list(manifest.get("finals") or [])
+                proj_inserts = [dict(x) for x in (manifest.get("inserts") or [])
+                                if isinstance(x, dict)]
             if manifest is not None:
                 if manifest.get("schema") != checkpoint.SCHEMA:
                     raise ValueError(f"存档目录格式不认识（{manifest.get('schema')}），请换一个目录名；"
@@ -980,14 +1042,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     off = 1  # 输入已断开仍沿用存档序章（LoadVideo 可 bypass），哈希校验跳过
                 elif 起始视频 is not None and not manifest.get("has_prologue"):
                     manifest = checkpoint.truncate(root, manifest, 0)
+                    proj_inserts = []
                     report.append("存档续跑：检测到新接入的序章视频，整链重做")
                 elif 起始视频 is not None and prologue_hash is not None:
                     stored = list(manifest.get("prompt_hashes", []))
                     if stored and stored[0] != prologue_hash:
                         manifest = checkpoint.truncate(root, manifest, 0)
+                        proj_inserts = []
                         report.append("存档续跑：序章视频已更换，整链重做")
                 done = checkpoint.contiguous_done(root, int(manifest.get("done", 0)))
-                full_hashes = ([prologue_hash] if off else []) + seg_hashes
+                full_hashes = ([prologue_hash] if off else []) + exec_hashes
                 hashes = list(manifest.get("prompt_hashes", []))
                 # 「重跑起始段」为 1-based 段号（与 tooltip 一致）：N=从第 N 段起重做
                 start = min(max(reroll - 1, 0), done) if reroll > 0 else min(
@@ -995,21 +1059,24 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if start < done:
                     manifest = checkpoint.truncate(root, manifest, start)
                     done = start
+                    proj_inserts = [x for x in proj_inserts
+                                    if int(x.get("slot", -1)) < start]
                     原因 = "手动指定「重跑起始段」" if reroll > 0 else "检测到该段提示词已修改"
                     report.append(f"存档续跑：{原因}，从段 {start + 1} 起重新生成"
                                   + (f"（段 1-{start} 沿用存档）" if start else "（整链重做）"))
                 seeds = [int(s) for s in manifest.get("seeds", [])]
-                report.append(f"存档续跑：载入已完成 {done}/{len(seg_prompts) + off} 段，目录 {root}")
+                report.append(f"存档续跑：载入已完成 {done}/{len(exec_items) + off} 段，目录 {root}")
                 if reroll == 0 and seeds:
                     report.append("控件种子仅在「重跑起始段」> 0 时生效，当前沿用存档种子序列")
-        full_hashes = ([prologue_hash] if off else []) + seg_hashes
+        full_hashes = ([prologue_hash] if off else []) + exec_hashes
         if review and autosave:
             report.append(f"审片：分段视频每段落盘 → output/h3_projects/{os.path.basename(root) or '…'}/seg_XXX.mp4，"
                           "成片为运行结束时的已确认部分")
 
-        pbar = comfy.utils.ProgressBar(len(seg_prompts))
-        total = len(seg_prompts) + off
-        prompt_list = (["「序章（上传视频）」"] if off else []) + list(seg_prompts)
+        pbar = comfy.utils.ProgressBar(len(exec_items))
+        total = len(exec_items) + off
+        prompt_list = (["「序章（上传视频）」"] if off else []) + [
+            (f"[插入视频] {it[1]}" if it[0] == "insert" else seg_prompts[it[1]]) for it in exec_items]
         thumbs, videos, seams, bridge_scores = [], [], [], []
         all_frames = []
         all_wav = None
@@ -1058,7 +1125,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "seeds": [0], "trims": [0], "prompt_hashes": [prologue_hash],
                         "total": total, "thumbs": [], "videos": [], "prompts": prompt_list,
                         "seams": [None], "bridge_scores": [None], "params": ckpt_params,
-                        "seam_metrics": [None], "seam_refine": seam_refine})
+                        "seam_metrics": [None], "seam_refine": seam_refine,
+                        "inserts": list(proj_inserts)})
                 report.append(f"序章：上传视频编码为段 1/{total}（{fc} 帧"
                               + ("，超长仅取前段" if raw_fc > fc else "")
                               + "，经一次 VAE 重编码，按 24fps 处理"
@@ -1086,14 +1154,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
             prev_lat = (pv, pa, 0, pv.shape[2], 0, pa.shape[-1])
             report.append(f"段1/{total}：{prologue_origin} 序章 留{pframes.shape[0]}帧 · 种子 — | guide=无（序章）")
 
-        def _decode_crop(i, video_t, audio_t, skip_f):
+        def _decode_crop(i, video_t, audio_t, skip_f, gi, next_bridge):
             """解码 → 桥帧门控 → 尾切 token 对齐 → 裁剪到保留区（重摇与正常路径共用）。
 
+            gi=全局段号（混排链位+off，报告用）；next_bridge=下一段是否接收本段尾帧桥
+            （下段是独立镜头/插入视频/末段时为 False：门控与智能切镜都是为下段桥服务的，
+            下段不要桥就不必牺牲本段帧数）。
             返回 (frames, wav, sample_rate, end_t, vis_len, 桥帧总分, 门控报告行)；
             报告行只取最终采用的尝试（重摇的中间尝试整组丢弃）。
             """
             lines = []
-            gi = i + off
             sampled_fc = latent_t_to_frames(video_t.shape[2])
             vis_len = seg_lengths[i]
             frames = video_vae.decode(video_t)
@@ -1103,7 +1173,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             wav, sample_rate = _decode_audio(audio_vae, audio_t,
                                              norm_skip_frac=skip_f / sampled_fc if skip_f else 0.0)
             seg_bridge_score = None
-            if 桥帧门控 != "关闭" and i + 1 < len(seg_prompts):
+            if 桥帧门控 != "关闭" and next_bridge:
                 window = frames[max(skip_f, frames.shape[0] - (ctx + gate_limit)):]
                 score = qc.frame_scores(window)
                 tail_score = float(score[-1])
@@ -1123,7 +1193,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 运动低谷 = 动作完成/暂停 = 自然切镜点；与桥帧门控互补。
             # 丢帧止损：单段上限（切镜最多丢帧）+ 全链预算（含门控回退与网格对齐，
             # dropped_total 在主循环逐段累计）——超预算只标注不裁剪，防"30秒删7秒"
-            if 智能切镜 == "自动" and i + 1 < len(seg_prompts):
+            if 智能切镜 == "自动" and next_bridge:
                 cut_cap = max(0, int(切镜最多丢帧))
                 cut = qc.find_cut_point(frames, skip_f, vis_len,
                                         max_trim_frames=cut_cap if cut_cap > 0 else None)
@@ -1159,10 +1229,99 @@ class H3SeamlessChainSampler(io.ComfyNode):
             wav = wav[..., skip_s:skip_s + take_s]
             return frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, lines
 
-        for i, prompt in enumerate(seg_prompts):
-            g = i + off  # 全局段下标（有序章时序章占 0 号）
+        def _next_wants_bridge(item_i):
+            """混排序列中 item_i 的下一段是否接收本段尾帧桥：下段不存在/是插入段/
+            是独立镜头提示词段 → False（插入段不吃 guide，独立镜头不要桥）"""
+            nxt = exec_items[item_i + 1] if item_i + 1 < len(exec_items) else None
+            return bool(nxt) and nxt[0] == "prompt" and not seg_unlink[nxt[1]]
+
+        for item_i, item in enumerate(exec_items):
+            # ---- 插入视频段：画面+原声进成片，尾帧 latent 桥接指导下一段 ----
+            if item[0] == "insert":
+                ins_file = item[1]
+                g = item_i + off
+                ins_replay = use_ckpt and g < done
+                if ins_replay:
+                    pv, pa = checkpoint.load_segment(root, g)
+                    pv = pv.to(video_vae.device)
+                    pa = pa.to(audio_vae.device)
+                    report.append(f"段{g + 1}/{total}：插入视频「{ins_file}」存档载入 · guide=尾帧桥（指导下段）")
+                else:
+                    imgs, aud = _load_input_video(ins_file)
+                    raw_fc = int(imgs.shape[0])
+                    fc = align_frame_count_down(min(raw_fc, length))
+                    if fc < 5:
+                        raise ValueError(f"插入视频「{ins_file}」至少需要 5 帧（约 0.2 秒 @24fps），请换更长的视频")
+                    pv = video_vae.encode(_center_cover(imgs[:fc], width, height))
+                    _wav_in = aud.get("waveform") if isinstance(aud, dict) else None
+                    if _wav_in is not None and int(_wav_in.shape[-1]) > 0:
+                        pa = _encode_audio_latent(audio_vae, aud, audio_tokens_for_frames(fc))
+                        _mute = ""
+                    else:
+                        pa = torch.zeros(1, 32, 2, audio_tokens_for_frames(fc), device=video_vae.device)
+                        _mute = "，无音轨按静音处理"
+                    if use_ckpt:
+                        checkpoint.save_segment(root, g, pv, pa)
+                    report.append(f"段{g + 1}/{total}：插入视频「{ins_file}」编码 {fc} 帧"
+                                  + ("，超长仅取前段" if raw_fc > fc else "") + _mute
+                                  + " · guide=尾帧桥（指导下段）")
+                pframes = video_vae.decode(pv)
+                if len(pframes.shape) == 5:
+                    pframes = pframes.reshape(-1, pframes.shape[-3], pframes.shape[-2], pframes.shape[-1])
+                pwav, sample_rate = _decode_audio(audio_vae, pa)
+                thumbs.append(checkpoint.save_thumb(root, g, pframes[0]) if use_ckpt else "")
+                videos.append(checkpoint.save_segment_mp4(root, g, pframes, pwav, sample_rate,
+                                                          fresh=not ins_replay) if use_ckpt else "")
+                # 插入段与上段硬切（外部素材画面固定，混合/精修会重影）：指标记 None
+                seams.append(None)
+                bridge_scores.append(None)
+                seam_metrics_rows.append(None)
+                if g < len(seeds):
+                    seeds[g] = 0
+                else:
+                    seeds.append(0)
+                trims.append(0)
+                all_frames.append(pframes.cpu())
+                seg_frames.append(pframes.cpu())
+                seg_wavs.append({"waveform": pwav.cpu(), "sample_rate": sample_rate})
+                all_wav = pwav.cpu() if all_wav is None else torch.cat([all_wav, pwav.cpu()], dim=-1)
+                prev_tail_frame = pframes[-1].cpu()
+                prev_tail_clip = pframes[-24:].cpu()
+                _seam_n0 = max(1, int(sample_rate * 0.25))
+                prev_tail_wav = pwav.cpu()[..., -_seam_n0:]
+                guide = _tail_keyframe(pv, pa, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
+                                       full_bridge=full_bridge)
+                prev_lat = (pv, pa, 0, pv.shape[2], 0, pa.shape[-1])
+                if not ins_replay:
+                    proj_inserts.append({"slot": g, "file": ins_file})
+                pbar.update(1)
+                if use_ckpt and not ins_replay:
+                    done = g + 1
+                    checkpoint.save_manifest(root, {
+                        "schema": checkpoint.SCHEMA, "done": done, "has_prologue": bool(off),
+                        "seeds": list(seeds[:done]), "trims": list(trims[:done]),
+                        "prompt_hashes": full_hashes[:done],
+                        "total": total, "thumbs": list(thumbs[:done]), "videos": list(videos[:done]),
+                        "prompts": prompt_list[:done],
+                        "seams": seams[:done], "bridge_scores": bridge_scores[:done],
+                        "seam_metrics": seam_metrics_rows[:done],
+                        "params": ckpt_params, "seam_refine": seam_refine,
+                        "inserts": list(proj_inserts),
+                        "title": proj_title, "created_at": proj_created,
+                        "updated_at": time.time(), "finals": list(proj_finals),
+                    })
+                if review and not ins_replay and item_i + 1 < len(exec_items):
+                    report.append(f"审片：段 {g + 1}（插入视频）已完成并落盘 → seg_{g:03d}.mp4；"
+                                  "满意请直接重新运行继续下一段")
+                    break
+                continue
+
+            i = item[1]   # 提示词段索引（seg_lengths/seg_unlink/seg_label_orders 均按此索引）
+            prompt = seg_prompts[i]
+            g = item_i + off  # 全局段下标（有序章时序章占 0 号）
             replay = use_ckpt and g < done
-            skip_f = 0 if (i == 0 and off == 0) else ctx
+            next_wants_bridge = _next_wants_bridge(item_i)
+            skip_f = 0 if (item_i == 0 and off == 0) or seg_unlink[i] else ctx
             if replay:
                 video_t, audio_t = checkpoint.load_segment(root, g)
                 video_t = video_t.to(video_vae.device)
@@ -1170,7 +1329,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 dt = 0.0
                 cur_seed = seeds[g] if g < len(seeds) else None
                 frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, gate_lines = \
-                    _decode_crop(i, video_t, audio_t, skip_f)
+                    _decode_crop(i, video_t, audio_t, skip_f, gi=g, next_bridge=next_wants_bridge)
             else:
                 # 种子规则：重摇（重跑起始段>0）用控件种子；否则延续断点种子序列的等差，
                 # 使审片多轮运行与一次跑完逐帧一致；断点无生成段种子（仅序章/新链）才用控件种子
@@ -1216,9 +1375,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         first_frame=首帧图片 if i == 0 else None)
 
                 cond, latent = out[0], out[1]
-                if guide is not None or tail_anchor_latent is not None:
+                # 独立镜头段：上段桥不注入（guide 屏蔽为 None）；尾帧锚定是用户主动
+                # 设定的本段结尾身份锚点，与段间衔接无关，不受断链影响
+                eff_guide = None if seg_unlink[i] else guide
+                if eff_guide is not None or tail_anchor_latent is not None:
                     cond = cls._apply_guide(
-                        cond, guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]),
+                        cond, eff_guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]),
                         tail_kf_latent=tail_anchor_latent)
                     # 锚定加噪（SkyReels-V2 addnoise_condition 思路）：H3 模型 payload
                     # 原生支持 cond 噪声增强（extra_conds 从 cond dict 任意键取参），
@@ -1241,7 +1403,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 递减锚定：visual_cond_noise_aug 随采样进度从强到弱递减到消失。
                     # 开启时覆盖 _apply_anchor_noise 写入的固定值——每步动态计算
                     restore_step_aug = None
-                    if fade_ratio > 0 and (guide is not None or tail_anchor_latent is not None):
+                    if fade_ratio > 0 and (eff_guide is not None or tail_anchor_latent is not None):
                         aug_start = 1.0 - aug if aug > 0 else 0.999
                         restore_step_aug = step_cond_noise_guard(
                             模型.model.diffusion_model, aug_start, 0.0, fade_ratio)
@@ -1257,9 +1419,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     dt = time.perf_counter() - t0
                     video_t, audio_t = sampled["samples"].unbind()
                     frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, gate_lines = \
-                        _decode_crop(i, video_t, audio_t, skip_f)
+                        _decode_crop(i, video_t, audio_t, skip_f, gi=g, next_bridge=next_wants_bridge)
                     d_raw = None
-                    if prev_tail_frame is not None:
+                    if prev_tail_frame is not None and not seg_unlink[i]:
                         d_raw = qc.seam_metrics(prev_tail_frame, frames[0])[0]
                     if best is None or (d_raw is not None and (best[0] is None or d_raw < best[0])):
                         best = (d_raw, (frames.cpu(), wav.cpu(), sample_rate,
@@ -1291,8 +1453,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
             dropped_total += seg_lengths[i] - vis_len   # 切镜+门控回退+网格对齐合计，预算门控用
 
             # 段首响度对齐（与分镜链同款）：增益匹配上段尾 RMS（±6dB 钳制 + 1s 渐出），
-            # 增益不沿链累积；归一化已排除锚定区，此处兜住内容本身的响度差
-            if (i > 0 or off) and prev_tail_wav is not None:
+            # 增益不沿链累积；归一化已排除锚定区，此处兜住内容本身的响度差。
+            # 独立镜头段跳过（独立镜头常配独立声音设计）
+            if (item_i > 0 or off) and prev_tail_wav is not None and not seg_unlink[i]:
                 wav, gain_db = qc.loudness_align_head(wav, prev_tail_wav, rate=sample_rate)
                 if gain_db is not None:
                     report.append(f"段{g + 1} 响度对齐：段首 {gain_db:+.1f} dB（1s 渐出）")
@@ -1300,7 +1463,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 接缝后验测量（测而不干预）：上一段最后可见帧 vs 本段首帧
             seam_n = int(sample_rate * 0.25)
             seam_d, seam_db = None, None
-            if (i > 0 or off) and prev_tail_frame is not None:
+            if (item_i > 0 or off) and prev_tail_frame is not None and not seg_unlink[i]:
                 seam_d, seam_db = qc.seam_metrics(prev_tail_frame, frames[0],
                                                   prev_tail_wav, wav[..., :seam_n], rate=sample_rate)
                 db_txt = f"{seam_db:+.1f} dB" if seam_db is not None else "—"
@@ -1310,11 +1473,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 接缝处理（生成后、拼接前）：统一由 seam profile 驱动（refine.resolve_profile）。
             # 精修=跨缝窗口联合重去噪（refine.py）：缝两侧出自同一次去噪，根治
             # 段首偏差；只替换本段头部缝后侧帧，上段帧/存档/分段 mp4 均不动。
-            # 纯后处理不进断点指纹（改此参数不触发重跑，replay 段结果仍一致）
+            # 纯后处理不进断点指纹（改此参数不触发重跑，replay 段结果仍一致）。
+            # 独立镜头段不做任何接缝处理（硬切转场）
             refine_used = False
             seam_skipped = False   # 窗口不足=完全跳过（像素混合本身是糊感来源，不作兜底）
-            if (i > 0 or off) and prev_tail_frame is not None and prev_lat is not None \
-                    and (seam["use_refine"] or seam["pixel_blend"]):
+            if (item_i > 0 or off) and prev_tail_frame is not None and prev_lat is not None \
+                    and not seg_unlink[i] and (seam["use_refine"] or seam["pixel_blend"]):
                 if seam["use_refine"]:
                     ck0 = video_latent_t(skip_f)
                     cur_lat_ctx = (video_t, audio_t, ck0, end_t,
@@ -1383,7 +1547,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     span = min(max(1, seam["blend"]), frames.shape[0])
                     frames = qc.smoothstep_blend_head(frames, prev_tail_frame, span)
                     report.append(f"段{g + 1} 接缝平滑：首帧硬锁锚帧 + smoothstep {span} 帧过渡")
-            if (i > 0 or off) and prev_tail_frame is not None:
+            if (item_i > 0 or off) and prev_tail_frame is not None and not seg_unlink[i]:
                 seams.append([round(seam_d, 4), None if seam_db is None else round(seam_db, 2)])
             else:
                 seams.append(None)
@@ -1391,7 +1555,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 本段头 48 帧的局部基线评测，处理（精修/混合）后的最终成帧上测。
             # 写入 manifest seam_metrics（tools/ab_report.py 的 A/B 对比数据源）
             z_row = None
-            if (i > 0 or off) and prev_tail_clip is not None:
+            if (item_i > 0 or off) and prev_tail_clip is not None and not seg_unlink[i]:
                 try:
                     z_row = metrics.evaluate_local(prev_tail_clip, frames[:48].cpu())
                     z_txt = metrics.fmt_seam_z(z_row)
@@ -1399,7 +1563,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         report.append(f"段{g + 1} 接缝基准：{z_txt}（|z|<2 合格）")
                 except Exception:
                     z_row = None
-            seam_metrics_rows.append(z_row if (i > 0 or off) else None)
+            seam_metrics_rows.append(z_row if ((item_i > 0 or off) and not seg_unlink[i]) else None)
 
             all_frames.append(frames.cpu())
             seg_frames.append(frames.cpu())
@@ -1425,12 +1589,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     + ("+音频" if "audio_latent" in guide else "")
             else:
                 note = "guide=无（首段）"
+            if seg_unlink[i]:
+                note = "guide=无（独立镜头断链）"
             origin = "存档载入" if replay else f"采样{latent_t_to_frames(video_t.shape[2])}帧"
             seed_txt = cur_seed if cur_seed is not None else "—"
             report.append(f"段{g + 1}/{total}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧({frames.shape[0] / 24:.1f}s)"
-                          f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {dt:.0f}s") + f" | {note}")
+                          f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {dt:.0f}s") + f" | {note}"
+                          + (" · 独立镜头（断链）" if seg_unlink[i] else ""))
 
-            if i + 1 < len(seg_prompts):
+            if next_wants_bridge:
                 # end_tokens=kept 末端：锚定末端与输出末端重合（回退量已含在 vis_len 里）
                 guide = _tail_keyframe(video_t, audio_t, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
                                        end_tokens=end_t, full_bridge=full_bridge)
@@ -1446,13 +1613,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     "seams": seams[:done], "bridge_scores": bridge_scores[:done],
                     "seam_metrics": seam_metrics_rows[:done],
                     "params": ckpt_params, "seam_refine": seam_refine,
+                    "inserts": list(proj_inserts),
                     "title": proj_title, "created_at": proj_created,
                     "updated_at": time.time(), "finals": list(proj_finals),
                 })
 
             pbar.update(1)
 
-            if review and not replay and i + 1 < len(seg_prompts):
+            if review and not replay and item_i + 1 < len(exec_items):
                 report.append(f"审片：段 {g + 1} 已完成并落盘 → 看项目文件夹里的 seg_{g:03d}.mp4；"
                               f"满意请直接重新运行继续段 {g + 2}；不满意：改该段提示词后运行（自动从本段重跑），"
                               f"或设「重跑起始段={g + 1}」+ 换种子重摇")
@@ -1470,6 +1638,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 "seams": seams[:done], "bridge_scores": bridge_scores[:done],
                 "seam_metrics": seam_metrics_rows[:done],
                 "params": ckpt_params, "seam_refine": seam_refine,
+                "inserts": list(proj_inserts),
                 "title": proj_title, "created_at": proj_created,
                 "updated_at": time.time(), "finals": list(proj_finals),
             })

@@ -5,7 +5,7 @@ let src = fs.readFileSync(path.join(__dirname, "../web/h3_director.js"), "utf8")
 src = src
     .replace('import { app } from "/scripts/app.js";', "const app = { graph: null, registerExtension() {} };")
     .replace('import { api } from "/scripts/api.js";', "const api = { addEventListener() {}, fetchApi: async () => ({ ok: true }) };");
-const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapV25WidgetValues, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage };")(() => {}, () => true);
+const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapV25WidgetValues, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs };")(() => {}, () => true);
 let fails = 0;
 function eq(name, got, want) {
     const ok = JSON.stringify(got) === JSON.stringify(want);
@@ -114,6 +114,52 @@ eq("段勾选图片封顶 9", mod.getDs(node3).segments[1].refs.length, mod.KIND
 /* 删除素材：段级引用联动清理 */
 mod.removeRefImage(node3, 0);
 ok("删除后无视频1引用", !mod.getDs(node3).segments[0].refs.includes("视频1"));
+
+/* ---- 段级独立镜头（unlink）：getDs 归一 + setDs 回写回环 ---- */
+const nodeU = { widgets: [{ name: "导演台状态", value: JSON.stringify({
+    mode: "文生视频", prompts: ["a", "b"],
+    segments: [{ scene_prompt: "s", unlink: true }, { unlink: "yes" }],
+}) }], setDirtyCanvas() {} };
+const dsU = mod.getDs(nodeU);
+eq("unlink 布尔归一", dsU.segments.map((s) => s.unlink), [true, true]);
+mod.setDs(nodeU, dsU);
+eq("unlink 回写回环", mod.getDs(nodeU).segments.map((s) => s.unlink), [true, true]);
+eq("defaultSegment unlink 缺省 false", mod.defaultSegment().unlink, false);
+
+/* ---- 插入视频段（ds.inserts）：getDs 规范化（去重/过滤/排序） ---- */
+const nodeI = { widgets: [{ name: "导演台状态", value: JSON.stringify({
+    mode: "文生视频", prompts: ["a", "b", "c"],
+    inserts: [
+        { pos: 3, file: "  c.mp4  " },
+        { pos: 2, file: "b.mp4" },
+        { pos: 2, file: "dup.mp4" },       // 同链位去重保首个（getDs 先到先得：b.mp4）
+        { pos: 0, file: "zero.mp4" },      // pos<1 过滤
+        { pos: 1.5, file: "frac.mp4" },    // 非整数过滤
+        { pos: 4, file: "" },              // 空文件名过滤
+        "garbage",                          // 非对象过滤
+    ],
+}) }], setDirtyCanvas() {} };
+const dsI = mod.getDs(nodeI);
+eq("inserts 规范化", dsI.inserts, [{ pos: 2, file: "b.mp4" }, { pos: 3, file: "c.mp4" }]);
+
+/* planFromDs 混排：链位 = 提示词段+插入段交错位置（不含序章）。
+ * pos=2/3 两个插入段连续占链位 2、3（第 1 个提示词段占 1，其余提示词段垫后）——
+ * 与 nodes.py exec_items 混排算法逐位一致 */
+const planI = mod.planFromDs(nodeI);
+eq("混排序列", planI.plan.map((it) => it.kind === "insert"
+    ? ["i", it.pos, it.file] : ["p", it.idx]), [["p", 0], ["i", 2, "b.mp4"], ["i", 3, "c.mp4"], ["p", 1], ["p", 2]]);
+eq("混排不吞草稿统计", planI.drafts, []);
+/* 尾部插入：pos 超过 prompts 数时插入段垫后 */
+const nodeT = { widgets: [{ name: "导演台状态", value: JSON.stringify({
+    mode: "文生视频", prompts: ["a"], inserts: [{ pos: 2, file: "tail.mp4" }],
+}) }], setDirtyCanvas() {} };
+eq("尾部插入混排", mod.planFromDs(nodeT).plan.map((it) => it.kind),
+    ["prompt", "insert"]);
+/* 插入段不受 drafts 统计影响：空提示词段照常标记 */
+const nodeD = { widgets: [{ name: "导演台状态", value: JSON.stringify({
+    mode: "文生视频", prompts: ["", "b"], inserts: [{ pos: 1, file: "head.mp4" }],
+}) }], setDirtyCanvas() {} };
+eq("插入段不进草稿统计", mod.planFromDs(nodeD).drafts, ["段 1"]);
 
 /* ---- 默认工作流模板结构校验 ---- */
 const tplSrc = fs.readFileSync(path.join(__dirname, "../web/h3_default_workflow.js"), "utf8");

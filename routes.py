@@ -8,6 +8,7 @@
 - POST /delete_project  删除项目 = 删除整个项目文件夹
 - POST /delete_file     删除项目内单个文件（成片等，限 h3_projects/<项目>/<文件>）
 - POST /delete          删除成片保存节点输出目录中的文件（saver 画廊，限两级路径）
+- POST /merge           按序合并若干段/成片/外部视频 -> merged_*.mp4（流式编码）
 
 均受限于输出目录内、防目录穿越；无新依赖。
 注册有运行期兜底：ensure_registered() 幂等重试，节点执行时会再调一次，
@@ -20,6 +21,7 @@ PromptServer.add_routes() 只在启动时给当时已知的路由生成 /api 副
 只挂根路径 => 新前端全部 404；两份都挂 => 新旧前端与浏览器直访全通。
 """
 
+import asyncio
 import json
 import os
 import traceback
@@ -41,6 +43,7 @@ ROUTES = [
     ("POST", "/h3chain/delete"),
     ("POST", "/h3chain/delete_project"),
     ("POST", "/h3chain/delete_file"),
+    ("POST", "/h3chain/merge"),
 ]
 
 _ROUTES_LOG = ", ".join(f"{m} {p}" for m, p in ROUTES)
@@ -140,6 +143,22 @@ def add_routes(routes):
         os.remove(target)
         return web.json_response({"ok": True})
 
+    async def merge(request):
+        data = await request.json()
+        items = data.get("items")
+        try:
+            # PyAV 流式编码是 CPU 密集长任务（分钟级），放线程池避免
+            # 阻塞 aiohttp 事件循环拖死整个 ComfyUI 界面
+            manifest = await asyncio.get_event_loop().run_in_executor(
+                None, projects.merge_project, str(data.get("dir") or ""), items)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except RuntimeError as e:
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({
+            "ok": True, "manifest": manifest,
+            "file": manifest["merges"][-1]["file"]})
+
     handlers = [
         ("GET", "/h3chain/ping", ping),
         ("GET", "/h3chain/projects", list_projects),
@@ -149,6 +168,7 @@ def add_routes(routes):
         ("POST", "/h3chain/delete", delete),
         ("POST", "/h3chain/delete_project", delete_project),
         ("POST", "/h3chain/delete_file", delete_file),
+        ("POST", "/h3chain/merge", merge),
     ]
 
     def _mount(target, method, path, handler):
