@@ -20,7 +20,7 @@ for _p in (os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE)), _HER
 from test_node_structure import _install_stubs
 
 ROUTE_SET = {"/h3chain/ping", "/h3chain/projects", "/h3chain/project",
-             "/h3chain/create_project", "/h3chain/delete",
+             "/h3chain/create_project", "/h3chain/save_prompts", "/h3chain/delete",
              "/h3chain/delete_project", "/h3chain/delete_file"}
 # 新版前端 api.fetchApi() 强制给非 /api 路径加 /api 前缀（ComfyApi.apiURL），
 # 自定义路由必须同时挂 /api 副本，否则新前端全部 404
@@ -141,6 +141,24 @@ def test_create_project_endpoint():
         assert asyncio.run(handler(_Req({"dir": "乙"})))["json"]["ok"] is True
         for bad in ({"dir": "../up"}, {"dir": "a/b"}, {}):
             assert asyncio.run(handler(_Req(bad)))["status"] == 400
+
+
+def test_save_prompts_endpoint():
+    """切换/编辑项目时提示词回写（持久源=项目文件夹）。"""
+    with _server_env() as (out, router):
+        handler = router.table["/h3chain/save_prompts"]
+        _mk_project(out, "甲", {"schema": "h3seamless/ckpt-v3", "done": 1, "total": 1,
+                                "prompts": ["旧词"], "prompt_hashes": ["h1"]})
+        resp = asyncio.run(handler(_Req({"dir": "甲", "prompts": ["新词一", "新词二"]})))
+        assert resp["json"]["ok"] is True
+        assert resp["json"]["manifest"]["prompts"] == ["新词一", "新词二"]
+        assert resp["json"]["manifest"]["total"] == 2
+        with open(os.path.join(out, "h3_projects", "甲", "manifest.json"),
+                  encoding="utf-8") as f:                       # 真落盘
+            assert json.load(f)["prompts"] == ["新词一", "新词二"]
+        assert asyncio.run(handler(_Req({"dir": "nope", "prompts": []})))["status"] == 404
+        assert asyncio.run(handler(_Req({"dir": "../up", "prompts": []})))["status"] == 404
+        assert asyncio.run(handler(_Req({"dir": "甲", "prompts": "str"})))["status"] == 404
 
 
 def test_delete_project_endpoint():

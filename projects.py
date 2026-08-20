@@ -78,6 +78,32 @@ def read_project(name: str):
     return manifest if isinstance(manifest, dict) else None
 
 
+def save_prompts(name: str, prompts):
+    """把导演台当前提示词组回写进项目 manifest（提示词的持久源=项目文件夹）。
+
+    只更新 prompts / total / updated_at（及 done 超界钳制），不动
+    params / seeds / prompt_hashes / finals——运行时的重做判定依旧按
+    节点控件提示词 vs prompt_hashes 逐段比对，改词段落照常自动重做。
+    序章项目（has_prologue）自动补回「序章」占位头，与运行时写盘格式一致。
+    目录或 manifest 不存在（未跑过的指纹目录）返回 None，调用方按无项目跳过。
+    """
+    name = safe_name(name)
+    if not name or not isinstance(prompts, list):
+        return None
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        return None
+    seg_prompts = [str(p) for p in prompts][:64]
+    off = 1 if manifest.get("has_prologue") else 0
+    manifest["prompts"] = (["「序章（上传视频）」"] if off else []) + seg_prompts
+    manifest["total"] = len(seg_prompts) + off
+    manifest["done"] = min(int(manifest.get("done") or 0), manifest["total"])
+    manifest["updated_at"] = time.time()
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
 def create_project(name: str):
     """新建项目：当场建文件夹 + 写初始 manifest（0 段草稿态），列表立即可见。
 

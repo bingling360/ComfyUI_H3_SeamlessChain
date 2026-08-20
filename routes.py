@@ -37,6 +37,7 @@ ROUTES = [
     ("GET", "/h3chain/projects"),
     ("GET", "/h3chain/project"),
     ("POST", "/h3chain/create_project"),
+    ("POST", "/h3chain/save_prompts"),
     ("POST", "/h3chain/delete"),
     ("POST", "/h3chain/delete_project"),
     ("POST", "/h3chain/delete_file"),
@@ -88,6 +89,14 @@ def add_routes(routes):
             return web.json_response({"error": "无效的项目目录名"}, status=400)
         return web.json_response({"ok": True, "manifest": manifest})
 
+    async def save_prompts(request):
+        data = await request.json()
+        manifest = projects.save_prompts(str(data.get("dir") or ""), data.get("prompts"))
+        if manifest is None:
+            return web.json_response(
+                {"error": "项目不存在（未新建也未跑过，无 manifest 可写）"}, status=404)
+        return web.json_response({"ok": True, "manifest": manifest})
+
     async def delete(request):
         data = await request.json()
         if "file" not in data:
@@ -136,6 +145,7 @@ def add_routes(routes):
         ("GET", "/h3chain/projects", list_projects),
         ("GET", "/h3chain/project", project_detail),
         ("POST", "/h3chain/create_project", create_project),
+        ("POST", "/h3chain/save_prompts", save_prompts),
         ("POST", "/h3chain/delete", delete),
         ("POST", "/h3chain/delete_project", delete_project),
         ("POST", "/h3chain/delete_file", delete_file),

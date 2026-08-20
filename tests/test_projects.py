@@ -110,6 +110,54 @@ def test_create_project():
         assert mf3["done"] == 3 and mf3["total"] == 8
 
 
+def test_save_prompts():
+    """提示词回写：项目的提示词持久源=项目文件夹（切换/新建/编辑时落盘）。"""
+    with _env() as out:
+        from ComfyUI_H3_SeamlessChain import projects
+
+        # 不存在/非法输入 -> None，不触磁盘
+        assert projects.save_prompts("nope", ["a"]) is None
+        assert projects.save_prompts("../up", ["a"]) is None
+        assert projects.save_prompts("甲", "not-a-list") is None
+
+        created = projects.create_project("甲")
+        mf = projects.save_prompts("甲", ["镜头一", "镜头二"])
+        assert mf["prompts"] == ["镜头一", "镜头二"]
+        assert mf["total"] == 2 and mf["done"] == 0
+        assert mf["title"] == created["title"]              # title/created_at 继承
+        assert mf["created_at"] == created["created_at"]
+        assert mf["updated_at"] >= created["updated_at"]
+
+        # 只动 prompts/total/updated_at：done/params/哈希/成片清单原样保留
+        _mk_project(out, "乙", {
+            "schema": "h3seamless/ckpt-v3", "done": 3, "total": 3,
+            "params": {"width": 864}, "prompt_hashes": ["h1", "h2", "h3"],
+            "finals": ["final_a.mp4"], "title": "乙", "created_at": 1.0, "updated_at": 1.0,
+            "prompts": ["旧1", "旧2", "旧3"]})
+        mf2 = projects.save_prompts("乙", ["旧1", "新2", "旧3", "加一段"])
+        assert mf2["prompts"] == ["旧1", "新2", "旧3", "加一段"]
+        assert mf2["total"] == 4 and mf2["done"] == 3       # 改词不截 done（运行时按哈希判定）
+        assert mf2["prompt_hashes"] == ["h1", "h2", "h3"]   # 哈希不动 -> 重做判定语义不变
+        assert mf2["params"] == {"width": 864} and mf2["finals"] == ["final_a.mp4"]
+
+        # 段数缩水 -> done 钳制到新 total（与 reroll_start 的 min 语义一致）
+        mf3 = projects.save_prompts("乙", ["旧1"])
+        assert mf3["total"] == 1 and mf3["done"] == 1
+
+        # 序章项目：自动补回占位头，与运行时写盘格式一致
+        _mk_project(out, "丙", {
+            "schema": "h3seamless/ckpt-v3", "done": 2, "total": 3, "has_prologue": True,
+            "prompts": ["「序章（上传视频）」", "正片1", "正片2"]})
+        mf4 = projects.save_prompts("丙", ["正片1改", "正片2"])
+        assert mf4["prompts"] == ["「序章（上传视频）」", "正片1改", "正片2"]
+        assert mf4["total"] == 3
+
+        # 回写后 list_projects 立即反映新进度
+        lst = projects.list_projects()
+        by_dir = {p["dir"]: p for p in lst}
+        assert by_dir["乙"]["total"] == 1 and by_dir["乙"]["done"] == 1
+
+
 def test_delete_project():
     with _env() as out:
         from ComfyUI_H3_SeamlessChain import projects

@@ -490,6 +490,7 @@ function setPromptText(node, idx, text) {
     if (idx < 0 || idx >= ds.prompts.length) return false;
     ds.prompts[idx] = text;
     setDs(node, ds);
+    schedulePromptFlush();   // 编辑即落盘（防抖）：提示词的持久源=项目文件夹
     return true;
 }
 
@@ -500,6 +501,7 @@ function addPromptSegment(node) {
     if (!ds.segments) ds.segments = [];
     ds.segments.push(defaultSegment());
     setDs(node, ds);
+    schedulePromptFlush();
     scheduleRefresh(60);
 }
 
@@ -509,6 +511,7 @@ function removePromptSegment(node, idx) {
     ds.prompts.splice(idx, 1);
     if (ds.segments) ds.segments.splice(idx, 1);
     setDs(node, ds);
+    schedulePromptFlush();
     scheduleRefresh(60);
 }
 
@@ -972,20 +975,60 @@ async function deleteProject(dir) {
     }
 }
 
-/** 读档：切换「存档目录」+ 载入该项目的提示词进导演台状态（后端续跑校验共享参数）。 */
+/** 提示词回写：把画布当前提示词组存进「存档目录」指向的项目 manifest——
+ *  项目提示词的持久源=项目文件夹。三个触发点：
+ *  ① 切换项目前（旧项目先落盘，否则画布状态被覆盖即丢失）；
+ *  ② 新建项目前（同上）；
+ *  ③ 编辑后 1.5s 防抖自动回写（断电/崩溃也不丢提示词草稿）。
+ *  项目目录/manifest 不存在（未新建未跑过的指纹目录）→ 404 静默跳过；
+ *  失败仅 console 警告，绝不阻断切换流程。 */
+async function flushPrompts(node, dir) {
+    node = node || findNode();
+    if (!node) return false;
+    const target = dir || getDirValue(node);
+    if (!target) return false;
+    const ds = getDs(node);
+    try {
+        const r = await api.fetchApi("/h3chain/save_prompts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dir: target, prompts: (ds.prompts || []).map(String) }),
+        });
+        if (r.status === 404) return false;   // 无 manifest 的目录：跳过不报错
+        if (!r.ok) { console.warn("[h3-director] save_prompts HTTP", r.status); return false; }
+        return true;
+    } catch (e) {
+        console.warn("[h3-director] save_prompts failed:", e);
+        return false;
+    }
+}
+
+let promptFlushTimer = 0;
+function schedulePromptFlush() {
+    clearTimeout(promptFlushTimer);
+    promptFlushTimer = setTimeout(() => { flushPrompts(); }, 1500);
+}
+
+/** 读档：切换「存档目录」+ 载入该项目的提示词进导演台状态（后端续跑校验共享参数）。
+ *  切走前先把当前提示词回写旧项目（否则覆盖即丢）；序章项目的 prompts[0]
+ *  是「序章（上传视频）」占位（对应起始视频，不是提示词框），载入时跳过。 */
 async function switchProject(dir) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点（只读模式）"); return; }
+    clearTimeout(promptFlushTimer);                             // 取消挂起的防抖：防止迟到的回写打到新项目
+    const oldDir = getDirValue(node);
+    if (oldDir && oldDir !== dir) await flushPrompts(node, oldDir);
     if (!setDirValue(node, dir)) { alert("节点上没有「存档目录/断点目录」控件"); return; }
     setWidgetValue(node, W_REROLL, 0);
     const r = await apiGet(`/h3chain/project?dir=${encodeURIComponent(dir)}`);
     const mf = r.ok ? (r.data?.manifest || null) : null;
     if (mf) {
-        const total = mf.total || (mf.prompts || []).length || 0;
-        if (total) {
+        const off = mf.has_prologue ? 1 : 0;
+        const plist = (mf.prompts || []).slice(off);
+        if (plist.length || mf.total) {
             const ds = getDs(node);
-            ds.prompts = Array.from({ length: total }, (_v, i) => String((mf.prompts || [])[i] ?? ""));
-            ds.segments = Array.from({ length: total }, (_v, i) => ds.segments?.[i] ?? defaultSegment());
+            ds.prompts = Array.from({ length: plist.length }, (_v, i) => String(plist[i] ?? ""));
+            ds.segments = Array.from({ length: plist.length }, (_v, i) => ds.segments?.[i] ?? defaultSegment());
             setDs(node, ds);
         }
         setLed("idle", `已读档「${mf.title || dir}」（${mf.total ? `${mf.done ?? 0}/${mf.total} 段` : "草稿，未配置段落"}）`);
@@ -2613,9 +2656,12 @@ function openNewProjectModal() {
         } catch (e) {
             console.warn("[h3-director] create_project failed:", e);
         }
+        clearTimeout(promptFlushTimer);       // 同上：取消挂起防抖，旧项目由下方显式回写
+        await flushPrompts(node);   // 旧项目底稿先落盘，再切走
         if (!setDirValue(node, name)) { err.textContent = "节点上没有「存档目录/断点目录」控件"; return; }
         setWidgetValue(node, W_REROLL, 0);
         if (cb.checked) clearPrompts(node);
+        if (diskOk) flushPrompts(node, name);   // 沿用底稿时把携带的提示词存进新项目
         setLed("idle", `新项目「${name}」已就绪${diskOk ? "（文件夹已建）" : ""}`);
         close();
         scheduleRefresh(200);
