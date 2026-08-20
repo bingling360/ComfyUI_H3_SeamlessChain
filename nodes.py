@@ -27,7 +27,6 @@ common_ksampler。多 token 桥与 keyframe 音频需要 ComfyUI 含 PR #15439
 行数，钉多 token 桥会形状错位，运行时自动探测并降级为单帧桥（报告说明）。
 """
 
-import math
 import os
 import re
 import time
@@ -319,27 +318,16 @@ _LABEL_TOKEN = re.compile(r"\[\[([^\[\]]{1,24})\]\]")
 
 
 def _resolve_canvas(ar, mp):
-    """宽高比+百万像素 -> 32 倍数对齐画布（短边≤768、长边≤1344，H3 原生画布上限）。
+    """宽高比+百万像素 -> 画布（官方 Resolution Selector 公式逐位移植，comfy_extras/nodes_resolution.py）。
 
-    16:9+1.0 → 1344×768（官方原生画布）；16:9+0.5 → 960×544；9:16+1.0 → 768×1344。
-    ceil 对齐可能顶破上限（2.0MP 正方形 → 800>768）：_fit 就近回落到上限
-    （768/1344 均为 32 倍数，回落不破坏对齐）；方形两边统一走短边上限。
+    1MP = 1024×1024 = 1048576 px（官方口径，非 1e6）；两侧各自 round 对齐 32 倍数，无上限收敛。
+    16:9 档位对照官方节点：0.2→608×352 / 0.5→960×544 / 0.98→1344×768（H3 原生）/ 1.0→1376×768 /
+    1.2→1504×832 / 1.5→1664×928 / 2.0→1920×1088；9:16+1.0 → 768×1376。
     """
     r = _AR_RATIO[str(ar)]
-    total = float(mp) * 1_000_000
+    total = float(mp) * 1024 * 1024
     w0, h0 = (total * r) ** 0.5, (total / r) ** 0.5
-    s = min(1.0, 1344 / max(w0, h0), 768 / min(w0, h0))
-
-    def _fit(target, cap):
-        v = math.ceil(target / 32) * 32
-        return max(32, min(v, cap))
-
-    if w0 == h0:                                   # 1:1 方形：短边上限对两边生效
-        side = _fit(w0 * s, 768)
-        return side, side
-    if w0 > h0:
-        return _fit(w0 * s, 1344), _fit(h0 * s, 768)
-    return _fit(w0 * s, 768), _fit(h0 * s, 1344)
+    return round(w0 / 32) * 32, round(h0 / 32) * 32
 
 
 def _snap_seconds(seconds):
@@ -467,12 +455,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Vae.Input("视频VAE"),
                 io.Vae.Input("音频VAE"),
                 io.Combo.Input("宽高比", options=["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"], default="16:9",
-                               tooltip="官方 Resolution Selector 同款：与「百万像素」共同换算画布，32 倍数对齐，"
-                                       "短边≤768、长边≤1344（H3 原生画布上限）。选「自定义」时直接用下方宽度/高度"),
+                               tooltip="官方 Resolution Selector 同款：与「百万像素」共同换算画布（1MP=1024×1024，32 倍数对齐）。"
+                                       "选「自定义」时直接用下方宽度/高度"),
                 io.Float.Input("百万像素", default=0.5, min=0.1, max=2.0, step=0.1,
-                               tooltip="目标总像素（MP），0.1–2.0 步进 0.1 共 20 档，箭头微调（官方 Resolution Selector 同款）："
-                                       "0.25 草稿 / 0.5 快速预览 / 1.0 官方原生（16:9 下即 1344×768）/ 2.0 超采样上限。"
-                                       "超出画布上限会自动收到上限（短边≤768、长边≤1344）"),
+                               tooltip="目标总像素（MP），0.1–2.0 步进 0.1，箭头微调（官方 Resolution Selector 同款口径）："
+                                       "0.2 草稿（608×352）/ 0.5 快速预览（960×544）/ 0.98 H3 官方原生（1344×768）/ "
+                                       "1.0（1376×768）/ 2.0 超采样（1920×1088）"),
                 io.Int.Input("宽度", default=864, min=32, max=16384, step=32, advanced=True,
                              tooltip="「宽高比=自定义」时直接生效；其余模式由 宽高比+百万像素 换算覆盖"),
                 io.Int.Input("高度", default=480, min=32, max=16384, step=32, advanced=True,
@@ -842,7 +830,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}，模式 {_mode}，上下文 {ctx} 帧"]
         if str(宽高比) != "自定义":
-            report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（32 倍数对齐，短边≤768）")
+            report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（官方换算，1MP=1024×1024，32 倍数对齐）")
         else:
             report.append(f"画布：自定义 {width}×{height}")
         _custom_len = [i for i in range(len(seg_lengths)) if seg_lengths[i] != length]

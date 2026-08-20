@@ -15,12 +15,20 @@ from ComfyUI_H3_SeamlessChain import nodes as plugin_nodes  # noqa: E402
 
 def test_resolve_canvas():
     rc = plugin_nodes._resolve_canvas
-    assert rc("16:9", "1.0") == (1344, 768)     # 官方原生画布
+    # 官方 Resolution Selector 公式逐位对照（1MP=1024×1024，round 对齐 32 倍数，无上限收敛）
+    assert rc("16:9", 0.2) == (608, 352)
     assert rc("16:9", "0.5") == (960, 544)      # 快速预览
-    assert rc("9:16", "1.0") == (768, 1344)     # 竖版原生
-    w, h = rc("21:9", "1.0")                    # 超上限收敛到 1344 长边
-    assert w == 1344 and h <= 768 and h % 32 == 0
-    # 百万像素浮点档位：0.1–2.0 共 20 档（官方箭头微调同款），字符串/浮点输入均可
+    assert rc("16:9", 0.98) == (1344, 768)      # H3 官方原生画布
+    assert rc("16:9", "1.0") == (1376, 768)     # 官方 1.0MP 口径
+    assert rc("16:9", 1.2) == (1504, 832)
+    assert rc("16:9", 1.5) == (1664, 928)
+    assert rc("16:9", 1.8) == (1824, 1024)
+    assert rc("16:9", 2.0) == (1920, 1088)
+    assert rc("9:16", "1.0") == (768, 1376)     # 竖版
+    assert rc("21:9", "1.0") == (1568, 672)     # 不再截断长边
+    assert rc("1:1", 1.0) == (1024, 1024)       # 方形：1MP=1024×1024 恒等
+    assert rc("1:1", 2.0) == (1440, 1440)
+    # 百万像素浮点档位：0.1–2.0 共 20 档，字符串/浮点输入均可
     mps = plugin_nodes._MP_OPTIONS
     assert len(mps) == 20 and mps[0] == 0.1 and mps[-1] == 2.0
     assert rc("16:9", 0.5) == rc("16:9", "0.5")
@@ -28,7 +36,8 @@ def test_resolve_canvas():
         for mp in mps:
             w, h = rc(ar, mp)
             assert w % 32 == 0 and h % 32 == 0 and w >= 32 and h >= 32
-            assert max(w, h) <= 1344 and min(w, h) <= 768
+            area = w * h
+            assert 0.9 * mp * 1024 * 1024 <= area <= 1.15 * mp * 1024 * 1024   # 面积贴合目标
     print("PASS test_resolve_canvas")
 
 

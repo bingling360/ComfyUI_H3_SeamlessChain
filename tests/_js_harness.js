@@ -15,12 +15,16 @@ function ok(name, cond) {
     if (!cond) { fails += 1; console.error(`FAIL ${name}`); }
 }
 
-eq("16:9+1.0", mod.resolveCanvas("16:9", "1.0"), [1344, 768]);
-eq("9:16+1.0", mod.resolveCanvas("9:16", "1.0"), [768, 1344]);
+eq("16:9+0.2", mod.resolveCanvas("16:9", "0.2"), [608, 352]);
 eq("16:9+0.5", mod.resolveCanvas("16:9", "0.5"), [960, 544]);
-eq("21:9+1.0 上限收敛", mod.resolveCanvas("21:9", "1.0"), [1344, 576]);
-eq("1:1+2.0 上限收敛", mod.resolveCanvas("1:1", "2.0"), [768, 768]);
-eq("16:9+2.0 上限收敛", mod.resolveCanvas("16:9", "2.0"), [1344, 768]);
+eq("16:9+0.98", mod.resolveCanvas("16:9", "0.98"), [1344, 768]);   // H3 官方原生
+eq("16:9+1.0", mod.resolveCanvas("16:9", "1.0"), [1376, 768]);     // 官方口径 1MP=1024×1024
+eq("16:9+1.2", mod.resolveCanvas("16:9", "1.2"), [1504, 832]);
+eq("16:9+2.0", mod.resolveCanvas("16:9", "2.0"), [1920, 1088]);
+eq("9:16+1.0", mod.resolveCanvas("9:16", "1.0"), [768, 1376]);
+eq("21:9+1.0 无截断", mod.resolveCanvas("21:9", "1.0"), [1568, 672]);
+eq("1:1+1.0", mod.resolveCanvas("1:1", "1.0"), [1024, 1024]);
+eq("1:1+2.0", mod.resolveCanvas("1:1", "2.0"), [1440, 1440]);
 eq("非法AR", mod.resolveCanvas("自定义", "1.0"), null);
 
 eq("snap 5.0", mod.snapFrames(5.0), 124);
@@ -29,16 +33,17 @@ eq("snap 6.0", mod.snapFrames(6.0), 141);
 eq("snap 0.5", mod.snapFrames(0.5), 5);
 eq("snap 15", mod.snapFrames(15), 362);
 
-eq("match 1344x768", mod.matchCanvasCombo(1344, 768), ["16:9", 1]);
+eq("match 1344x768", mod.matchCanvasCombo(1344, 768), ["16:9", 0.98]);  // 0.98 为 MP_LIST 迁移专用档
+eq("match 1376x768", mod.matchCanvasCombo(1376, 768), ["16:9", 1]);
 eq("match 960x544", mod.matchCanvasCombo(960, 544), ["16:9", 0.5]);
-eq("match 864x480", mod.matchCanvasCombo(864, 480), ["16:9", 0.4]);   // 20 档细分后旧默认画布可命中
+eq("match 864x480", mod.matchCanvasCombo(864, 480), ["16:9", 0.4]);
 eq("match 850x480 无组合", mod.matchCanvasCombo(850, 480), null);      // 非 32 倍数必然无组合
 
 const remapped = mod.remapOldWidgetValues([864, 480, 124, "22", 0, "fixed", 25, 1.0, "res_multistep", "simple"]);
 eq("迁移头部", remapped.slice(0, 8), ["16:9", 0.4, 864, 480, 5.2, "22", 0, "fixed"]);
 eq("迁移尾部保留", remapped.slice(8), [25, 1.0, "res_multistep", "simple"]);
 const remapped2 = mod.remapOldWidgetValues([1344, 768, 124, "22", 9, "randomize", 30, 2.0]);
-eq("迁移命中组合", remapped2.slice(0, 7), ["16:9", 1, 1344, 768, 5.2, "22", 9]);
+eq("迁移命中组合", remapped2.slice(0, 7), ["16:9", 0.98, 1344, 768, 5.2, "22", 9]);
 
 /* 导演台时代 25 值 → 统一接缝后端 35 值：头部不变、接缝混合映射、新控件默认值插入、尾部保留 */
 const v25 = ["16:9", "0.5", 864, 480, 5.0, "22", 0, "fixed", 25, 1.0,

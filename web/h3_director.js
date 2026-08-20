@@ -50,7 +50,7 @@ const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
 const AR_LIST = ["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"];
 const AR_RATIO = { "21:9": 21 / 9, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4, "1:1": 1 };
-const MP_LIST = Array.from({ length: 20 }, (_v, i) => ((i + 1) / 10).toFixed(1));   // 0.1–2.0 共 20 档（与后端 _MP_OPTIONS 一致）
+const MP_LIST = [...Array.from({ length: 20 }, (_v, i) => ((i + 1) / 10).toFixed(1)), "0.98"].sort((a, b) => a - b);   // 0.1–2.0 共 20 档 + 0.98（官方 1344×768 原生档，旧档迁移用）
 const QUICK_LABELS = ["角色1", "角色2", "场景1", "场景2", "风格", "道具"];
 /* 素材类别：与后端 REF_CAPS/_KIND_NAME 对齐（官方单段上限 图9/视3/音3） */
 const KIND_LIST = ["image", "video", "audio"];
@@ -152,14 +152,14 @@ function badge(text, cls) {
 function resolveCanvas(ar, mp) {
     const r = AR_RATIO[String(ar)];
     if (!r) return null;
-    const total = parseFloat(mp) * 1e6;
+    const total = parseFloat(mp) * 1024 * 1024;
     if (!isFinite(total) || total <= 0) return null;
-    const w0 = Math.sqrt(total * r), h0 = Math.sqrt(total / r);
-    const s = Math.min(1, 1344 / Math.max(w0, h0), 768 / Math.min(w0, h0));
-    const fit = (t, cap) => Math.max(32, Math.min(Math.ceil(t / 32) * 32, cap));
-    if (w0 === h0) { const side = fit(w0 * s, 768); return [side, side]; }
-    if (w0 > h0) return [fit(w0 * s, 1344), fit(h0 * s, 768)];
-    return [fit(w0 * s, 768), fit(h0 * s, 1344)];
+    const fit = (x) => {
+        const u = x / 32, f = Math.floor(u), d = u - f;
+        const k = d === 0.5 ? (f % 2 === 0 ? f : f + 1) : Math.round(u);   // Python round：.5 取偶
+        return Math.max(32, k * 32);
+    };
+    return [fit(Math.sqrt(total * r)), fit(Math.sqrt(total / r))];
 }
 
 function snapFrames(seconds) {
@@ -2301,14 +2301,17 @@ function renderWidgetField(node, name, labelOverride) {
         inp.type = "number";
         inp.value = w.value;
         const step = w.options && w.options.step;
-        inp.step = step || (name === "CFG" || name === W_DUR ? 0.1 : 1);
+        inp.step = step || (name === W_MP || name === "CFG" || name === W_DUR ? 0.1 : 1);
         if (w.options && Number.isFinite(w.options.min)) inp.min = w.options.min;
         if (w.options && Number.isFinite(w.options.max)) inp.max = w.options.max;
         inp.onchange = () => setWidgetValue(node, name, Number(inp.value));
         row.append(inp);
         if (name === W_MP) {
             row.append(el("span", "h3d-secs-hint", "MP"));
-            inp.title = "目标总像素 0.1–2.0MP（步进0.1，箭头微调，共20档）：0.25 草稿 / 0.5 预览 / 1.0 官方原生 / 超出画布上限自动收敛";
+            inp.title = "目标总像素 0.1–2.0MP（步进0.1，箭头微调；官方口径 1MP=1024×1024）："
+                + "0.2 草稿(608×352) / 0.5 预览(960×544) / 0.98 H3原生(1344×768) / 1.0(1376×768) / 2.0(1920×1088)";
+            inp.min = inp.min || 0.1;   // 控件 options 未下发时兜底，防箭头越界
+            inp.max = inp.max || 2.0;
         }
         if (name === W_SEED) {
             const dice = el("button", "h3d-btn", "🎲");
@@ -2344,7 +2347,7 @@ function renderParamsZone(sec, data) {
         const badgeTxt = canvasBadgeText(node);
         if (badgeTxt) {
             const b = el("div", "h3d-convbadge", `${escapeHtml(badgeTxt)} · 32倍数对齐`);
-            b.title = "官方 Resolution Selector 同款换算：短边≤768、长边≤1344（H3 原生画布上限）";
+            b.title = "官方 Resolution Selector 同款换算：1MP=1024×1024，两侧各自 round 对齐 32 倍数";
             grid.append(b);
         }
     } else {
