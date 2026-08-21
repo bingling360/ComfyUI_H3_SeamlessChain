@@ -770,8 +770,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 待做段「神经放大 latent → 低强度重采样 → 解码落盘 upseg_*」；关闭时 None
         from . import upscale
         up_cfg = upscale.parse_state(ds)
-        if up_cfg:
-            report.append(f"潜空间放大二采：已开启（{up_cfg['mode']}），主链完成后执行")
 
         # 插入视频段（导演台状态 inserts）：按链位混排进执行序列——画面+原声进成片，
         # 尾帧 latent 桥接指导下一段生成（序章机制的任意段间推广）。
@@ -884,6 +882,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                        if it[0] == "prompt" and seg_unlink[it[1]]]
         if _unlink_pos:
             report.append(f"独立镜头：{len(_unlink_pos)} 段与上段断链（无桥接/硬切，段 {'、'.join(_unlink_pos)}）")
+        if up_cfg:
+            report.append(f"潜空间放大二采：已开启（{up_cfg['mode']}），主链完成后执行")
         if str(宽高比) != "自定义":
             report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（官方换算，1MP=1024×1024，32 倍数对齐）")
         else:
