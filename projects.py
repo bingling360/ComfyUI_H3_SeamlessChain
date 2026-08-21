@@ -179,9 +179,11 @@ def delete_project(name: str):
 def upscale_reset(name, seg):
     """清掉某段的二采记录与产物文件（下次开启二采运行时该段重做）。
 
-    只动 manifest.upscale.segs[seg-1] 与 upseg_* 文件，不碰基础链的段存档、
-    finals 与 merges；段号是 1-based 全局槽位（含序章/插入视频段，与前端
-    段落卡片链位一致）。项目/段号非法抛 ValueError。
+    新方案高清分段与基础段同名合并存储（seg_NNN.mp4 即二采结果），故重置
+    连同 seg mp4/缩略图/尾帧锚一起删（下次运行按记录缺失自愈重建：二采开=
+    重渲染高清，二采关=回放段重编码基础分辨率）。不碰基础链的段 latent 存档
+    （seg_NNN.pt）、finals 与 merges；段号是 1-based 全局槽位（含序章/插入
+    视频段，与前端段落卡片链位一致）。项目/段号非法抛 ValueError。
     """
     name = safe_name(name)
     if not name:
@@ -208,7 +210,7 @@ def upscale_reset(name, seg):
     manifest["upscale"] = up
     manifest["updated_at"] = time.time()
     checkpoint.save_manifest(root, manifest)
-    for f in checkpoint.upseg_paths(root, g).values():
+    for f in (*checkpoint.upscale_files(g).values(), *checkpoint.upscale_legacy_files(g)):
         try:
             os.remove(os.path.join(root, f))
         except OSError:

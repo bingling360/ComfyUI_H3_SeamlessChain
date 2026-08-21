@@ -365,7 +365,7 @@ function defaultDs() {
 }
 
 function defaultUpscale() {
-    /* 潜空间放大二采：独立后处理通道（主链完成后清扫），参数不进基础链指纹 */
+    /* 潜空间放大二采：主循环内渲染通道（每段采样定稿后、段落盘前），参数不进基础链指纹 */
     return { on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.45, steps: 15, cfg: 1.0, precision: "fp32", include: [] };
 }
 
@@ -692,7 +692,7 @@ function removeLastFrame(node) {
     setLastFrame(node, "");
 }
 
-/* ---- 潜空间放大二采：状态读写（ds.upscale，主链完成后由后端清扫执行） ---- */
+/* ---- 潜空间放大二采：状态读写（ds.upscale，主循环内逐段渲染：采样定稿后、段落盘前） ---- */
 
 const UP_MODES = ["关闭", "跟随生成", "手动选择"];
 const UP_PRECISIONS = ["fp32", "fp16", "bf16"];
@@ -2413,7 +2413,7 @@ function buildCards(data) {
         /* 已有二采产物：一键清记录（下次二采运行重做该段；基础链不受影响） */
         if (upRec?.done && node && state?.dir) {
             const rst = el("button", "h3d-btn", "↺ 重置二采");
-            rst.title = "清掉本段二采记录与 upseg_* 高清产物（下次二采运行时重做该段；基础链与成片不受影响）";
+            rst.title = "清掉本段二采记录与高清产物（段视频/缩略图一并删，下次运行按记录缺失自愈重建；基础链 latent 与成片记录不受影响）";
             rst.onclick = () => doUpscaleReset(rst, state.dir, idx + 1);
             actions.append(rst);
         }
@@ -2750,6 +2750,7 @@ function upscaleSig(data) {
         (data.upscaleModels || []).join(","),
         data.mf?.upscale?.hash ?? "",
         (data.mf?.upscale?.segs || []).filter((r) => r && r.done).length,
+        (data.mf?.upscale?.finals || []).length,
         data.state?.done ?? 0,
         `${getWidgetValue(data.node, W_WIDTH) ?? ""}x${getWidgetValue(data.node, W_HEIGHT) ?? ""}`,
     ]);
@@ -2786,7 +2787,7 @@ function renderUpscaleZone(sec, data) {
     const done = mf?.done ?? state?.done ?? 0;
     const upRecs = mf?.upscale?.segs || [];
     const upDone = upRecs.filter((r) => r && r.done).length;
-    const upFinals = (mf?.finals || []).filter((f) => String(f).startsWith("final_up_"));
+    const upFinals = mf?.upscale?.finals || [];
 
     const det = el("details", "h3d-adv h3d-updet" + (on ? " on" : ""));
     det.open = on;
@@ -2805,7 +2806,7 @@ function renderUpscaleZone(sec, data) {
     modeField.append(el("label", "", "模式"));
     const modeSel = document.createElement("select");
     modeSel.className = "h3d-select";
-    modeSel.title = "跟随生成：主链每段落盘后自动二采（逐段审片时即「生成一段二采一段」）；"
+    modeSel.title = "跟随生成：每段采样定稿后立即二采，段视频直接存高清结果（逐段审片时即「生成一段二采一段」）；"
         + "手动选择：在段落卡片勾选任意已完成段（含插入视频/序章）后运行；关闭：不执行二采。"
         + "二采参数不进基础链指纹——改参数只重做二采，不动已生成段";
     for (const m of UP_MODES) {
@@ -2910,9 +2911,9 @@ function renderUpscaleZone(sec, data) {
     /* 分区脚注：模式说明 + 当前进度 */
     const footBits = [];
     if (!on) {
-        footBits.push("关闭中：主链照常，不做放大重采样（已产出的 upseg_* 不受影响）");
+        footBits.push("关闭中：主链照常，不做放大重采样（已产出的高清分段/成片不受影响）");
     } else if (up.mode === "跟随生成") {
-        footBits.push("跟随生成：每次运行后对新增/失效段自动二采；逐段审片=生成一段二采一段");
+        footBits.push("跟随生成：每段采样定稿后立即二采（新增/失效段自动重做）；逐段审片=生成一段二采一段");
     } else {
         const inc = up.include || [];
         footBits.push(inc.length
@@ -2921,9 +2922,9 @@ function renderUpscaleZone(sec, data) {
     }
     if (done > 0) {
         footBits.push(`已二采 ${upDone}/${done} 段`
-            + (upFinals.length ? ` · 高清成片×${upFinals.length}（final_up_*）` : ""));
+            + (upFinals.length ? ` · 高清成片×${upFinals.length}` : ""));
     }
-    footBits.push("产物在项目文件夹：upseg_*.mp4 高清分段 / final_up_*.mp4 高清成片；音轨沿用原声");
+    footBits.push("产物在项目文件夹：seg_*.mp4 即高清分段（同名覆盖基础段）/ final_*.mp4 高清成片；音轨沿用原声");
     if (on && !up.model && models.length) footBits.push("⚠ 未选择放大模型：运行时会报错提示");
     det.insertAdjacentHTML("beforeend",
         `<div class="h3d-foot">${footBits.map(escapeHtml).join("<br>")}</div>`);

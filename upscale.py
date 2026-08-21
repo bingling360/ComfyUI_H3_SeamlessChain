@@ -1,4 +1,4 @@
-"""潜空间放大二次采样（二采）独立后端。
+"""潜空间放大二次采样（二采）——主循环内渲染通道。
 
 上游两个仓库的整合：
 - 放大网络：LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler——H3 24 通道 latent
@@ -9,20 +9,21 @@
   用官方 common_ksampler 以 denoise<1 低强度重去噪补回高频细节；条件里的
   keyframe（生成期桥锚）同步放大到目标尺寸，避免按原尺寸重编码。
 
-与主链的关系：完全独立的后处理通道。主循环（生成/桥接/断点/重跑）零改动；
-本模块在主循环结束后清扫：读基础段 latent → 神经放大 → 低强度重采样 →
-解码裁剪（复刻主循环 skip_f/trims/end_t 口径）→ 接缝平滑 → 落盘 upseg_*。
-节点主输出仍是基础链结果；高清产物在项目文件夹（避免高清全帧驻留内存）。
-音频不重采样：成片音轨=原轨（零音频回归，拼接不动音频的项目约束）。
+与主链的关系：每段采样完成后（重摇定稿、latent 存档之后、分段 mp4 落盘之前）
+立即「神经放大 → 低强度重采样 → 解码」——分段视频 seg_NNN.mp4 与成片直接
+保存二采后的高清结果，不再产出 upseg_* 双份副本（旧版独立后处理通道已废弃）。
+段内机制（重摇/门控/智能切镜/接缝精修/指标）仍跑在基础分辨率帧上，语义零漂移；
+二采只接管「落盘的帧」。音频不重采样：分段与成片音轨=原轨（零音频回归）。
 
 两种触发模式（导演台面板）：
-- 跟随生成：每次运行后自动对新增/失效段二采（逐段审片时即"生成一段二采一段"）
-- 手动选择：勾选任意已完成段（含插入视频段/序章）一键二采
+- 跟随生成：每次运行对待做段（新增/失效）二采，逐段审片时即"生成一段二采一段"
+- 手动选择：勾选任意段（含插入视频段/序章）随下次运行二采
 
 重做规则（manifest.upscale 记录，二采参数不进 ckpt_params 指纹）：
-- 二采参数变（hash 变）→ include 范围内段全部重做二采，基础链不动
-- 基础链从段 k 重做（truncate）→ upseg ≥ k 的记录与文件自动清除，链完成后补做
-- 某段基础 prompt/seed 变（base_hash 变）→ 仅该段二采记录失效
+- 二采参数变（hash 变）→ include 范围内段全部重渲染高清，基础 latent 不动
+- 基础链从段 k 重做（truncate）→ ≥ k 的记录与锚文件自动清除，重跑时补渲染
+- 某段基础 prompt/seed 变（base_hash 变）→ 仅该段高清记录失效
+- 全链记录齐且尺寸一致 → 成片改为流式拼接高清分段（单份产物）
 """
 
 import os
@@ -32,7 +33,6 @@ import torch
 
 from . import checkpoint
 from . import grid
-from . import qc
 
 MODES = ("跟随生成", "手动选择")
 PRECISIONS = ("fp32", "fp16", "bf16")
@@ -112,34 +112,41 @@ def _records(manifest):
 
 
 def _record_valid(segs, root, g, ph, bh):
-    """记录有效 = hash/base_hash 匹配且关键产物文件在（mp4 成片 + last 接缝锚）。"""
+    """记录有效 = hash/base_hash 匹配且产物文件齐全（高清分段 mp4 + 缩略图 + 尾帧锚）。"""
     rec = segs[g] if g < len(segs) else None
     if not (isinstance(rec, dict) and rec.get("done")):
         return False
     if rec.get("hash") != ph or rec.get("base_hash") != bh:
         return False
-    files = rec.get("files") or {}
-    for key in ("mp4", "last"):
+    files = rec.get("files") or checkpoint.upscale_files(g)
+    for key in ("mp4", "thumb", "last"):
         f = files.get(key)
         if not f or not os.path.isfile(os.path.join(root, f)):
             return False
     return True
 
 
-def pending_slots(manifest, root, cfg):
-    """待二采全局槽位列表（链序）：已完成段中 include 范围内、记录失效或缺失的。"""
-    done = int(manifest.get("done") or 0)
-    total = int(manifest.get("total") or 0)
+def record_stale(manifest, root, cfg, g, bh=None):
+    """段 g 的高清渲染是否待做（供主循环逐段判定；manifest 可为 None=全待做）。"""
+    if cfg is None:
+        return False
+    if not in_scope(cfg, g):
+        return False
+    if manifest is None:
+        return True
     ph = params_hash(cfg)
-    segs = _records(manifest)
-    out = []
-    for g in range(min(done, total)):
-        if cfg["include"] is not None and g not in cfg["include"]:
-            continue
-        if _record_valid(segs, root, g, ph, base_hash(manifest, g)):
-            continue
-        out.append(g)
-    return out
+    if bh is None:
+        bh = base_hash(manifest, g)
+    return not _record_valid(_records(manifest), root, g, ph, bh)
+
+
+def in_scope(cfg, g):
+    """段 g 是否在二采范围内（跟随生成=全部段；手动选择=勾选段）。"""
+    if cfg is None:
+        return False
+    if cfg["include"] is None:
+        return True
+    return g in cfg["include"]
 
 
 # ---- latent 放大数学（纯 torch，可单测） ----
@@ -194,25 +201,26 @@ def resize_latent_bilinear(z, h, w):
 
 # ---- 运行期（需 ComfyUI 环境，单测不触达） ----
 
-def _slot_layout(exec_items, off, seg_unlink, seg_lengths, trims, g, ctx):
-    """全局槽位 g -> (kind, idx, item_i, skip_f, vis_len, end_t)。
+def load_net(cfg):
+    """按配置加载放大网络（upscale_net 按 名称+架构+设备+精度 缓存）。
 
-    kind: "prologue"（序章）/"insert"（插入视频）/"prompt"；vis_len/end_t 仅
-    prompt 段有意义（复刻主循环 _decode_crop 口径：trims 来自 manifest，
-    end_t 按 trims==0 决定向上/向下对齐 token 网格）。
+    未选模型 / 权重文件缺失 / 架构不匹配 -> ValueError（带可操作的指引），
+    调用方（nodes.py）在主循环前调用一次：当场报错降级为基础分辨率整链运行，
+    不让每段反复撞同一个错。
     """
-    if off and g == 0:
-        return ("prologue", None, None, 0, None, None)
-    item_i = g - off
-    item = exec_items[item_i]
-    if item[0] != "prompt":
-        return ("insert", item[1], item_i, 0, None, None)
-    i = item[1]
-    skip_f = 0 if (item_i == 0 and off == 0) or seg_unlink[i] else ctx
-    trim = trims[g] if g < len(trims) else 0
-    vis0 = seg_lengths[i] - trim
-    end_t = grid.frames_to_latent_t(skip_f + vis0, up=trim == 0)
-    return ("prompt", i, item_i, skip_f, grid.latent_t_to_frames(end_t) - skip_f, end_t)
+    import comfy.model_management
+
+    from . import upscale_net
+
+    if not cfg["model"]:
+        raise ValueError("未选择放大模型——请从 HuggingFace "
+                         "LBH-123-AI/Minimax_h3_latent_Upscaler 下载权重放入 "
+                         "models/latent_upscale_models/，刷新导演台后在二采面板选择")
+    dev = comfy.model_management.intermediate_device()
+    try:
+        return upscale_net.load_model(cfg["model"], dev, cfg["precision"], cfg["arch"])
+    except FileNotFoundError as e:
+        raise ValueError(f"放大模型加载失败：{e}") from None
 
 
 def _build_seg_refs(i, seg_label_orders, pool_tensors, refs):
@@ -238,6 +246,167 @@ def _build_seg_refs(i, seg_label_orders, pool_tensors, refs):
     for j, v in enumerate(refs["ref_audios"].values()):
         seg_refs["ref_audios"][f"ref_audio_{n['audio'] + j}"] = v
     return seg_refs
+
+
+def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
+                  video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
+                  pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
+                  采样器, 调度器):
+    """基础段 AV latent -> 高清视频 latent（放大 + 低强度重采样）。
+
+    kind: "prompt"（提示词段，cond 带本段提示词/参考素材/首帧）
+          / "insert"|"prologue"（外部素材段，空提示词轻精修）。
+    guide: 本段生成时用的上段尾帧桥（None=首段/断链/插入段）——视频 latent
+    神经放大后注入重采样 cond（CondSync：锚住段首与上段高清尾的连续性）。
+    tail_kf_latent: 尾帧身份锚定的基础 latent（与主循环同语义，同步放大注入）。
+    返回 (up_out_v 高清视频 latent, tw, th, 二采种子, 是否桥锚)。
+    """
+    import comfy.nested_tensor
+    import nodes as comfy_nodes
+    from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo
+
+    from . import nodes as plugin_nodes
+
+    dev = next(net.parameters()).device
+    up_v = upscale_video(video_t, net, cfg["scale"], cfg["arch"])
+    tw, th = int(up_v.shape[4]) * 16, int(up_v.shape[3]) * 16
+    length = grid.latent_t_to_frames(video_t.shape[2])
+
+    # cond 构造：官方节点按目标分辨率（refs/首帧由官方节点重编码到目标尺寸）
+    if kind == "prompt":
+        has_refs = any(pool_tensors.values()) or any(refs.values())
+        if has_refs:
+            out = MiniMaxH3ReferenceToVideo.execute(
+                clip=clip, vae=video_vae, audio_vae=audio_vae,
+                prompt=seg_prompts[idx], width=tw, height=th, length=length,
+                ref_image_size="match",
+                **_build_seg_refs(idx, seg_label_orders, pool_tensors, refs))
+        else:
+            out = MiniMaxH3ImageToVideo.execute(
+                clip=clip, vae=video_vae, prompt=seg_prompts[idx],
+                width=tw, height=th, length=length,
+                first_frame=first_frame if idx == 0 else None)
+    else:
+        out = MiniMaxH3ImageToVideo.execute(
+            clip=clip, vae=video_vae, prompt="", width=tw, height=th, length=length)
+    cond, latent = out[0], out[1]
+
+    # 桥锚 CondSync：上段尾帧桥的 video latent 同步神经放大后注入 keyframe——
+    # 只依赖上段基础 latent + scale，与处理顺序/模式无关（单段可独立重做）；
+    # 尾帧身份锚定同式放大注入（首尾双锚隧道与主循环同构）
+    bridged = False
+    if kind == "prompt" and (guide is not None or tail_kf_latent is not None):
+        up_guide = None
+        if guide is not None:
+            up_guide = dict(guide)
+            up_guide["latent"] = upscale_video(guide["latent"].to(dev, torch.float32),
+                                               net, cfg["scale"], cfg["arch"])
+            bridged = True
+        up_tail = None
+        if tail_kf_latent is not None:
+            up_tail = upscale_video(tail_kf_latent.to(dev, torch.float32),
+                                    net, cfg["scale"], cfg["arch"])
+        cond = plugin_nodes.H3SeamlessChainSampler._apply_guide(
+            cond, up_guide, length, tail_kf_latent=up_tail)
+
+    # 低强度重采样：初始 latent = 放大后的视频 latent + 原音频 latent；
+    # 采样输出的音频丢弃，分段/成片音轨 = 原轨（零音频回归）
+    seed = (int(cur_seed) + 1) % 0xffffffffffffffff if cur_seed is not None else 1
+    latent["samples"] = comfy.nested_tensor.NestedTensor(
+        (up_v.to(dev, torch.float32), audio_t.to(dev, torch.float32)))
+    restore_rows = plugin_nodes.cond_audio_rows_guard(模型.model.diffusion_model)
+    try:
+        sampled = comfy_nodes.common_ksampler(
+            模型, seed, cfg["steps"], cfg["cfg"], 采样器, 调度器,
+            cond, negative, latent, denoise=cfg["denoise"])[0]
+    finally:
+        restore_rows()
+    up_out_v, _discarded_audio = sampled["samples"].unbind()
+    return up_out_v, tw, th, seed, bridged
+
+
+def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
+                   root, g, video_t, audio_t, kind, idx,
+                   seg_prompts, seg_label_orders, pool_tensors, refs,
+                   first_frame, guide, tail_kf_latent, cur_seed,
+                   skip_f, vis_len, blend_span, prev_hi_tail,
+                   wav, sample_rate, bh, report, 采样器, 调度器):
+    """基础段 AV latent -> 高清分段直接落盘（放大→重采样→解码→裁剪→接缝平滑）。
+
+    主循环逐段调用（采样定稿/回放载入之后、基础段落盘之前）：分段视频与
+    缩略图沿用基础段同名（单份产物——seg_NNN.mp4 即高清结果），另存尾帧锚
+    uplast_NNN.png（下一段高清接缝平滑用）并原子写 manifest.upscale 记录。
+    裁剪口径与主循环 _decode_crop 完全一致：skip_f/vis_len 由调用方按基础
+    分辨率帧的门控/切镜决策传入（机制零漂移，二采只接管落盘的帧）；
+    音频沿用基础段原轨（零音频回归）。blend_span>0 且锚帧尺寸匹配时对段首
+    做 smoothstep 平滑（高清路径无跨缝精修，靠桥锚 keyframe+平滑兜连续性）。
+    返回 (高清尾帧 CPU tensor, 最新 upscale 存档状态)；异常向上抛，由调用方
+    降级为基础分辨率保存（基础链产物不受影响）。
+    """
+    from . import qc
+
+    t0 = time.perf_counter()
+    purge_legacy(root, g)
+    up_v, tw, th, up_seed, bridged = render_latent(
+        模型, clip, video_vae, audio_vae, negative, cfg, net,
+        video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
+        pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
+        采样器, 调度器)
+    frames = video_vae.decode(up_v)
+    del up_v
+    if len(frames.shape) == 5:
+        frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
+    frames = frames[skip_f:skip_f + vis_len]
+    blended = False
+    if blend_span and prev_hi_tail is not None \
+            and tuple(prev_hi_tail.shape[-2:]) == tuple(frames.shape[-2:]):
+        frames = qc.smoothstep_blend_head(frames, prev_hi_tail,
+                                          min(int(blend_span), frames.shape[0]))
+        blended = True
+    if not checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate, fresh=True):
+        raise RuntimeError("高清分段编码失败（save_av_mp4 返回失败，详见 ComfyUI 控制台输出）")
+    checkpoint.save_thumb(root, g, frames[0])
+    files = checkpoint.upscale_files(g)
+    _save_png(os.path.join(root, files["last"]), frames[-1])
+    up_state = write_record(root, g, cfg, up_seed, (tw, th), bh)
+    report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
+                  f"强度 {cfg['denoise']:g} · {cfg['steps']}步 · {time.perf_counter() - t0:.0f}s"
+                  + (" · 桥锚" if bridged else "") + (" · 接缝平滑" if blended else ""))
+    return frames[-1].detach().float().cpu(), up_state
+
+
+def write_record(root, g, cfg, seed, size, bh):
+    """段 g 高清渲染记录原子写盘（重读 manifest 防竞态覆盖并发进度）。
+
+    bh=该段基础身份指纹（调用方用本地 full_hashes/seeds 现算，不依赖磁盘
+    manifest 的写入时机）；返回最新 upscale dict（调用方回填 proj_upscale，
+    后续主循环的 manifest 快照写盘才不会把记录冲掉）。
+    """
+    ph = params_hash(cfg)
+    rec = {"hash": ph, "base_hash": bh, "seed": seed, "done": True,
+           "files": checkpoint.upscale_files(g), "size": list(size)}
+    fresh = checkpoint.load_manifest(root) or {}
+    up_state = dict(fresh["upscale"]) if isinstance(fresh.get("upscale"), dict) else {}
+    segs = list(up_state.get("segs") or [])
+    while len(segs) <= g:
+        segs.append(None)
+    segs[g] = rec
+    up_state["segs"] = segs
+    up_state["hash"] = ph
+    up_state["params"] = {k: cfg[k] for k in _PARAM_KEYS}
+    fresh["upscale"] = up_state
+    fresh["updated_at"] = time.time()
+    checkpoint.save_manifest(root, fresh)
+    return up_state
+
+
+def purge_legacy(root, g):
+    """清掉旧版二采独立产物（upseg_*/upthumb_*，防新旧文件混淆）。"""
+    for f in checkpoint.upscale_legacy_files(g):
+        try:
+            os.remove(os.path.join(root, f))
+        except OSError:
+            pass
 
 
 def _save_png(path, frame, long_edge=None):
@@ -270,230 +439,50 @@ def _load_frame_png(path, device=None):
         return None
 
 
-def run_pass(模型, clip, video_vae, audio_vae, negative, root, cfg,
-             exec_items, off, seg_prompts, seg_lengths, seg_unlink,
-             seg_label_orders, pool_tensors, refs, first_frame, ctx,
-             采样器, 调度器, seam_blend, full_bridge, report):
-    """主循环后的二采清扫：待做段逐个「放大→重采样→解码→落盘」。
+def try_final(root, cfg, report):
+    """全链段高清记录齐且尺寸一致时，流式拼接 seg_*.mp4 -> final_时间戳.mp4。
 
-    只读基础链的段 latent 与 manifest 记录，不改任何基础链产物；二采记录写
-    manifest.upscale（每段完成即原子落盘，崩溃安全，写回前重读防竞态）。
-    全链记录齐且链完成时流式拼接高清成片 final_up_*.mp4。
-    ValueError=可读的配置错误（模型缺失/编码失败），由调用方写进报告。
+    返回 True 表示已产出高清成片（调用方跳过基础分辨率成片编码，单份产物）；
+    链未完成 / 记录不齐 / 尺寸不一致（混排手动二采）/ 编码失败均返回 False
+    （回退主循环内存帧编码基础成片，分段高清不受影响）。
     """
-    import comfy.model_management
-    import comfy.nested_tensor
-    import nodes as comfy_nodes
-    from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo
-
-    from . import nodes as plugin_nodes
-    from . import upscale_net
-
     mf = checkpoint.load_manifest(root) or {}
     total = int(mf.get("total") or 0)
     done = int(mf.get("done") or 0)
-    if total <= 0 or done <= 0:
-        report.append("二采：链尚无已完成段，本次跳过")
-        return
-    trims = [int(t or 0) for t in (mf.get("trims") or [])]
-    seeds = list(mf.get("seeds") or [])
-    segs = _records(mf)
-    while len(segs) < total:
-        segs.append(None)
+    if total <= 0 or done < total:
+        return False
     ph = params_hash(cfg)
-    pending = pending_slots(mf, root, cfg)
-    mode_txt = (f"{cfg['mode']} · {cfg['model'] or '未选模型'}（{cfg['arch']}）"
-                f" · 倍率 {cfg['scale']:g} · 强度 {cfg['denoise']:.2f} · 步数 {cfg['steps']}")
-    if pending:
-        report.append(f"二采（{mode_txt}）：待做 {len(pending)} 段"
-                      f"（段号 {'、'.join(str(g + 1) for g in pending)}）")
-    else:
-        report.append(f"二采（{mode_txt}）：{done}/{total} 段均为最新（hash {ph}），无待做段")
-
-    if not cfg["model"]:
-        raise ValueError("潜空间放大二采：未选择放大模型——请从 HuggingFace "
-                         "LBH-123-AI/Minimax_h3_latent_Upscaler 下载权重放入 "
-                         "models/latent_upscale_models/，刷新面板后选择")
-    dev = comfy.model_management.intermediate_device()
+    segs = _records(mf)
+    if len(segs) < total:
+        report.append("二采成片：分段高清记录不全（手动模式未全选），成片按基础分辨率编码")
+        return False
+    for g in range(total):
+        if not _record_valid(segs, root, g, ph, base_hash(mf, g)):
+            report.append("二采成片：部分段无有效高清记录（手动模式未全选或记录失效），"
+                          "成片按基础分辨率编码")
+            return False
+    size0 = segs[0].get("size") or [None, None]
+    if any((segs[g].get("size") or [None, None]) != size0 for g in range(total)):
+        report.append("二采成片：分段高清尺寸不一致（手动模式混排），成片按基础分辨率编码")
+        return False
+    sources = [os.path.join(root, segs[g]["files"]["mp4"]) for g in range(total)]
+    out_name = f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
     try:
-        net = upscale_net.load_model(cfg["model"], dev, cfg["precision"], cfg["arch"])
-    except FileNotFoundError as e:
-        raise ValueError(f"潜空间放大模型加载失败：{e}") from None
-
-    has_refs = any(pool_tensors.values()) or any(refs.values())
-    pending_set = set(pending)
-    chain_end = max(pending_set) + 1 if pending_set else 0
-    prev_tail_wav = None    # 上段对齐后尾部 0.25s（响度对齐链状态，逐段推进）
-    prev_has_up = False     # 上段是否有二采产物（接缝平滑锚存在性）
-    did_any = False
-    t_all = time.perf_counter()
-
-    for g in range(chain_end):
-        kind, idx, item_i, skip_f, vis_len, _end_t = _slot_layout(
-            exec_items, off, seg_unlink, seg_lengths, trims, g, ctx)
-        base_v, base_a = checkpoint.load_segment(root, g)
-        base_a = base_a.to(audio_vae.device)
-        sampled_fc = grid.latent_t_to_frames(base_v.shape[2])
-
-        # 音频链状态（无论是否待做都推进——后续待做段的响度对齐依赖上段尾音）：
-        # 复刻主循环口径：归一化排除锚定区 + skip/vis 比例裁剪 + 段首响度对齐
-        if kind == "prompt":
-            wav, sr = plugin_nodes._decode_audio(
-                audio_vae, base_a, norm_skip_frac=skip_f / sampled_fc if skip_f else 0.0)
-            wav_total = wav.shape[-1]
-            skip_s = round(wav_total * skip_f / sampled_fc)
-            take_s = round(wav_total * vis_len / sampled_fc)
-            wav = wav[..., skip_s:skip_s + take_s]
-            if g > 0 and prev_tail_wav is not None and not seg_unlink[idx]:
-                wav, _gain_db = qc.loudness_align_head(wav, prev_tail_wav, rate=sr)
-        else:
-            wav, sr = plugin_nodes._decode_audio(audio_vae, base_a)
-        seam_n = max(1, int(sr * 0.25))
-        next_tail_wav = wav.cpu()[..., -seam_n:]
-
-        if g not in pending_set:
-            prev_tail_wav = next_tail_wav
-            prev_has_up = isinstance(segs[g], dict) and bool(segs[g].get("done"))
-            continue
-
-        did_any = True
-        t0 = time.perf_counter()
-        bw, bh = int(base_v.shape[4]) * 16, int(base_v.shape[3]) * 16
-        up_v = upscale_video(base_v.to(dev, torch.float32), net, cfg["scale"], cfg["arch"])
-        tw, th = int(up_v.shape[4]) * 16, int(up_v.shape[3]) * 16
-        if tw * th > 2_621_440:   # 2.5MP（1024² 二进制口径）
-            report.append(f"二采注意：段{g + 1} 目标画布 {tw}×{th} 超过 2.5MP，"
-                          "显存/内存压力大，建议降低倍率或缩小基础画布")
-
-        # cond 构造：官方节点按目标分辨率（refs/首帧由官方节点重编码到目标尺寸）
-        length = sampled_fc
-        if kind == "prompt":
-            if has_refs:
-                out = MiniMaxH3ReferenceToVideo.execute(
-                    clip=clip, vae=video_vae, audio_vae=audio_vae,
-                    prompt=seg_prompts[idx], width=tw, height=th, length=length,
-                    ref_image_size="match",
-                    **_build_seg_refs(idx, seg_label_orders, pool_tensors, refs))
-            else:
-                out = MiniMaxH3ImageToVideo.execute(
-                    clip=clip, vae=video_vae, prompt=seg_prompts[idx],
-                    width=tw, height=th, length=length,
-                    first_frame=first_frame if idx == 0 else None)
-        else:
-            # 插入视频/序章：空提示词轻精修（外部素材段是否二采由面板勾选决定）
-            out = MiniMaxH3ImageToVideo.execute(
-                clip=clip, vae=video_vae, prompt="", width=tw, height=th, length=length)
-        cond, latent = out[0], out[1]
-
-        # 桥锚 CondSync：上段「基础 latent 尾切片」神经放大后注入 keyframe——
-        # 只依赖上段基础 latent + scale，与处理顺序/模式无关（单段可独立重做）
-        bridged = False
-        if skip_f > 0:
-            pv, pa = checkpoint.load_segment(root, g - 1)
-            pv, pa = pv.to(dev), pa.to(audio_vae.device)
-            _, _, _, _, _, end_tokens_prev = _slot_layout(
-                exec_items, off, seg_unlink, seg_lengths, trims, g - 1, ctx)
-            kf = plugin_nodes._tail_keyframe(
-                pv, pa, ctx, plugin_nodes.KEYFRAME_AUDIO_SUPPORTED and full_bridge,
-                end_tokens=end_tokens_prev, full_bridge=full_bridge)
-            kf["latent"] = upscale_video(kf["latent"].to(dev, torch.float32),
-                                         net, cfg["scale"], cfg["arch"])
-            cond = plugin_nodes.H3SeamlessChainSampler._apply_guide(cond, kf, length)
-            bridged = True
-
-        # 低强度重采样：初始 latent = 放大后的视频 latent + 原音频 latent；
-        # 采样输出的音频丢弃，成片音轨 = 原轨（零音频回归）
-        seed = (int(seeds[g]) + 1) % 0xffffffffffffffff if g < len(seeds) else 1
-        latent["samples"] = comfy.nested_tensor.NestedTensor(
-            (up_v.to(dev, torch.float32), base_a.to(dev, torch.float32)))
-        restore_rows = plugin_nodes.cond_audio_rows_guard(模型.model.diffusion_model)
-        try:
-            sampled = comfy_nodes.common_ksampler(
-                模型, seed, cfg["steps"], cfg["cfg"], 采样器, 调度器,
-                cond, negative, latent, denoise=cfg["denoise"])[0]
-        finally:
-            restore_rows()
-        up_out_v, _discarded_audio = sampled["samples"].unbind()
-
-        # 解码 + 复刻主循环裁剪口径（skip_f 裁头；插入/序章全量）
-        frames = video_vae.decode(up_out_v.to(video_vae.device))
-        if len(frames.shape) == 5:
-            frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
-        if kind == "prompt":
-            frames = frames[skip_f:skip_f + vis_len]
-
-        # 接缝平滑：上段有二采产物时，锚定上段高清尾帧 + smoothstep 窗吸收段首偏差
-        blended = False
-        if kind == "prompt" and skip_f > 0 and prev_has_up:
-            anchor = _load_frame_png(
-                os.path.join(root, checkpoint.upseg_paths(root, g - 1)["last"]),
-                frames.device)
-            if anchor is not None:
-                span = min(max(1, int(seam_blend)), frames.shape[0])
-                frames = qc.smoothstep_blend_head(frames, anchor, span)
-                blended = True
-
-        # 落盘四件套 + manifest 增量记录（每段完成即写盘，崩溃安全）
-        files = checkpoint.upseg_paths(root, g)
-        checkpoint.save_upsegment(root, g, up_out_v, base_a)
-        try:
-            from . import media
-        except ImportError:
-            import media
-        if not media.save_av_mp4(os.path.join(root, files["mp4"]), frames, wav, sr):
-            raise ValueError(f"段{g + 1} 二采成片编码失败：{media.last_error}")
-        _save_png(os.path.join(root, files["thumb"]), frames[0], long_edge=256)
-        _save_png(os.path.join(root, files["last"]), frames[-1])
-        record = {"hash": ph, "base_hash": base_hash(mf, g), "seed": seed,
-                  "done": True, "files": files, "size": [tw, th]}
-        segs[g] = record
+        from . import media
+    except ImportError:
+        import media
+    if media.concat_av_mp4(sources, os.path.join(root, out_name),
+                           width=size0[0], height=size0[1]):
         fresh = checkpoint.load_manifest(root) or dict(mf)
-        up_state = dict(fresh["upscale"]) if isinstance(fresh.get("upscale"), dict) else {}
-        segs_f = list(up_state.get("segs") or [])
-        while len(segs_f) <= g:
-            segs_f.append(None)
-        segs_f[g] = record
-        up_state["segs"] = segs_f
-        up_state["hash"] = ph
-        up_state["params"] = {k: cfg[k] for k in _PARAM_KEYS}
+        fresh.setdefault("finals", []).append(out_name)
+        up_state = dict(fresh.get("upscale") or {})
+        up_state.setdefault("finals", []).append(out_name)
         fresh["upscale"] = up_state
         fresh["updated_at"] = time.time()
         checkpoint.save_manifest(root, fresh)
-        mf = fresh
-        report.append(f"段{g + 1} 二采：{bw}×{bh}→{tw}×{th} · 强度 {cfg['denoise']:.2f}"
-                      f" · {time.perf_counter() - t0:.0f}s"
-                      + (" · 桥锚CondSync" if bridged else "")
-                      + (" · 接缝平滑" if blended else ""))
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        prev_tail_wav = next_tail_wav
-        prev_has_up = True
-
-    if did_any:
-        report.append(f"二采：本次完成 {len(pending)} 段 · 用时 {time.perf_counter() - t_all:.0f}s")
-
-    # 全链记录齐且链完成 -> 流式拼接高清成片（磁盘级，复用 merge 的拼接器）
-    finals = list(mf.get("finals") or [])
-    has_up_final = any(str(f).startswith("final_up_") for f in finals)
-    if total > 0 and done >= total and (did_any or not has_up_final) \
-            and all(_record_valid(segs, root, g, ph, base_hash(mf, g)) for g in range(total)):
-        size0 = segs[0].get("size") or [None, None]
-        sources = [os.path.join(root, segs[g]["files"]["mp4"]) for g in range(total)]
-        out_name = f"final_up_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
-        try:
-            from . import media
-        except ImportError:
-            import media
-        if media.concat_av_mp4(sources, os.path.join(root, out_name),
-                               width=size0[0], height=size0[1]):
-            fresh = checkpoint.load_manifest(root) or dict(mf)
-            fresh.setdefault("finals", []).append(out_name)
-            fresh["updated_at"] = time.time()
-            checkpoint.save_manifest(root, fresh)
-            report.append(f"二采成片：{total} 段高清拼接 → {out_name}"
-                          f"（{size0[0]}×{size0[1]}）")
-        else:
-            report.append(f"二采成片编码失败：{media.last_error}（分段 upseg_*.mp4 不受影响）")
+        report.append(f"二采成片：{total} 段高清流式拼接 → {out_name}"
+                      f"（{size0[0]}×{size0[1]}，音轨沿用原声）")
+        return True
+    report.append(f"二采成片编码失败（{media.last_error}）——回退编码基础分辨率成片，"
+                  "分段高清不受影响")
+    return False

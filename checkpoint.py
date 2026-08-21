@@ -86,9 +86,11 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
     """丢弃第 start 段起的进度：截断 manifest 各列表并立即原子落盘，删除被弃段文件。
 
     截断即时落盘：截断后立刻崩溃也不会复活旧进度。段文件含 latent(.pt)、
-    分段视频(.mp4) 与缩略图(.png)，三者同下标一起清，防止重跑后残留旧画面。
-    二采产物（upseg_*）与 manifest.upscale.segs 记录同段号联动清理：
-    基础段重做后其二采必然失效，链完成后的二采清扫会按新 base_hash 补做。
+    分段视频(.mp4) 与缩略图(.png)，三者同下标一起清，防止重跑后残留旧画面
+    （二采渲染与基础段同名——seg_NNN.mp4 被清即高清记录自然失效）。
+    二采记录 manifest.upscale.segs 同段号联动截断，旧版独立产物
+    （upseg_*/upthumb_*/uplast_*）一并清理；基础段重做后其二采必然失效，
+    重跑时按新 base_hash 自动补渲染。
     返回更新后的 manifest。
     """
     out = dict(manifest)
@@ -201,34 +203,22 @@ def load_segment(root: str, idx: int):
     return payload["video"], payload["audio"]
 
 
-def upseg_paths(root: str, idx: int) -> dict:
-    """二采段产物相对文件名（与 seg_* 平行的 upseg_* 族，项目目录内）。
+def upscale_files(idx: int) -> dict:
+    """二采渲染产物文件名（与基础段同名合并存储，不再有 upseg_* 副本族）。
 
-    pt=放大重采样后的 AV latent；mp4=高清分段成片；thumb=首帧缩略图；
-    last=尾帧 PNG（下一段二采的接缝平滑锚）。latent 与像素分开存：
-    二采结果本身也可作为链式二采的续接起点。
+    mp4=seg_NNN.mp4（高清直接覆盖基础分段名——段视频就是二采结果）；
+    thumb=thumb_NNN.png；last=uplast_NNN.png（尾帧锚，下一段高清接缝平滑用）。
     """
     return {
-        "pt": f"upseg_{idx:03d}.pt",
-        "mp4": f"upseg_{idx:03d}.mp4",
-        "thumb": f"upthumb_{idx:03d}.png",
+        "mp4": f"seg_{idx:03d}.mp4",
+        "thumb": f"thumb_{idx:03d}.png",
         "last": f"uplast_{idx:03d}.png",
     }
 
 
-def save_upsegment(root: str, idx: int, video_t, audio_t):
-    """二采段 AV latent 原子落盘（与 save_segment 同法，路径换 upseg_*）。"""
-    import torch
-
-    payload = {
-        "video": video_t.detach().cpu().clone(),
-        "audio": audio_t.detach().cpu().clone(),
-    }
-    buf = tempfile.SpooledTemporaryFile(max_size=64 << 20)
-    torch.save(payload, buf)
-    buf.seek(0)
-    _atomic_write(os.path.join(root, upseg_paths(root, idx)["pt"]), buf.read())
-    buf.close()
+def upscale_legacy_files(idx: int) -> tuple:
+    """旧版二采独立产物文件名（重渲染该段时清理，防新旧文件混淆）。"""
+    return (f"upseg_{idx:03d}.pt", f"upseg_{idx:03d}.mp4", f"upthumb_{idx:03d}.png")
 
 
 def projects_root() -> str:

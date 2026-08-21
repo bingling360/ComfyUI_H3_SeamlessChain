@@ -1,12 +1,13 @@
 """潜空间放大二采单测（真 torch + einops）：python tests/test_upscale.py
 
-覆盖：parse_state 参数归一化、二采参数指纹与重做判定（pending_slots /
+覆盖：parse_state 参数归一化、二采参数指纹与重做判定（record_stale /
 _record_valid / base_hash）、latent 放大数学（target_hw 偶数对齐 /
 resize_latent_bilinear）、2D/3D 放大网络前向形状与权重加载（架构不匹配
-明确报错 / MODEL_CACHE 缓存 / _detect_arch 结构推断）、upseg_* 存档联动
-（save_upsegment 落盘回读 / truncate 清扫 / projects.upscale_reset）。
-run_pass 本体依赖 ComfyUI 运行环境，不在本测范围（异常兜底在 nodes.py
-调用点：任何失败降级为报告，不丢基础链产物）。
+明确报错 / MODEL_CACHE 缓存 / _detect_arch 结构推断）、高清分段同名存档
+联动（upscale_files 命名 / truncate 清扫 / try_final 记录门控 /
+projects.upscale_reset 自愈重建）。
+render_latent / render_segment 本体依赖 ComfyUI 运行环境，不在本测范围
+（异常兜底在 nodes.py 调用点：任何失败降级为报告，不丢基础链产物）。
 注意不能用 test_node_structure 的 stub（其 torch 是假的）——本测需要真
 torch 切片与前向；包 __init__ 在无 ComfyUI 环境下自行降级（静默导入）。
 """
@@ -127,41 +128,50 @@ def test_base_hash():
 
 # ---- 重做判定 ----
 
-def test_pending_slots():
+def test_record_stale():
     with tempfile.TemporaryDirectory() as root:
         cfg = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth"}})
         ph = upscale.params_hash(cfg)
         mf = {"done": 3, "total": 4, "prompt_hashes": ["a", "b", "c"],
               "seeds": [1, 2, 3], "upscale": {"segs": [None, None, None]}}
-        assert upscale.pending_slots(mf, root, cfg) == [0, 1, 2]   # 无记录全待做（done 截断）
+        # 无记录全待做；manifest=None（无存档）同样全待做
+        assert [g for g in range(3) if upscale.record_stale(mf, root, cfg, g)] == [0, 1, 2]
+        assert upscale.record_stale(None, root, cfg, 0) is True
 
-        # 段0 有效记录：hash/base_hash 匹配且 mp4/last 文件在
-        files0 = checkpoint.upseg_paths(root, 0)
-        for k in ("mp4", "last"):
+        # 段0 有效记录：hash/base_hash 匹配且 mp4/thumb/last 文件齐（同名合并存储）
+        files0 = checkpoint.upscale_files(0)
+        for k in ("mp4", "thumb", "last"):
             open(os.path.join(root, files0[k]), "wb").close()
         mf["upscale"]["segs"][0] = {"hash": ph, "base_hash": "a|1", "done": True,
                                     "files": files0}
-        assert upscale.pending_slots(mf, root, cfg) == [1, 2]
+        assert [g for g in range(3) if upscale.record_stale(mf, root, cfg, g)] == [1, 2]
 
-        # 段1 记录 hash 不匹配（二采参数变过）
+        # 段1 记录 hash 不匹配（二采参数变过）；段2 base_hash 不匹配（基础链改词/换种子）
         mf["upscale"]["segs"][1] = {"hash": "deadbeef", "base_hash": "b|2", "done": True,
-                                    "files": checkpoint.upseg_paths(root, 1)}
-        # 段2 base_hash 不匹配（基础链改词/换种子）
+                                    "files": checkpoint.upscale_files(1)}
         mf["upscale"]["segs"][2] = {"hash": ph, "base_hash": "X|9", "done": True,
-                                    "files": checkpoint.upseg_paths(root, 2)}
-        assert upscale.pending_slots(mf, root, cfg) == [1, 2]
+                                    "files": checkpoint.upscale_files(2)}
+        assert [g for g in range(3) if upscale.record_stale(mf, root, cfg, g)] == [1, 2]
 
-        # 段0 mp4 被删 -> 记录失效
+        # 段0 mp4 被删 -> 记录失效（seg_NNN.mp4 即高清产物，文件缺失=重做）
         os.remove(os.path.join(root, files0["mp4"]))
-        assert upscale.pending_slots(mf, root, cfg) == [0, 1, 2]
+        assert [g for g in range(3) if upscale.record_stale(mf, root, cfg, g)] == [0, 1, 2]
 
-        # 手动模式：只算勾选段（含勾选但无记录/失效的）
+        # 手动模式：范围外段不待做（in_scope 短路，与记录无关）
         cfg2 = upscale.parse_state({"upscale": {"mode": "手动选择", "model": "m.pth",
                                                 "include": [1]}})
-        assert upscale.pending_slots(mf, root, cfg2) == [1]
+        assert [g for g in range(3) if upscale.record_stale(mf, root, cfg2, g)] == [1]
         cfg3 = upscale.parse_state({"upscale": {"mode": "手动选择", "model": "m.pth",
                                                 "include": []}})
-        assert upscale.pending_slots(mf, root, cfg3) == []
+        assert [g for g in range(3) if upscale.record_stale(mf, root, cfg3, g)] == []
+
+        # bh 显式传入（主循环按本地 full_hashes/seeds 现算，不依赖磁盘 manifest 写入时机）
+        mf["upscale"]["segs"][1] = {"hash": ph, "base_hash": "b|2", "done": True,
+                                    "files": checkpoint.upscale_files(1)}
+        for k in ("mp4", "thumb", "last"):
+            open(os.path.join(root, checkpoint.upscale_files(1)[k]), "wb").close()
+        assert upscale.record_stale(mf, root, cfg, 1, "b|2") is False   # bh 匹配
+        assert upscale.record_stale(mf, root, cfg, 1, "X|9") is True    # bh 不匹配
 
 
 # ---- latent 放大数学 ----
@@ -294,64 +304,109 @@ def test_detect_arch_from_weights():
 
 # ---- 存档联动 ----
 
-def test_upseg_save_load_and_truncate():
+def test_upscale_files_and_truncate():
     with _env() as (out, _):
         root = os.path.join(out, "h3_projects", "甲")
         os.makedirs(root)
-        v = torch.randn(1, 24, 7, 4, 6)
-        a = torch.randn(1, 32, 2, 1, 40)
-        checkpoint.save_upsegment(root, 1, v, a)
-        paths = checkpoint.upseg_paths(root, 1)
-        assert paths == {"pt": "upseg_001.pt", "mp4": "upseg_001.mp4",
-                         "thumb": "upthumb_001.png", "last": "uplast_001.png"}
-        assert os.path.isfile(os.path.join(root, paths["pt"]))
-        # load_segment 走 seg_*：二采 latent 回读用 torch.load 直接验证
-        with open(os.path.join(root, paths["pt"]), "rb") as f:
-            payload = torch.load(f, map_location="cpu", weights_only=True)
-        assert torch.equal(payload["video"], v) and torch.equal(payload["audio"], a)
-
-        # truncate：二采记录与文件随基础段联动清理（≥start 全清）
+        # 高清分段与基础段同名合并存储：段视频就是二采结果（单份产物）
+        assert checkpoint.upscale_files(1) == {"mp4": "seg_001.mp4",
+                                               "thumb": "thumb_001.png",
+                                               "last": "uplast_001.png"}
+        assert checkpoint.upscale_legacy_files(1) == ("upseg_001.pt", "upseg_001.mp4",
+                                                      "upthumb_001.png")
+        # truncate：二采记录与文件随基础段联动清理（≥start 全清，含旧版独立产物）
         mf = {"schema": "h3seamless/ckpt-v3", "done": 3, "total": 3,
               "prompt_hashes": ["a", "b", "c"], "seeds": [1, 2, 3],
               "upscale": {"segs": [
-                  {"hash": "h", "base_hash": "a|1", "done": True, "files": checkpoint.upseg_paths(root, 0)},
-                  {"hash": "h", "base_hash": "b|2", "done": True, "files": checkpoint.upseg_paths(root, 1)},
-                  {"hash": "h", "base_hash": "c|3", "done": True, "files": checkpoint.upseg_paths(root, 2)}]}}
+                  {"hash": "h", "base_hash": "a|1", "done": True, "files": checkpoint.upscale_files(0)},
+                  {"hash": "h", "base_hash": "b|2", "done": True, "files": checkpoint.upscale_files(1)},
+                  {"hash": "h", "base_hash": "c|3", "done": True, "files": checkpoint.upscale_files(2)}]}}
         checkpoint.save_manifest(root, mf)
         for g in range(3):
-            for f in checkpoint.upseg_paths(root, g).values():
+            for f in checkpoint.upscale_files(g).values():
                 open(os.path.join(root, f), "wb").close()
+        open(os.path.join(root, "upseg_002.pt"), "wb").close()      # 旧版独立产物
+        open(os.path.join(root, "upthumb_002.png"), "wb").close()
         out_mf = checkpoint.truncate(root, mf, 2)
         assert len(out_mf["upscale"]["segs"]) == 2
-        assert os.path.isfile(os.path.join(root, "upseg_000.mp4"))
-        assert os.path.isfile(os.path.join(root, "upseg_001.pt"))
-        assert not os.path.exists(os.path.join(root, "upseg_002.mp4"))
+        assert os.path.isfile(os.path.join(root, "seg_000.mp4"))        # <start 保留
+        assert os.path.isfile(os.path.join(root, "uplast_001.png"))
+        assert not os.path.exists(os.path.join(root, "seg_002.mp4"))    # ≥start 高清产物随基础段清
+        assert not os.path.exists(os.path.join(root, "thumb_002.png"))
         assert not os.path.exists(os.path.join(root, "uplast_002.png"))
+        assert not os.path.exists(os.path.join(root, "upseg_002.pt"))   # 旧版独立产物一并清
+        assert not os.path.exists(os.path.join(root, "upthumb_002.png"))
         # manifest 已即时落盘
         with open(os.path.join(root, "manifest.json"), encoding="utf-8") as f:
             assert len(json.load(f)["upscale"]["segs"]) == 2
+
+
+def test_try_final_gating():
+    """高清成片门控：链未完成静默回退；记录不全/尺寸混排给可见提示（不触 media）。"""
+    with _env() as (out, _):
+        root = os.path.join(out, "h3_projects", "丙")
+        os.makedirs(root)
+        cfg = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth"}})
+        ph = upscale.params_hash(cfg)
+        report = []
+        # 无 manifest / 链未完成：静默 False（审片进行中是正常态，不刷屏）
+        assert upscale.try_final(root, cfg, report) is False
+        assert report == []
+        mf = {"schema": "h3seamless/ckpt-v3", "done": 1, "total": 2,
+              "prompt_hashes": ["a", "b"], "seeds": [1, 2]}
+        checkpoint.save_manifest(root, mf)
+        assert upscale.try_final(root, cfg, report) is False
+        assert report == []
+
+        # 链完成但记录不全（手动模式未全选）-> 提示 + 回退
+        mf["done"] = 2
+        checkpoint.save_manifest(root, mf)
+        report = []
+        assert upscale.try_final(root, cfg, report) is False
+        assert "记录不全" in report[-1]
+
+        # 记录在但产物文件缺失 -> 提示 + 回退
+        mf["upscale"] = {"segs": [
+            {"hash": ph, "base_hash": "a|1", "done": True, "files": checkpoint.upscale_files(0)},
+            {"hash": ph, "base_hash": "b|2", "done": True, "files": checkpoint.upscale_files(1)}]}
+        checkpoint.save_manifest(root, mf)
+        report = []
+        assert upscale.try_final(root, cfg, report) is False
+        assert "无有效高清记录" in report[-1]
+
+        # 记录齐但尺寸不一致（手动模式混排）-> 提示 + 回退
+        for g in range(2):
+            for f in checkpoint.upscale_files(g).values():
+                open(os.path.join(root, f), "wb").close()
+        mf["upscale"]["segs"][0]["size"] = [1376, 768]
+        mf["upscale"]["segs"][1]["size"] = [2752, 1536]
+        checkpoint.save_manifest(root, mf)
+        report = []
+        assert upscale.try_final(root, cfg, report) is False
+        assert "尺寸不一致" in report[-1]
 
 
 def test_upscale_reset():
     with _env() as (out, _):
         root = os.path.join(out, "h3_projects", "乙")
         os.makedirs(root)
-        files1 = checkpoint.upseg_paths(root, 1)
+        files1 = checkpoint.upscale_files(1)
         mf = {"schema": "h3seamless/ckpt-v3", "done": 2, "total": 2,
               "prompt_hashes": ["a", "b"], "seeds": [1, 2],
               "upscale": {"segs": [
-                  {"hash": "h", "base_hash": "a|1", "done": True, "files": checkpoint.upseg_paths(root, 0)},
+                  {"hash": "h", "base_hash": "a|1", "done": True, "files": checkpoint.upscale_files(0)},
                   {"hash": "h", "base_hash": "b|2", "done": True, "files": files1}]}}
         checkpoint.save_manifest(root, mf)
         for f in files1.values():
             open(os.path.join(root, f), "wb").close()
+        open(os.path.join(root, "upseg_001.pt"), "wb").close()   # 旧版独立产物一并清
 
         from ComfyUI_H3_SeamlessChain import projects
         out_mf = projects.upscale_reset("乙", 2)
         assert out_mf["upscale"]["segs"][1] is None          # 记录清掉
         assert out_mf["upscale"]["segs"][0] is not None      # 其余段不动
-        for f in files1.values():
-            assert not os.path.exists(os.path.join(root, f))  # 产物文件删掉
+        for f in (*files1.values(), "upseg_001.pt"):
+            assert not os.path.exists(os.path.join(root, f))  # 高清产物删掉（同名合并+旧版）
         with open(os.path.join(root, "manifest.json"), encoding="utf-8") as fh:
             assert json.load(fh)["upscale"]["segs"][1] is None  # 真落盘
 

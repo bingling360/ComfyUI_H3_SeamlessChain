@@ -284,7 +284,7 @@ def test_upscale_models_endpoint():
 
 
 def test_upscale_reset_endpoint():
-    """二采记录重置端点：清记录+删产物；项目/段号非法 -> 400。"""
+    """二采记录重置端点：清记录+删高清产物（同名合并存储 seg mp4 一并删）；非法 -> 400。"""
     with _server_env() as (out, router):
         handler = router.table["/h3chain/upscale_reset"]
         pdir = _mk_project(out, "甲", {"schema": "h3seamless/ckpt-v3", "done": 2, "total": 2,
@@ -292,14 +292,16 @@ def test_upscale_reset_endpoint():
                                        "upscale": {"segs": [
                                            {"hash": "h", "base_hash": "a|1", "done": True},
                                            {"hash": "h", "base_hash": "b|2", "done": True}]}})
-        up = os.path.join(pdir, "upseg_001.mp4")
-        open(up, "wb").close()
+        made = ["seg_001.mp4", "thumb_001.png", "uplast_001.png", "upseg_001.mp4"]
+        for f in made:
+            open(os.path.join(pdir, f), "wb").close()
 
         resp = asyncio.run(handler(_Req({"dir": "甲", "seg": 2})))
         assert resp["json"]["ok"] is True
         assert resp["json"]["manifest"]["upscale"]["segs"][1] is None    # 记录已清
         assert resp["json"]["manifest"]["upscale"]["segs"][0] is not None
-        assert not os.path.exists(up)                                   # 产物已删
+        for f in made:
+            assert not os.path.exists(os.path.join(pdir, f)), f         # 产物已删（含旧版名）
 
         # 段号/项目名非法 -> 400（ValueError 映射）
         for bad in ({"dir": "甲", "seg": "x"}, {"dir": "甲", "seg": 0},

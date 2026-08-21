@@ -10,7 +10,7 @@
 - POST /delete          删除成片保存节点输出目录中的文件（saver 画廊，限两级路径）
 - POST /merge           按序合并若干段/成片/外部视频 -> merged_*.mp4（流式编码）
 - GET  /upscale_models  列出 latent_upscale_models 目录里的放大权重（二采面板下拉）
-- POST /upscale_reset   清掉某段的二采记录与 upseg_* 产物（下次运行重做该段）
+- POST /upscale_reset   清掉某段的二采记录与高清产物（下次运行重做该段）
 
 均受限于输出目录内、防目录穿越；无新依赖。
 注册有运行期兜底：ensure_registered() 幂等重试，节点执行时会再调一次，

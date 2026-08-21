@@ -766,10 +766,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
             seg_unlink.append(bool(seg.get("unlink")))
 
-        # 潜空间放大二采（独立后处理通道，导演台面板控制）：主循环结束后对
-        # 待做段「神经放大 latent → 低强度重采样 → 解码落盘 upseg_*」；关闭时 None
+        # 潜空间放大二采（导演台面板控制）：每段采样定稿后立即「神经放大 latent →
+        # 低强度重采样 → 解码」，分段视频与成片直接保存二采结果（同名覆盖，不再
+        # 产出 upseg_* 副本）。模型在主循环前预加载：缺失/不匹配当场降级为基础
+        # 分辨率整链运行（报告注明），不让每段反复撞同一个错。关闭时 up_cfg=None
         from . import upscale
         up_cfg = upscale.parse_state(ds)
+        up_net = None
+        _up_err = None
+        if up_cfg:
+            try:
+                up_net = upscale.load_net(up_cfg)
+            except ValueError as e:
+                _up_err = str(e)
+                up_cfg = None
 
         # 插入视频段（导演台状态 inserts）：按链位混排进执行序列——画面+原声进成片，
         # 尾帧 latent 桥接指导下一段生成（序章机制的任意段间推广）。
@@ -883,7 +893,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if _unlink_pos:
             report.append(f"独立镜头：{len(_unlink_pos)} 段与上段断链（无桥接/硬切，段 {'、'.join(_unlink_pos)}）")
         if up_cfg:
-            report.append(f"潜空间放大二采：已开启（{up_cfg['mode']}），主链完成后执行")
+            report.append(f"潜空间放大二采：{up_cfg['mode']} · {up_cfg['arch']} {up_cfg['scale']:g}× · "
+                          f"强度 {up_cfg['denoise']:g} · 步数 {up_cfg['steps']}——每段采样定稿后立即"
+                          "渲染高清，分段视频与成片直接保存二采结果")
+        elif _up_err:
+            report.append(f"潜空间放大二采：面板已开启但本次跳过——{_up_err}")
         if str(宽高比) != "自定义":
             report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（官方换算，1MP=1024×1024，32 倍数对齐）")
         else:
@@ -971,6 +985,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
         autosave = 自动保存 == "分段+成片"
         reroll = max(0, int(重跑起始段))
         use_ckpt = resume or review or autosave   # 审片须落盘续接；自动保存须段落盘 mp4
+        if up_cfg and not use_ckpt:
+            # 二采产物落项目文件夹（manifest 记录 + seg mp4 覆盖），无存档就没有挂载点
+            report.append("潜空间放大二采：需开启自动保存（或审片/自动存档）建立项目存档，本次跳过")
+            up_cfg = None
         if review and not (resume or autosave):
             report.append("审片模式：存档自动启用（每段落盘 latent，跨次运行续接）")
         if autosave and not (resume or review):
@@ -1099,9 +1117,48 @@ class H3SeamlessChainSampler(io.ComfyNode):
         prev_tail_wav = None
         prev_tail_clip = None   # 上段尾 24 帧（接缝指标局部基线用）
         prev_lat = None   # 上段 (video_t, audio_t, kept t0, kept t1, audio a0, audio a1)——接缝精修窗口切片用
+        prev_hi_tail = None   # 上段高清尾帧 CPU [H,W,3]（二采段首接缝平滑锚；本段未二采时为 None）
         sample_rate = None
         dropped_total = 0        # 全链累计丢弃帧（切镜+门控回退+网格对齐），预算门控用
         seam_metrics_rows = []   # 每缝五维 z-score（与 seams 列表对齐；无缝/指标不可用为 None）
+
+        def _up_hi(g, video_t, audio_t, kind, idx, guide_kf, tail_kf, cur_seed,
+                   skip_f, vis_len, blend_span, wav, rate):
+            """二采渲染段 g 并落盘高清产物（序章/插入段/生成段统一入口）。
+
+            返回 (ready, tried)：ready=True 表示高清产物已在盘（本次渲染成功或
+            记录有效沿用——调用方跳过基础分辨率保存，段视频就是二采结果）；
+            ready=False 且 tried=True 表示渲染失败（调用方基础保存强制重编码，
+            覆盖可能写坏的 mp4 自愈）；范围外/关闭时 (False, False) 正常基础保存。
+            proj_upscale / prev_hi_tail 原地更新（后者供下一段高清接缝平滑）。
+            """
+            nonlocal proj_upscale, prev_hi_tail
+            if not (up_cfg and use_ckpt):
+                return False, False
+            if not upscale.in_scope(up_cfg, g):
+                return False, False
+            if g < len(full_hashes) and cur_seed is not None:
+                bh = f"{full_hashes[g]}|{cur_seed}"   # 本段当前身份（回放段与 manifest 记录一致）
+            else:
+                bh = upscale.base_hash(manifest, g) if isinstance(manifest, dict) else ""
+            if not upscale.record_stale(manifest, root, up_cfg, g, bh):
+                files = checkpoint.upscale_files(g)
+                prev_hi_tail = upscale._load_frame_png(os.path.join(root, files["last"]))
+                return True, False
+            try:
+                prev_hi_tail, proj_upscale = upscale.render_segment(
+                    模型, clip, video_vae, audio_vae, negative, up_cfg, up_net,
+                    root, g, video_t, audio_t, kind, idx,
+                    seg_prompts, seg_label_orders, pool_tensors, refs,
+                    首帧图片, guide_kf, tail_kf, cur_seed,
+                    skip_f, vis_len, blend_span, prev_hi_tail,
+                    wav, rate, bh, report, 采样器, 调度器)
+                return True, False
+            except Exception as e:   # 单段失败只降级该段，整链照常
+                report.append(f"段{g + 1} 二采失败：{type(e).__name__}: {e}"
+                              "——本段按基础分辨率保存（基础链产物不受影响）")
+                prev_hi_tail = None
+                return False, True
 
         if use_ckpt:  # 运行起点状态（面板据此定位当前链）
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
@@ -1146,9 +1203,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if len(pframes.shape) == 5:
                 pframes = pframes.reshape(-1, pframes.shape[-3], pframes.shape[-2], pframes.shape[-1])
             pwav, sample_rate = _decode_audio(audio_vae, pa)
-            thumbs.append(checkpoint.save_thumb(root, 0, pframes[0]) if use_ckpt else "")
-            videos.append(checkpoint.save_segment_mp4(root, 0, pframes, pwav, sample_rate,
-                                                      fresh=prologue_fresh) if use_ckpt else "")
+            _hi_ready, _hi_tried = _up_hi(0, pv, pa, "prologue", None, None, None, 0,
+                                          0, pframes.shape[0], 0, pwav, sample_rate)
+            if not _hi_ready:
+                thumbs.append(checkpoint.save_thumb(root, 0, pframes[0]) if use_ckpt else "")
+                videos.append(checkpoint.save_segment_mp4(root, 0, pframes, pwav, sample_rate,
+                                                          fresh=prologue_fresh or _hi_tried) if use_ckpt else "")
+            else:
+                _u_files = checkpoint.upscale_files(0)
+                thumbs.append(_u_files["thumb"])
+                videos.append(_u_files["mp4"])
             seams.append(None)
             bridge_scores.append(None)
             seam_metrics_rows.append(None)
@@ -1280,9 +1344,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if len(pframes.shape) == 5:
                     pframes = pframes.reshape(-1, pframes.shape[-3], pframes.shape[-2], pframes.shape[-1])
                 pwav, sample_rate = _decode_audio(audio_vae, pa)
-                thumbs.append(checkpoint.save_thumb(root, g, pframes[0]) if use_ckpt else "")
-                videos.append(checkpoint.save_segment_mp4(root, g, pframes, pwav, sample_rate,
-                                                          fresh=not ins_replay) if use_ckpt else "")
+                _hi_ready, _hi_tried = _up_hi(g, pv, pa, "insert", None, None, None, 0,
+                                              0, pframes.shape[0], 0, pwav, sample_rate)
+                if not _hi_ready:
+                    thumbs.append(checkpoint.save_thumb(root, g, pframes[0]) if use_ckpt else "")
+                    videos.append(checkpoint.save_segment_mp4(root, g, pframes, pwav, sample_rate,
+                                                              fresh=not ins_replay or _hi_tried) if use_ckpt else "")
+                else:
+                    _u_files = checkpoint.upscale_files(g)
+                    thumbs.append(_u_files["thumb"])
+                    videos.append(_u_files["mp4"])
                 # 插入段与上段硬切（外部素材画面固定，混合/精修会重影）：指标记 None
                 seams.append(None)
                 bridge_scores.append(None)
@@ -1487,6 +1558,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 段首偏差；只替换本段头部缝后侧帧，上段帧/存档/分段 mp4 均不动。
             # 纯后处理不进断点指纹（改此参数不触发重跑，replay 段结果仍一致）。
             # 独立镜头段不做任何接缝处理（硬切转场）
+            # 二采段首平滑跨度：镜像基础链的链接缝处理意图（精修/混合任一开=同跨度
+            # smoothstep；全关=硬切）。跨缝精修帧无法在高清路径复用（重采样后是新解码），
+            # 桥锚 keyframe + 平滑兜连续性（见 upscale.render_segment）
+            hi_blend = seam["blend"] if ((item_i > 0 or off) and prev_tail_frame is not None
+                                         and prev_lat is not None and not seg_unlink[i]
+                                         and (seam["use_refine"] or seam["pixel_blend"])) else 0
             refine_used = False
             seam_skipped = False   # 窗口不足=完全跳过（像素混合本身是糊感来源，不作兜底）
             if (item_i > 0 or off) and prev_tail_frame is not None and prev_lat is not None \
@@ -1589,9 +1666,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         audio_tokens_for_frames(skip_f),
                         audio_tokens_for_frames(skip_f + vis_len))
             if use_ckpt:
-                thumbs.append(checkpoint.save_thumb(root, g, frames[0]))
-                videos.append(checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate,
-                                                          fresh=not replay))
+                # 二采在段视频落盘前接管：成功/记录沿用则段视频即高清结果（同名覆盖），
+                # 失败才回退基础分辨率保存（fresh 强制重编码，覆盖可能写坏的 mp4）
+                hi_ready, hi_tried = _up_hi(g, video_t, audio_t, "prompt", i,
+                                            None if seg_unlink[i] else guide, tail_anchor_latent,
+                                            cur_seed, skip_f, frames.shape[0], hi_blend,
+                                            wav, sample_rate)
+                if not hi_ready:
+                    thumbs.append(checkpoint.save_thumb(root, g, frames[0]))
+                    videos.append(checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate,
+                                                              fresh=not replay or hi_tried))
+                else:
+                    _u_files = checkpoint.upscale_files(g)
+                    thumbs.append(_u_files["thumb"])
+                    videos.append(_u_files["mp4"])
             else:
                 thumbs.append("")
                 videos.append("")
@@ -1667,32 +1755,23 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                    "report": "\n".join(report), "updated_at": time.time()})
 
         images = torch.cat(all_frames, dim=0)
-        # 自动保存：完整链（或审片已确认部分）编码成片，直接落项目文件夹
+        # 自动保存：完整链（或审片已确认部分）编码成片，直接落项目文件夹。
+        # 二采开启且全链高清记录齐时优先流式拼接高清分段（单份产物，成片=二采结果）；
+        # 链未完成/记录不齐/尺寸混排/拼接失败回退内存帧编码基础分辨率成片
         if autosave and use_ckpt:
-            final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate)
-            if final_name:
-                proj_finals.append(os.path.basename(final_name))
-                mf = checkpoint.load_manifest(root) or {}
-                mf["finals"] = list(proj_finals)
-                checkpoint.save_manifest(root, mf)
-                report.append(f"自动保存：分段与成片已就绪 → {root}"
-                              f"（seg_XXX.mp4 逐段，{os.path.basename(final_name)} 完整成片）")
-            else:
-                err_detail = f"（{enc_err}）" if enc_err else ""
-                report.append(f"自动保存：成片编码失败{err_detail}，分段 mp4 不受影响")
-        # 潜空间放大二采：主链收尾后的独立清扫（待做段放大→重采样→upseg_* 落盘）。
-        # 放在自动保存之后：run_pass 增量写 manifest 时重读磁盘，不覆盖基础链 finals；
-        # 主输出 images 保持基础链结果（高清产物在项目文件夹，避免全帧驻留内存）
-        if up_cfg and use_ckpt and root:
-            try:
-                upscale.run_pass(
-                    模型, clip, video_vae, audio_vae, negative, root, up_cfg,
-                    exec_items, off, seg_prompts, seg_lengths, seg_unlink,
-                    seg_label_orders, pool_tensors, refs, 首帧图片, ctx,
-                    采样器, 调度器, int(混合帧数), full_bridge, report)
-            except Exception as e:   # 独立后处理通道：任何失败只降级为报告，不丢基础链产物
-                report.append(f"二采失败：{type(e).__name__}: {e}（基础链产物不受影响）")
-            # 状态指针重写：审片面板报告带上二采进度（此前的 save_state 在清扫前）
+            if not (up_cfg and upscale.try_final(root, up_cfg, report)):
+                final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate)
+                if final_name:
+                    proj_finals.append(os.path.basename(final_name))
+                    mf = checkpoint.load_manifest(root) or {}
+                    mf["finals"] = list(proj_finals)
+                    checkpoint.save_manifest(root, mf)
+                    report.append(f"自动保存：分段与成片已就绪 → {root}"
+                                  f"（seg_XXX.mp4 逐段，{os.path.basename(final_name)} 完整成片）")
+                else:
+                    err_detail = f"（{enc_err}）" if enc_err else ""
+                    report.append(f"自动保存：成片编码失败{err_detail}，分段 mp4 不受影响")
+            # 状态指针重写：带上自动保存/二采成片的报告行（此前的 save_state 在其之前）
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
                                    "review": bool(review), "reroll": reroll,
                                    "report": "\n".join(report), "updated_at": time.time()})
