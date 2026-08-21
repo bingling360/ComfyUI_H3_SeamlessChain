@@ -17,7 +17,7 @@
   成片以它开头，后续生成段从其结尾续拍（24fps 约定，经一次 VAE 重编码）
 
 配套节点：成片历史画廊走 H3ChainSaver（web/h3chain_saver.js）；
-「自动保存=分段+成片」时每段 mp4 与完整成片自动落盘项目文件夹
+「自动保存=分段」时每段 mp4 自动落盘项目文件夹，完整成片由「自动成片」开关控制
 output/h3_projects/<项目名>/（游戏式存档：一项目一文件夹，导演台可读档/删除）。
 
 兼容性：不 monkey-patch；conditioning/latent 构造直接调用官方
@@ -478,9 +478,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Combo.Input("采样器", options=comfy.samplers.KSampler.SAMPLERS, default="res_multistep"),
                 io.Combo.Input("调度器", options=comfy.samplers.KSampler.SCHEDULERS, default="simple"),
                 io.Combo.Input("自动存档", options=["关闭", "自动存档"], default="关闭", advanced=True,
-                               tooltip="自动存档：每段采样后立即落盘 latent 存档（约5MB/段），中断后重跑自动跳过已完成段，结果与一次跑完一致。"
-                                       "注意：「自动保存」默认开（分段+成片）且「审片模式」都会自动启用存档，"
-                                       "本开关仅在两者全关时才有独立作用（纯 latent 续跑、不出 mp4 的调试场景）"),
+                               tooltip="已并入「自动保存」的「分段」档（功能等价）。本开关仅兼容旧工作流："
+                                       "旧「自动存档=自动存档」自动映射为「自动保存=分段」且不成片。"
+                                       "新工作流请直接使用「自动保存」"),
                 io.String.Input("存档目录", default="",
                                 tooltip="项目名：output/h3_projects/<项目名>/ 一个项目一个文件夹（视频/提示词/成片/latent 全在内）。"
                                         "空=按参数指纹自动命名；填了名字即固定项目：中断重跑、改词重跑都续在这个文件夹"),
@@ -501,9 +501,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                tooltip="逐段确认：每次运行只生成一个新的段落即返回，预览「分段图像」或项目文件夹里的"
                                        "分段视频后重新运行继续下一段；不满意可改该段提示词（自动从该段重跑）或设「重跑起始段」重摇。"
                                        "开启后存档自动启用"),
-                io.Combo.Input("自动保存", options=["关闭", "分段+成片"], default="分段+成片",
-                               tooltip="开启后无需任何下游接线：每段生成完自动存 mp4、链（或审片已确认部分）自动拼成"
-                                       "完整成片，全部直接落在项目文件夹 output/h3_projects/<项目名>/ 内，报告注明路径。开启后存档自动启用"),
+                io.Combo.Input("自动保存", options=["关闭", "分段"], default="分段",
+                               tooltip="开启后无需任何下游接线：每段生成完自动落盘 latent 存档与分段 mp4，"
+                                       "全部落在项目文件夹 output/h3_projects/<项目名>/ 内，报告注明路径。"
+                                       "「分段」=落存档+分段视频（等价旧「自动存档」，可续跑）；"
+                                       "是否拼完整成片由「自动成片」开关独立控制。开启后存档自动启用"),
                 io.Int.Input("重跑起始段", default=0, min=0, max=63,
                              tooltip="0=自动（沿用存档进度，改过提示词的段自动重做）；N=从第 N 段起丢弃存档重新生成"
                                      "（有序章时序章为第 1 段），配合改「种子」即可重摇该段及之后。用完记得改回 0"),
@@ -527,6 +529,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "多参=参考图片（ref2va UNET，仅接「参考图片」组）。"
                                        "UI 据此互斥首帧/参考图；后端校验模式与素材一致性，不匹配时报错。"
                                        "实际 UNET 由「模型」输入决定，本控件只做模式声明与素材互斥。"),
+                # 注意：新控件一律加在「生成模式」之后（widgets_values 末尾），
+                # 旧工作流值不足时按默认值补齐，绝不插入中间破坏既有顺序（见 example_workflows）
+                io.Combo.Input("自动成片", options=["关闭", "开启"], default="开启", advanced=True,
+                               tooltip="独立控制完整成片编码：开启=无论一采/二采生成完毕都自动拼成片"
+                                       "（二采开且高清记录齐时流式拼接高清分段，否则编码基础分辨率成片），"
+                                       "直接落在项目文件夹；关闭=只落分段视频、不编码成片（需手动「合并导出」）。"
+                                       "需开启自动保存/自动存档/审片之一建立项目存档才有挂载点"),
                 io.String.Input("导演台状态", multiline=True, default="", socketless=True, advanced=True,
                                tooltip="导演台前端写入的 JSON 状态（模式/提示词/素材文件名/分段处理）。"
                                        "有值时优先于画布接线：提示词从 JSON 读取，图片从 input 目录加载。"
@@ -595,7 +604,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
                 自动存档="关闭", 存档目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
                 锚定加噪=0.0,
-                审片模式="关闭", 自动保存="分段+成片", 重跑起始段=0,
+                审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
                 递减锚定="关闭", 生成模式="文生视频", 导演台状态=""):
         # 运行期路由兜底：导入期注册因时序失败时，首次执行后前端删除/列表即可用
@@ -919,11 +928,21 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 存档指纹只覆盖共享参数（不含提示词、不含种子）：改某段提示词仍指向同一条链，
         # 重跑起点由逐段提示词哈希比对定位；种子控件开着 control_after_generate 每次运行
         # 自动 +1，真正的种子序列由 manifest 权威记录（见下方续跑载入逻辑）
+        # 兼容旧三态「自动保存=分段+成片」：成片已由「自动成片」独立接管，映射为「分段」
+        if 自动保存 == "分段+成片":
+            自动保存 = "分段"
+        # 兼容旧「自动存档」：旧值映射为「自动保存=分段」且不成片（保持旧行为）
+        if 自动存档 in ("自动存档", "自动续跑") and 自动保存 == "关闭":
+            自动保存 = "分段"
+            自动成片 = "关闭"
         resume = 自动存档 in ("自动存档", "自动续跑")  # 自动续跑=旧版工作流里的值，读档兼容
         review = 审片模式 == "逐段确认"
-        autosave = 自动保存 == "分段+成片"
+        autosave = 自动保存 == "分段"   # 落盘存档 + 分段 mp4（旧「分段+成片」已映射为「分段」）
         reroll = max(0, int(重跑起始段))
         use_ckpt = resume or review or autosave   # 审片须落盘续接；自动保存须段落盘 mp4
+        autosave_final = use_ckpt and 自动成片 == "开启"   # 成片由「自动成片」独立控制
+        if 自动成片 == "开启" and not use_ckpt:
+            report.append("自动成片：需开启自动保存/自动存档/审片之一建立项目存档，本次跳过成片")
         if up_cfg and not use_ckpt:
             # 二采产物落项目文件夹（manifest 记录 + seg mp4 覆盖），无存档就没有挂载点
             report.append("潜空间放大二采：需开启自动保存（或审片/自动存档）建立项目存档，本次跳过")
@@ -1691,10 +1710,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                    "report": "\n".join(report), "updated_at": time.time()})
 
         images = torch.cat(all_frames, dim=0)
-        # 自动保存：完整链（或审片已确认部分）编码成片，直接落项目文件夹。
+        # 自动成片：完整链（或审片已确认部分）编码成片，直接落项目文件夹。
         # 二采开启且全链高清记录齐时优先流式拼接高清分段（单份产物，成片=二采结果）；
-        # 链未完成/记录不齐/尺寸混排/拼接失败回退内存帧编码基础分辨率成片
-        if autosave and use_ckpt:
+        # 链未完成/记录不齐/尺寸混排/拼接失败回退内存帧编码基础分辨率成片。
+        # 由「自动成片」独立开关控制（与「自动保存」解耦）：关闭则完全不成片
+        if autosave_final:
             if not (up_cfg and upscale.try_final(root, up_cfg, report)):
                 final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate)
                 if final_name:
@@ -1743,8 +1763,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         )
 
     @classmethod
-    def IS_CHANGED(cls, 审片模式="关闭", 自动存档="关闭", 自动保存="分段+成片", **kwargs):
-        if 审片模式 == "逐段确认" or 自动存档 in ("自动存档", "自动续跑") or 自动保存 == "分段+成片":
+    def IS_CHANGED(cls, 审片模式="关闭", 自动存档="关闭", 自动保存="分段", 自动成片="开启", **kwargs):
+        if 审片模式 == "逐段确认" or 自动存档 in ("自动存档", "自动续跑") \
+                or 自动保存 in ("分段", "分段+成片"):   # 旧三态「分段+成片」也强制重跑（读档兼容）
             return float("nan")   # 存档/审片/自动保存激活时输入不变也强制真正执行（重读最新 manifest）
         return ""
 

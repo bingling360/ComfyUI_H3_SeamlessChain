@@ -1968,7 +1968,7 @@ function renderLeftColumn(sec, data) {
     } else if (!projects.length) {
         list.append(el("div", "h3d-empty",
             "暂无项目存档：点下方「＋ 新建项目」立即在 output/h3_projects/ 建好文件夹；"
-            + "开自动存档/审片跑一次也会自动生成项目。"));
+            + "开自动保存/审片跑一次也会自动生成项目。"));
     }
     for (const p of projects) {
         const active = state?.dir && p.dir === state.dir;
@@ -2711,7 +2711,7 @@ function renderAssetsZone(sec, data) {
 const PRIMARY_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数"];
 const ADVANCED_DEFS = [
     "引导帧数", "CFG", "采样器", "调度器",
-    "自动存档", "存档目录", "审片模式", "自动保存", "重跑起始段",
+    "存档目录", "审片模式", "自动保存", "自动成片", "重跑起始段",
     "桥帧门控", "清晰度阈值", "回退上限", "锚定加噪",
     "接缝重摇", "重摇阈值", "重摇上限", "递减锚定",
     W_WIDTH, W_HEIGHT,
@@ -3299,7 +3299,7 @@ function renderHistoryZone(sec, data) {
         }
     } else if (!finals.length) {
         box.append(el("div", "h3d-empty",
-            "还没有成片：开启「自动保存」后成片直接落在项目文件夹；<br>"
+            "还没有成片：开启「自动成片」（高级设置）后成片直接落在项目文件夹；<br>"
             + `接 H3ChainSaver 节点的输出历史会出现在 output/${escapeHtml(prefix)}/`));
     }
     sec.append(box);

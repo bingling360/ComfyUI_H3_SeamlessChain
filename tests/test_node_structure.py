@@ -188,7 +188,7 @@ def test_structure():
     for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽高比", "百万像素", "宽度", "高度",
                 "每段时长", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
                 "自动存档", "存档目录", "桥帧门控", "清晰度阈值", "回退上限", "锚定加噪",
-                "审片模式", "自动保存", "重跑起始段",
+                "审片模式", "自动保存", "自动成片", "重跑起始段",
                 "接缝重摇", "重摇阈值", "重摇上限", "递减锚定",
                 "首帧图片", "尾帧锚定", "起始视频", "起始视频音轨",
                 "提示词组",
@@ -207,9 +207,12 @@ def test_structure():
     assert by_id["引导帧数"].kwargs.get("options") == ["5", "22", "39", "56"]
     assert by_id["种子"].kwargs.get("control_after_generate") is True
     assert by_id["自动存档"].kwargs.get("options") == ["关闭", "自动存档"]
-    assert by_id["自动存档"].kwargs.get("advanced") is True   # 自动保存默认开已覆盖其作用，收进高级参数
-    assert by_id["自动保存"].kwargs.get("options") == ["关闭", "分段+成片"]
-    assert by_id["自动保存"].kwargs.get("default") == "分段+成片"
+    assert by_id["自动存档"].kwargs.get("advanced") is True   # 已并入「自动保存」分段档，仅兼容旧工作流
+    assert by_id["自动保存"].kwargs.get("options") == ["关闭", "分段"]
+    assert by_id["自动保存"].kwargs.get("default") == "分段"
+    assert by_id["自动成片"].kwargs.get("options") == ["关闭", "开启"]
+    assert by_id["自动成片"].kwargs.get("default") == "开启"
+    assert by_id["自动成片"].kwargs.get("advanced") is True
     assert "提示词清单" not in ids                   # 控制台已回退，清单输入随之移除
     assert "接缝混合" not in ids                     # 旧控件已随「接缝处理」一并剔除
     assert "接缝处理" not in ids                     # 潜空间精修后处理已剔除（第一阶段）
@@ -312,6 +315,7 @@ def test_is_changed():
     assert math.isnan(cls.IS_CHANGED(自动存档="自动存档"))         # 存档激活 -> 强制执行
     assert math.isnan(cls.IS_CHANGED(自动存档="自动续跑"))         # 旧工作流遗留值仍激活
     assert math.isnan(cls.IS_CHANGED(审片模式="关闭", 自动存档="关闭"))  # 自动保存默认开 -> 强制执行
+    assert math.isnan(cls.IS_CHANGED(审片模式="关闭", 自动存档="关闭", 自动保存="分段"))  # 分段档也强制重跑
     assert cls.IS_CHANGED(审片模式="关闭", 自动存档="关闭", 自动保存="关闭") == ""  # 全关 -> 可缓存
     assert math.isnan(cls.IS_CHANGED())                           # 无参调用兜底（自动保存默认开）
     print("PASS test_is_changed")
