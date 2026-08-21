@@ -1158,6 +1158,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 report.append(f"段{g + 1} 二采失败：{type(e).__name__}: {e}"
                               "——本段按基础分辨率保存（基础链产物不受影响）")
                 prev_hi_tail = None
+                # 释放二采失败可能残留的显存（放大 latent / 推理缓存），
+                # 给后续基础采样腾空间；放大网络可能已在 CPU（render_latent 内 net.cpu()），
+                # 下段二采开始时 render_latent 会自愈装回 GPU
+                try:
+                    import comfy.model_management
+                    comfy.model_management.soft_empty_cache()
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
                 return False, True
 
         if use_ckpt:  # 运行起点状态（面板据此定位当前链）
