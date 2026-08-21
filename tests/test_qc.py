@@ -10,7 +10,7 @@ try:
         # 合集运行时 test_node_structure 的假 torch stub 可能已在 sys.modules——视为无 torch
         raise ImportError
     from qc import (frame_scores, pick_backtrack, seam_metrics,
-                    smoothstep_blend_head, smoothstep_fade_head, loudness_align_head)
+                    loudness_align_head)
 except ImportError:
     torch = None
 
@@ -74,38 +74,6 @@ def test_seam_metrics():
     assert db_big > 20.0                                 # 前响后静 -> 大正跳变
     _, db_short = seam_metrics(a, a, silent[..., :10], silent[..., :10])
     assert db_short is None                              # 过短 wav -> None
-
-
-def test_smoothstep_blend_head():
-    if torch is None:
-        return print("SKIP test_smoothstep_blend_head (no torch)")
-    frames = torch.zeros(6, 8, 8, 3)
-    frames[5] = 1.0                                        # span=3 窗外的帧
-    anchor = torch.full((8, 8, 3), 0.5)
-    out = smoothstep_blend_head(frames, anchor, 3)
-    assert torch.equal(out[0], anchor)                     # 第 0 帧逐像素硬锁
-    w_mid = 0.5 * 0.5 * (3 - 2 * 0.5)                      # t=0.5 -> w=0.5
-    assert torch.allclose(out[1], torch.full_like(out[1], 0.5 * (1 - w_mid)))
-    assert torch.equal(out[5], frames[5])                  # 窗外帧原样保留
-    assert torch.equal(out[2], frames[2])                  # 窗尾 w=1 -> 纯生成帧
-    out99 = smoothstep_blend_head(frames, anchor, 99)      # span 超帧数 -> 钳制
-    assert out99.shape[0] == 6
-    assert torch.equal(out99[0], anchor) and torch.equal(out99[-1], frames[-1])
-    out1 = smoothstep_blend_head(frames, anchor, 1)        # span=1 -> 仅硬锁
-    assert torch.equal(out1[0], anchor) and torch.equal(out1[1], frames[1])
-    assert float(out1.min()) >= 0.0 and float(out1.max()) <= 1.0
-
-
-def test_smoothstep_fade_head():
-    if torch is None:
-        return print("SKIP test_smoothstep_fade_head (no torch)")
-    # 已弃用（拼接期音频叠加导致双声部重叠）：任何输入都应原样返回、零干预
-    wav = torch.randn(2, 100)
-    anchor = torch.randn(2, 41)
-    out = smoothstep_fade_head(wav, anchor)
-    assert out.shape == wav.shape
-    assert torch.equal(out, wav)
-    assert torch.equal(smoothstep_fade_head(wav, None), wav)
 
 
 def test_loudness_align_head():

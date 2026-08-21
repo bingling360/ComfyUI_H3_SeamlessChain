@@ -60,46 +60,6 @@ def pick_backtrack(score, limit: int, threshold: float):
     return 0, tail
 
 
-def smoothstep_weights(n, device=None, dtype=None):
-    """smoothstep 权重向量 w(t)=t²(3−2t)，端点导数为 0（无可见速度突变）。
-
-    linspace 端点精确落在 0/1，故 w(0)=0、w(n-1)=1。接缝像素混合与
-    精修区尾羽化共用（后者见 refine.py）。
-    """
-    w = torch.linspace(0.0, 1.0, n, device=device, dtype=dtype)
-    return w * w * (3.0 - 2.0 * w)
-
-
-def smoothstep_blend_head(frames, anchor_frame, span):
-    """接缝像素级兜底：锚帧硬锁为新段首帧 + smoothstep 窗吸收前 span 帧偏差。
-
-    与 LtoJ_H3ContinuityOpeningLock（一体化总控台 3.2）同算法：
-    w(t) = t²(3−2t)，两端导数为 0（无可见速度突变）；输出第 0 帧与锚帧
-    逐像素一致。frames: [F,H,W,C] 0-1（任意设备）；anchor_frame: [H,W,C]。
-    """
-    out = frames.clone()
-    anchor = anchor_frame.to(device=out.device, dtype=out.dtype)[None]
-    if anchor.shape[-1] != out.shape[-1]:
-        anchor = anchor[..., : out.shape[-1]]
-    n = min(max(1, int(span)), out.shape[0])
-    if n == 1:
-        out[0:1] = anchor
-        return out.clamp(0.0, 1.0)
-    w = smoothstep_weights(n, device=out.device, dtype=out.dtype).view(n, 1, 1, 1)
-    out[:n] = anchor * (1.0 - w) + out[:n] * w
-    out[0:1] = anchor                              # 浮点路径防御：无条件逐像素硬锁
-    return out.clamp(0.0, 1.0)
-
-
-def smoothstep_fade_head(wav, anchor_wav):
-    """已弃用：接缝两侧音频是不同内容（上段尾音 vs 本段新音频），拼接期叠加
-    会双声部重叠（用户实测"声音重叠"）。音频连贯由生成期桥锚定 + 裁剪对齐负责，
-    与 H3-Motion-Context（坐标改写）/ 一体化总控台（音频不混合）的共识一致。
-    保留函数仅为旧引用兼容，直接原样返回。
-    """
-    return wav
-
-
 def loudness_align_head(wav, prev_wav, rate=44100, max_db=6.0, fade_s=1.0):
     """段首响度对齐：增益匹配上段尾部 RMS（±max_db 钳制），fade_s 内线性渐出回 1。
 
@@ -145,54 +105,3 @@ def seam_metrics(prev_frame, head_frame, prev_wav=None, head_wav=None, rate=4410
             rb = float(pb[..., :n].pow(2).mean().sqrt())
             db = 20.0 * math.log10((ra + 1e-5) / (rb + 1e-5))
     return diff, db
-
-
-def find_cut_point(frames, skip_f, vis_len, search_ratio=0.33, min_keep_ratio=0.5,
-                   max_trim_frames=None):
-    """在段尾 search_ratio 范围内找最佳切镜点（运动低谷 + 高清晰度）。
-
-    运动低谷 = 动作完成/暂停 = 自然切镜点（电影剪辑师在动作间歇处切镜）。
-    评分 = 帧清晰度归一 − 运动量归一 × 0.5，选评分最高帧。
-
-    max_trim_frames: 单段最多丢弃帧数上限——搜索窗口下界被抬高到
-    段尾预算内，任何切点距段尾都不超过该值（None=不限制，旧行为）；
-    上限小于 17 帧时搜索窗口不足，返回 None（不裁剪）。
-    frames: [N,H,W,C] 0-1 float（任意设备）；skip_f/vis_len: 保留区参数。
-    返回 (cut_frame绝对索引, 运动量, 清晰度) 或 None（搜索窗口太短）。
-    """
-    total = int(vis_len)
-    min_keep = int(total * min_keep_ratio)
-    search_start = max(skip_f + min_keep, skip_f + total - int(total * search_ratio))
-    if max_trim_frames is not None:
-        search_start = max(search_start, skip_f + total - max(0, int(max_trim_frames)))
-    search_end = skip_f + total
-
-    if search_end - search_start < 17:
-        return None
-
-    search_frames = frames[search_start:search_end].float()
-
-    # 帧间运动量（像素差异均值）
-    n = search_frames.shape[0]
-    motion = torch.zeros(n, device=search_frames.device)
-    if n > 1:
-        motion[1:] = (search_frames[1:] - search_frames[:-1]).abs().mean(dim=[1, 2, 3])
-
-    # 3帧滑动平均平滑
-    if n > 3:
-        kernel = torch.ones(3, device=motion.device, dtype=motion.dtype) / 3.0
-        motion = F.conv1d(motion[None, None], kernel[None, None], padding=1)[0, 0]
-
-    # 帧清晰度（复用 frame_scores）
-    quality = frame_scores(search_frames)
-
-    # 归一化到 [0, 1]
-    m_lo, m_hi = float(motion.min()), float(motion.max())
-    q_lo, q_hi = float(quality.min()), float(quality.max())
-    motion_norm = (motion - m_lo) / (m_hi - m_lo + 1e-6)
-    quality_norm = (quality - q_lo) / (q_hi - q_lo + 1e-6)
-
-    score = quality_norm - motion_norm * 0.5
-    best_idx = int(score.argmax().item())
-
-    return search_start + best_idx, float(motion[best_idx]), float(quality[best_idx])

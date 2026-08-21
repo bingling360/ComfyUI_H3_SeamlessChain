@@ -187,11 +187,9 @@ def test_structure():
     ids = [inp.id for inp in schema.inputs]
     for key in ["模型", "文本编码器", "视频VAE", "音频VAE", "宽高比", "百万像素", "宽度", "高度",
                 "每段时长", "引导帧数", "种子", "步数", "CFG", "采样器", "调度器",
-                "自动存档", "存档目录", "桥帧门控", "清晰度阈值", "回退上限",
-                "接缝处理", "混合帧数",
+                "自动存档", "存档目录", "桥帧门控", "清晰度阈值", "回退上限", "锚定加噪",
                 "审片模式", "自动保存", "重跑起始段",
-                "精修强度", "精修窗口", "接缝重摇", "重摇阈值", "重摇上限",
-                "智能切镜", "递减锚定",
+                "接缝重摇", "重摇阈值", "重摇上限", "递减锚定",
                 "首帧图片", "尾帧锚定", "起始视频", "起始视频音轨",
                 "提示词组",
                 "参考图片组", "参考视频组", "参考视频音轨组", "参考音频组"]:
@@ -213,40 +211,28 @@ def test_structure():
     assert by_id["自动保存"].kwargs.get("options") == ["关闭", "分段+成片"]
     assert by_id["自动保存"].kwargs.get("default") == "分段+成片"
     assert "提示词清单" not in ids                   # 控制台已回退，清单输入随之移除
-    assert "接缝混合" not in ids                     # 旧控件已被「接缝处理」取代
+    assert "接缝混合" not in ids                     # 旧控件已随「接缝处理」一并剔除
+    assert "接缝处理" not in ids                     # 潜空间精修后处理已剔除（第一阶段）
+    assert "精修强度" not in ids and "精修窗口" not in ids and "混合帧数" not in ids
+    assert "智能切镜" not in ids and "切镜最多丢帧" not in ids
+    assert "全链丢弃预算" not in ids and "自适应精修" not in ids
     assert by_id["桥帧门控"].kwargs.get("options") == ["关闭", "标注", "自动回退"]
-    assert by_id["接缝处理"].kwargs.get("options") == [
-        "标准", "轻量", "强力", "自定义", "潜空间精修", "smoothstep像素混合", "关闭"]
-    assert by_id["接缝处理"].kwargs.get("default") == "标准"
-    assert by_id["混合帧数"].kwargs.get("default") == 6
-    assert by_id["混合帧数"].kwargs.get("min") == 1 and by_id["混合帧数"].kwargs.get("max") == 24
-    # 接缝根治新控件（全部追加在既有控件之后，旧工作流 JSON 兼容）
-    assert by_id["精修强度"].kwargs.get("default") == 0.45
-    assert by_id["精修强度"].kwargs.get("min") == 0.2 and by_id["精修强度"].kwargs.get("max") == 0.7
-    assert by_id["精修窗口"].kwargs.get("options") == ["22", "39", "56"]
-    assert by_id["精修窗口"].kwargs.get("default") == "39"
+    # 保留的核心接缝控件：桥帧门控 / 重摇（排除抽卡坏段）+ 下阶段技术储备（锚定/递减锚定）
+    assert by_id["锚定加噪"].kwargs.get("default") == 0.0
+    assert by_id["锚定加噪"].kwargs.get("min") == 0.0 and by_id["锚定加噪"].kwargs.get("max") == 0.5
     assert by_id["接缝重摇"].kwargs.get("options") == ["关闭", "自动"]
     assert by_id["接缝重摇"].kwargs.get("default") == "自动"
     assert by_id["重摇阈值"].kwargs.get("default") == 0.06
     assert by_id["重摇上限"].kwargs.get("default") == 1
     assert by_id["重摇上限"].kwargs.get("min") == 0 and by_id["重摇上限"].kwargs.get("max") == 3
-    # 智能切镜 + 递减锚定（替代已回退的段内分片）
-    assert by_id["智能切镜"].kwargs.get("options") == ["关闭", "自动"]
-    assert by_id["智能切镜"].kwargs.get("default") == "关闭"
     assert by_id["递减锚定"].kwargs.get("options") == ["关闭", "0.3", "0.5", "0.7"]
     assert by_id["递减锚定"].kwargs.get("default") == "关闭"
     assert "段内分片" not in ids                        # 已回退
-    # 删帧止损 + 自适应精修（评测基线批次：全部追加在控件列表尾部）
-    assert by_id["切镜最多丢帧"].kwargs.get("default") == 17
-    assert by_id["切镜最多丢帧"].kwargs.get("min") == 0 and by_id["切镜最多丢帧"].kwargs.get("max") == 120
-    assert by_id["全链丢弃预算"].kwargs.get("default") == 48
-    assert by_id["自适应精修"].kwargs.get("options") == ["开启", "关闭"]
-    assert by_id["自适应精修"].kwargs.get("default") == "开启"
-    assert ids.index("自适应精修") < ids.index("首帧图片")   # 新控件在图像输入之前（widget 区尾部）
     assert by_id["审片模式"].kwargs.get("options") == ["关闭", "逐段确认"]
     assert by_id["审片模式"].kwargs.get("default") == "关闭"
     assert by_id["重跑起始段"].kwargs.get("default") == 0
     assert by_id["重跑起始段"].kwargs.get("min") == 0
+    assert ids.index("递减锚定") < ids.index("生成模式")  # 接缝区控件在生成模式之前（widget 区尾部）
     outs = [(o.id, o.is_output_list) for o in schema.outputs]
     assert outs == [("图像", False), ("音频", False), ("帧率", False), ("报告", False),
                     ("分段图像", True), ("分段音频", True)]

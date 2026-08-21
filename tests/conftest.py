@@ -9,7 +9,7 @@ stub 依赖收集期副作用——且 test_checkpoint/test_saver/test_routes �
 本 conftest 在收集任何测试模块前安装一次 stub，并在每个测试结束后
 幂等重装（_install_stubs 可重入），使合集与单跑行为一致。
 真 torch 环境下 _install_stubs 自动跳过 torch stub（见 test_node_structure），
-真 torch 测试（metrics/qc/refine/smart_cut/seam_doctor）正常跑真逻辑。
+真 torch 测试（metrics/qc/seam_doctor）正常跑真逻辑。
 """
 import os
 import sys

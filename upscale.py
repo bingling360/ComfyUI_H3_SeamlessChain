@@ -344,21 +344,20 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                    root, g, video_t, audio_t, kind, idx,
                    seg_prompts, seg_label_orders, pool_tensors, refs,
                    first_frame, guide, tail_kf_latent, cur_seed,
-                   skip_f, vis_len, blend_span, prev_hi_tail,
+                   skip_f, vis_len,
                    wav, sample_rate, bh, report, 采样器, 调度器):
-    """基础段 AV latent -> 高清分段直接落盘（放大→重采样→解码→裁剪→接缝平滑）。
+    """基础段 AV latent -> 高清分段直接落盘（放大→重采样→解码→裁剪）。
 
     主循环逐段调用（采样定稿/回放载入之后、基础段落盘之前）：分段视频与
     缩略图沿用基础段同名（单份产物——seg_NNN.mp4 即高清结果），另存尾帧锚
-    uplast_NNN.png（下一段高清接缝平滑用）并原子写 manifest.upscale 记录。
+    uplast_NNN.png 供下游使用，并原子写 manifest.upscale 记录。
     裁剪口径与主循环 _decode_crop 完全一致：skip_f/vis_len 由调用方按基础
     分辨率帧的门控/切镜决策传入（机制零漂移，二采只接管落盘的帧）；
-    音频沿用基础段原轨（零音频回归）。blend_span>0 且锚帧尺寸匹配时对段首
-    做 smoothstep 平滑（高清路径无跨缝精修，靠桥锚 keyframe+平滑兜连续性）。
+    音频沿用基础段原轨（零音频回归）。跨缝连续性由生成期桥锚 keyframe
+    （_apply_guide）兜底，二采路径不再做任何像素级平滑。
     返回 (高清尾帧 CPU tensor, 最新 upscale 存档状态)；异常向上抛，由调用方
     降级为基础分辨率保存（基础链产物不受影响）。
     """
-    from . import qc
     import comfy.model_management
 
     t0 = time.perf_counter()
@@ -380,12 +379,6 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     if len(frames.shape) == 5:
         frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
     frames = frames[skip_f:skip_f + vis_len]
-    blended = False
-    if blend_span and prev_hi_tail is not None \
-            and tuple(prev_hi_tail.shape[-2:]) == tuple(frames.shape[-2:]):
-        frames = qc.smoothstep_blend_head(frames, prev_hi_tail,
-                                          min(int(blend_span), frames.shape[0]))
-        blended = True
     if not checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate, fresh=True):
         raise RuntimeError("高清分段编码失败（save_av_mp4 返回失败，详见 ComfyUI 控制台输出）")
     checkpoint.save_thumb(root, g, frames[0])
@@ -394,7 +387,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh)
     report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
                   f"强度 {cfg['denoise']:g} · {cfg['steps']}步 · {time.perf_counter() - t0:.0f}s"
-                  + (" · 桥锚" if bridged else "") + (" · 接缝平滑" if blended else ""))
+                  + (" · 桥锚" if bridged else ""))
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
     torch.cuda.empty_cache()
     return frames[-1].detach().float().cpu(), up_state

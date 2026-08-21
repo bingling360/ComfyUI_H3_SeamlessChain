@@ -76,6 +76,70 @@ const MODES = [
 const MODE_DEFAULT = "文生视频";
 const MAX_SEG = 64;
 
+/* ---- 实验性功能（镜像后端 experiments.py 的 EXPERIMENT_DEFS）----
+ * 状态存进「导演台状态」JSON 的 ds.experiments（不新增画布控件、不进 paramsSig），
+ * 由后端 ExperimentContext 归一化：on 只记开启 id，params 记每项参数字典。 */
+const EXPERIMENT_DEFS = [
+    { id: "e1_bridge_shard", name: "强化引导桥 + 段内分片", group: "生成结构",
+      desc: "滑窗/重叠条件采样强化段间桥，单段内拆子片抑制中段漂移",
+      params: [
+          { key: "滑窗token", type: "num", def: 6, min: 1, max: 128, step: 1 },
+          { key: "子片帧数", type: "num", def: 0, min: 0, max: 512, step: 17 },
+          { key: "重叠token", type: "num", def: 2, min: 0, max: 16, step: 1 },
+      ] },
+    { id: "e2_memory_anchor", name: "全局记忆锚", group: "长链记忆",
+      desc: "提取首段关键帧沿整链恒定注入，抑制长链逐段累积漂移",
+      params: [
+          { key: "记忆帧数", type: "num", def: 2, min: 1, max: 8, step: 1 },
+          { key: "注入位置", type: "enum", def: "段首", opts: ["段首", "全程"] },
+      ] },
+    { id: "e3_motion_gate", name: "运动感知闭环门控", group: "闭环调控",
+      desc: "把接缝重摇触发信号从『帧差』扩展为帧差+光流/相机 z-score",
+      params: [
+          { key: "运动z阈值", type: "num", def: 2.0, min: 0.5, max: 6.0, step: 0.1 },
+          { key: "触发动作", type: "enum", def: "重摇", opts: ["重摇", "重锚"] },
+      ] },
+    { id: "e4_transition_res", name: "双向过渡重生成", group: "过渡重采样",
+      desc: "对超阈值缝区做 past|transition|future 双锚 + 缝区独占噪声定向重采样",
+      params: [
+          { key: "过渡窗帧数", type: "num", def: 17, min: 5, max: 512, step: 17 },
+          { key: "重生成步数", type: "num", def: 20, min: 1, max: 100, step: 1 },
+          { key: "双锚强度", type: "num", def: 1.0, min: 0.0, max: 2.0, step: 0.1 },
+      ] },
+];
+const EXPERIMENT_MAP = (() => { const m = {}; for (const e of EXPERIMENT_DEFS) m[e.id] = e; return m; })();
+
+function defaultExperiments() {
+    const params = {};
+    for (const e of EXPERIMENT_DEFS) {
+        const pd = {};
+        for (const p of e.params) pd[p.key] = p.def;
+        params[e.id] = pd;
+    }
+    return { on: {}, params };
+}
+
+/* 从导演台状态 raw.experiments 归一化：只认已知 id，参数字典合并前端默认值 */
+function normalizeExperiments(raw) {
+    const out = defaultExperiments();
+    if (raw && typeof raw === "object") {
+        for (const e of EXPERIMENT_DEFS) { if (raw[e.id] === true) out.on[e.id] = true; }
+        const rp = raw.params && typeof raw.params === "object" ? raw.params : {};
+        for (const e of EXPERIMENT_DEFS) {
+            const src = rp[e.id] && typeof rp[e.id] === "object" ? rp[e.id] : {};
+            for (const p of e.params) {
+                if (p.type === "num") {
+                    const n = Number(src[p.key]);
+                    out.params[e.id][p.key] = isFinite(n) ? Math.min(p.max, Math.max(p.min, n)) : p.def;
+                } else if (p.opts && p.opts.includes(src[p.key])) {
+                    out.params[e.id][p.key] = src[p.key];
+                }
+            }
+        }
+    }
+    return out;
+}
+
 let miniBox = null;
 let desk = null;
 let pendingReset = false;
@@ -308,10 +372,10 @@ function remapOldWidgetValues(wv) {
 }
 
 /* 导演台时代（25 值）→ 统一接缝后端（35 值）：尾部错位修正。
- * 25 值布局尾部 […, 重跑起始段, 生成模式, 导演台状态] 直接按位载入 35 控件会把
- * 生成模式/导演台状态错塞到精修强度/精修窗口上；此处把后端新增的 10 个接缝控件
- * 默认值插入「重跑起始段」之后，并把「接缝混合」旧值映射到「接缝处理」旧值档
- * （与后端 backfill 同规则），其余位置不变。 */
+ * 仅用于导入「导演台时代」极老工作流（widgets_values.length === 25）。
+ * 第二阶段剔除后后端已不再有潜空间精修/像素混合/智能切镜，接缝区仅保留
+ * 重摇/锚定/递减；此处仍按 25→35 顺序重排（防止生成模式/导演台状态错位），
+ * 残余的已删控件默认值会被 ComfyUI 按当前控件顺序自然截断，不影响新布局。 */
 const V25_WIDGET_COUNT = 25;   // 24 控件 + 种子 control 占 1 位
 const SEAM_LEGACY_MAP = { "smoothstep": "smoothstep像素混合", "潜空间精修": "潜空间精修", "关闭": "关闭" };
 const V35_SEAM_DEFAULTS = [0.45, "39", "自动", 0.06, 1, "关闭", "关闭", 17, 48, "开启"];
@@ -361,7 +425,7 @@ function fixInvalidArWidget(node) {
 /* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
 
 function defaultDs() {
-    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], upscale: defaultUpscale() };
+    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], upscale: defaultUpscale(), experiments: defaultExperiments() };
 }
 
 function defaultUpscale() {
@@ -459,6 +523,7 @@ function getDs(node) {
             segments,
             inserts,
             upscale,
+            experiments: normalizeExperiments(raw.experiments),
         };
     } catch (e) {
         return defaultDs();
@@ -1651,6 +1716,18 @@ function injectStyles() {
     .h3d-param label{display:block;margin-bottom:4px;color:var(--h3d-muted);font-size:11px}
     .h3d-select,.h3d-seedrow input{width:100%;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:6px 7px;font-size:12px;outline:none;font-family:inherit}
     .h3d-select:focus,.h3d-seedrow input:focus{border-color:#a8d8bd}
+    /* 实验性功能面板 */
+    .h3d-expsec{padding-bottom:14px}
+    .h3d-exp-top{display:flex;gap:8px;align-items:center;padding:10px 12px 4px}
+    .h3d-exp-card{margin:8px 12px 0;border:1px solid #332f27;border-radius:9px;background:#1b1a16;overflow:hidden}
+    .h3d-exp-card.on{border-color:#3f6b52;box-shadow:inset 3px 0 0 var(--h3d-cyan)}
+    .h3d-exp-head{display:flex;gap:8px;align-items:center;padding:9px 10px}
+    .h3d-exp-head input[type=checkbox]{accent-color:#7fc79f;width:15px;height:15px;cursor:pointer}
+    .h3d-exp-head strong{font-size:12px;flex:1;min-width:0}
+    .h3d-exp-desc{display:block;padding:0 10px 9px;color:var(--h3d-muted);font-size:11px;line-height:1.55}
+    .h3d-exp-params{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px;border-top:1px solid #2a261f}
+    .h3d-exp-params .h3d-param{margin:0}
+    .h3d-exp-params .h3d-param label{font-size:10px}
     .h3d-seedrow{display:flex;gap:5px}
     .h3d-seedrow input{flex:1;min-width:0}
     .h3d-seedrow input::-webkit-outer-spin-button,.h3d-seedrow input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
@@ -1761,9 +1838,10 @@ function openDesk() {
         "<strong>段落流水线</strong><small>卡片 = 生成顺序（1–64 段不限，「＋ 添加一段」即可加段；「提示词·1..3」只是画布镜像）；✏ 改词 · 🎲 重摇 · 📎 插视频 · 🎬 分段处理（场景/角色）</small>"));
     const colR = el("aside", "h3d-col right");
     const rParams = el("section", "h3d-rsec h3d-psec");
+    const rExp = el("section", "h3d-rsec h3d-expsec");
     const rUpscale = el("section", "h3d-rsec h3d-upsec");
     const rHist = el("section", "h3d-rsec h3d-hsec");
-    colR.append(rParams, rUpscale, rHist);
+    colR.append(rParams, rExp, rUpscale, rHist);
     stage.append(colL, colC, colR);
 
     /* 页脚 */
@@ -1782,7 +1860,7 @@ function openDesk() {
             project: sub,
             colC,
             lProj, lAssets,
-            rParams, rUpscale, rHist,
+            rParams, rExp, rUpscale, rHist,
             footInfo, run,
         },
         cardsSig: "",
@@ -1848,6 +1926,12 @@ function updateDesk(data) {
     if (!(pgrid && pgrid.contains(document.activeElement)) && z.rParams.dataset.sig !== psig) {
         z.rParams.dataset.sig = psig;
         renderParamsZone(z.rParams, data);
+    }
+    /* 实验性功能面板（ds.experiments 驱动；编辑中不重建防丢焦） */
+    const esig = JSON.stringify(data.ds?.experiments ?? {});
+    if (!z.rExp.contains(document.activeElement) && z.rExp.dataset.sig !== esig) {
+        z.rExp.dataset.sig = esig;
+        renderExperimentsZone(z.rExp, data);
     }
     const usig = upscaleSig(data);
     if (!z.rUpscale.contains(document.activeElement) && z.rUpscale.dataset.sig !== usig) {
@@ -2628,9 +2712,8 @@ const PRIMARY_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数"];
 const ADVANCED_DEFS = [
     "引导帧数", "CFG", "采样器", "调度器",
     "自动存档", "存档目录", "审片模式", "自动保存", "重跑起始段",
-    "桥帧门控", "清晰度阈值", "回退上限", "接缝处理", "混合帧数", "锚定加噪",
-    "精修强度", "精修窗口", "接缝重摇", "重摇阈值", "重摇上限",
-    "智能切镜", "递减锚定", "切镜最多丢帧", "全链丢弃预算", "自适应精修",
+    "桥帧门控", "清晰度阈值", "回退上限", "锚定加噪",
+    "接缝重摇", "重摇阈值", "重摇上限", "递减锚定",
     W_WIDTH, W_HEIGHT,
 ];
 const PARAM_LABELS = { [W_DUR]: "每段时长(秒) · 新段默认" };
@@ -2738,6 +2821,108 @@ function renderParamsZone(sec, data) {
     sec.append(grid);
     sec.append(el("div", "h3d-foot",
         "全部节点参数已收纳于此：改「高级设置」同样随工作流保存；「生成模式」由左侧模式条控制。"));
+}
+
+/* ---- 实验性功能面板（右栏，ds.experiments 驱动；默认全关，可单独/任意组合开启） ---- */
+
+function expActive(node) {
+    return Object.keys((getDs(node)?.experiments || {}).on || {}).length;
+}
+
+/* 落盘实验开关/参数并联动重渲面板（切换实验组合由后端指纹判整链重做） */
+function setExpOn(node, id, on) {
+    const ds = getDs(node);
+    if (on) ds.experiments.on[id] = true;
+    else delete ds.experiments.on[id];
+    setDs(node, ds);
+    scheduleRefresh(0);
+}
+
+function setExpParam(node, id, key, value) {
+    const ds = getDs(node);
+    ds.experiments.params[id][key] = value;
+    setDs(node, ds);
+    scheduleRefresh(0);
+}
+
+function setExpAll(node, on) {
+    const ds = getDs(node);
+    ds.experiments.on = {};
+    if (on) for (const e of EXPERIMENT_DEFS) ds.experiments.on[e.id] = true;
+    setDs(node, ds);
+    scheduleRefresh(0);
+}
+
+function renderExperimentsZone(sec, data) {
+    const { node } = data;
+    sec.replaceChildren();
+    if (!node) {
+        sec.append(el("div", "h3d-empty", "画布上未找到节点，实验性功能面板不可用"));
+        return;
+    }
+    const ds = getDs(node);
+    const on = ds.experiments?.on || {};
+    sec.append(el("div", "h3d-sechead",
+        "<strong>🧪 实验性功能</strong><small>生成期干预 · 默认全关 · 逐项试效果再试组合</small>"));
+    if (node) {
+        const top = el("div", "h3d-exp-top");
+        const active = Object.keys(on).length;
+        const offbtn = el("button", "h3d-btn h3d-btn-warn" + (active ? "" : " disabled"),
+            active ? `✕ 全部关闭（当前${active}项）` : "✓ 全部关闭（已全关）");
+        offbtn.title = "一键关闭所有实验。建议逐项开启实测，再试着组合——不同实验组合会触发对应段重新生成（后端指纹），结论请用同一项目文件夹对比。";
+        offbtn.onclick = () => { if (active) setExpAll(node, false); };
+        top.append(offbtn);
+        if (active) top.append(badge(`开启 ${active} 项`, "cyan"));
+        sec.append(top);
+    }
+    for (const e of EXPERIMENT_DEFS) {
+        const isOn = !!on[e.id];
+        const card = el("div", "h3d-exp-card" + (isOn ? " on" : ""));
+        const head = el("div", "h3d-exp-head");
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = isOn;
+        cb.onchange = () => setExpOn(node, e.id, cb.checked);
+        head.append(cb);
+        head.append(el("strong", "", escapeHtml(e.name)));
+        head.append(badge(e.group, "media"));
+        card.append(head);
+        card.append(el("small", "h3d-exp-desc", escapeHtml(e.desc)));
+        const paramBox = el("div", "h3d-exp-params");
+        for (const p of e.params) {
+            const row = el("div", "h3d-param");
+            row.append(el("label", "", escapeHtml(p.key)));
+            if (p.type === "enum" && p.opts) {
+                const sel = document.createElement("select");
+                sel.className = "h3d-select";
+                for (const v of p.opts) {
+                    const o = document.createElement("option");
+                    o.value = v; o.textContent = v;
+                    if (String(v) === String(ds.experiments.params[e.id][p.key])) o.selected = true;
+                    sel.append(o);
+                }
+                sel.onchange = () => setExpParam(node, e.id, p.key, sel.value);
+                row.append(sel);
+            } else {
+                const inp = document.createElement("input");
+                inp.type = "number";
+                inp.value = ds.experiments.params[e.id][p.key];
+                inp.min = String(p.min); inp.max = String(p.max); inp.step = String(p.step);
+                inp.addEventListener("wheel", (ev) => ev.preventDefault(), { passive: false });
+                inp.onchange = () => {
+                    const n = Number(inp.value);
+                    if (isFinite(n)) setExpParam(node, e.id, p.key, Math.min(p.max, Math.max(p.min, n)));
+                };
+                row.append(inp);
+            }
+            paramBox.append(row);
+        }
+        card.append(paramBox);
+        sec.append(card);
+    }
+    sec.append(el("div", "h3d-foot",
+        "全部默认关闭；切换实验组合会触发对应段重新生成（改存档指纹判定整链重做）。"
+        + "逐项开启试效果，再试组合；结论请用同一项目文件夹对比，避免缓存污染。"));
 }
 
 /* ---- 潜空间放大二采面板（右栏，独立后处理通道：主链完成后的清扫执行） ---- */

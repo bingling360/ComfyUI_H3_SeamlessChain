@@ -87,6 +87,16 @@ def build(tag_a, mani_a, tag_b, mani_b):
             w(f"  {k}: A={va!r}  B={vb!r}")
     else:
         w("  （指纹完全一致）")
+    # 实验性功能状态（manifest.experiments 是描述串，params.experiments 是指纹）
+    exp_a = mani_a.get("experiments", "（未记录）")
+    exp_b = mani_b.get("experiments", "（未记录）")
+    w(f"  实验性功能 A：{exp_a}")
+    w(f"  实验性功能 B：{exp_b}")
+    ma_a = mani_a.get("memory_anchor")
+    ma_b = mani_b.get("memory_anchor")
+    if ma_a or ma_b:
+        w(f"  E2 记忆锚 A：{ma_a or '（无）'}")
+        w(f"  E2 记忆锚 B：{ma_b or '（无）'}")
     seeds_a, seeds_b = mani_a.get("seeds", []), mani_b.get("seeds", [])
     same_seeds = seeds_a and seeds_b and seeds_a[:min(len(seeds_a), len(seeds_b))] == \
         seeds_b[:min(len(seeds_a), len(seeds_b))]
