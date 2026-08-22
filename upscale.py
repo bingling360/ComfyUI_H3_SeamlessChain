@@ -320,15 +320,47 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     torch.cuda.empty_cache()
 
     # 低强度重采样：初始 latent = 放大后的视频 latent + 原音频 latent；
-    # 采样输出的音频丢弃，分段/成片音轨 = 原轨（零音频回归）
+    # 采样输出的音频丢弃，分段/成片音轨 = 原轨（零音频回归）。
+    # OOM 三级降级重试（基础链采样后 CLIP/VAE/UNET 全部驻留 GPU ~28GB，
+    # 2× 分辨率的激活放不下）：
+    #   0 原样尝试 → 1 卸载全部驻留模型（重采样只需 UNET，CLIP/VAE 腾出数 GB）
+    #   → 2 LOW_VRAM 模式（UNET 权重分块换入换出，慢数倍但确保能出结果）
     seed = (int(cur_seed) + 1) % 0xffffffffffffffff if cur_seed is not None else 1
     latent["samples"] = comfy.nested_tensor.NestedTensor(
         (up_v.to(dev, torch.float32), audio_t.to(dev, torch.float32)))
-    restore_rows = plugin_nodes.cond_audio_rows_guard(模型.model.diffusion_model)
-    try:
-        sampled = comfy_nodes.common_ksampler(
+
+    def _is_oom(e):
+        return "out of memory" in str(e).lower()
+
+    def _sample():
+        return comfy_nodes.common_ksampler(
             模型, seed, cfg["steps"], cfg["cfg"], 采样器, 调度器,
             cond, negative, latent, denoise=cfg["denoise"])[0]
+
+    restore_rows = plugin_nodes.cond_audio_rows_guard(模型.model.diffusion_model)
+    vram_level = 0
+    last_oom = None
+    try:
+        for level in (0, 1, 2):
+            if level:
+                comfy.model_management.unload_all_models()
+                torch.cuda.empty_cache()
+            if level == 2:
+                old_vs = comfy.model_management.vram_state
+                comfy.model_management.vram_state = comfy.model_management.VRAMState.LOW_VRAM
+            try:
+                sampled = _sample()
+                vram_level = level
+                break
+            except RuntimeError as e:   # torch.OutOfMemoryError 是其子类
+                if not _is_oom(e):
+                    raise
+                last_oom = e
+            finally:
+                if level == 2:
+                    comfy.model_management.vram_state = old_vs
+        else:
+            raise last_oom
     finally:
         restore_rows()
 
@@ -337,7 +369,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     up_out_v, _discarded_audio = sampled["samples"].unbind()
     del cond, latent, sampled
     torch.cuda.empty_cache()
-    return up_out_v, tw, th, seed, bridged
+    return up_out_v, tw, th, seed, bridged, vram_level
 
 
 def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
@@ -369,7 +401,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     comfy.model_management.soft_empty_cache()
     torch.cuda.empty_cache()
 
-    up_v, tw, th, up_seed, bridged = render_latent(
+    up_v, tw, th, up_seed, bridged, vram_level = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
@@ -394,7 +426,9 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh)
     report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
                   f"强度 {cfg['denoise']:g} · {cfg['steps']}步 · {time.perf_counter() - t0:.0f}s"
-                  + (" · 桥锚" if bridged else "") + (" · 接缝平滑" if blended else ""))
+                  + (" · 桥锚" if bridged else "") + (" · 接缝平滑" if blended else "")
+                  + (" · 低显存模式" if vram_level == 2 else
+                     "（显存吃紧已卸载驻留模型重试）" if vram_level == 1 else ""))
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
     torch.cuda.empty_cache()
     return frames[-1].detach().float().cpu(), up_state
