@@ -1154,7 +1154,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     skip_f, vis_len, blend_span, prev_hi_tail,
                     wav, rate, bh, report, 采样器, 调度器)
                 return True, False
-            except Exception as e:   # 单段失败只降级该段，整链照常
+            except upscale.UpscaleAbortError:
+                raise   # 预检/二采显存致命：报告已 append，终止整链，不降级
+            except Exception as e:   # 单段偶发失败只降级该段，整链照常
                 oom = "out of memory" in str(e).lower()
                 report.append(f"段{g + 1} 二采失败：{type(e).__name__}: {e}"
                               "——本段按基础分辨率保存（基础链产物不受影响）"

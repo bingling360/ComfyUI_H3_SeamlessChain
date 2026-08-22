@@ -248,10 +248,132 @@ def _build_seg_refs(i, seg_label_orders, pool_tensors, refs):
     return seg_refs
 
 
+class UpscaleAbortError(RuntimeError):
+    """二采致命问题（显存不足 / 画布越界 / 放大模型缺失）——发现即在真正占显存前
+    输出报告并终止整链。主循环单独 catch 它并 re-raise（不上报告且不降级），
+    避免产出"混一段高清一段基础"的不一致结果。"""
+
+
+def _diff_model(model):
+    """从 ComfyUI 模型包装器取底层 diffusion model（拿不到就原样返回）。"""
+    dm = getattr(model, "model", None)
+    if dm is not None:
+        return getattr(dm, "diffusion_model", dm)
+    return model
+
+
+def _vram_gb():
+    """当前可回收集显存（GB，comfy 语义；失败回退 torch，再失败返回 0）。"""
+    try:
+        import comfy.model_management as mm
+        return mm.get_free_memory() / (1024 ** 3)
+    except Exception:
+        try:
+            import torch
+            return torch.cuda.mem_get_info()[0] / (1024 ** 3)
+        except Exception:
+            return 0.0
+
+
+_UNET_SIZE_CACHE = {}
+
+
+def _unet_size_gb(model):
+    """UNET 权重字节（GB，按 id 缓存——跟随生成每段预检不用重算）。"""
+    key = id(model)
+    v = _UNET_SIZE_CACHE.get(key)
+    if v is None:
+        try:
+            dm = _diff_model(model)
+            v = sum(p.numel() * max(p.element_size(), 2)
+                    for p in dm.parameters()) / (1024 ** 3)
+        except Exception:
+            v = 0.0
+        _UNET_SIZE_CACHE[key] = v
+    return v
+
+
+_CANVAS_ABORT_MP = 12.0    # 二采画布超此（MP）→ 硬停（VAE 解码 + 显存双重爆点）
+_ACTIVATION_FACTOR = 4.0   # 采样峰值激活 ≈ 初始高清 latent 体积 × 系数（经验折中）
+_SAFE_MARGIN_GB = 1.0      # 显存账目安全余量（避免贴着上沿静默崩）
+
+
+def _calc_scale_cap(h_latent, w_latent):
+    """画布不超 _CANVAS_ABORT_MP 的最大放大倍率（向下取整到 0.5）。"""
+    cur = (w_latent * 16) * (h_latent * 16)
+    if cur <= 0:
+        return 1.0
+    cap = (_CANVAS_ABORT_MP * 1e6 / cur) ** 0.5
+    return max(1.0, int(cap * 2) / 2.0)
+
+
+def preflight(模型, cfg, net, video_t, audio_t, report=None):
+    """二采前置健康预检——在【放大 / 分配高清内存之前】跑，把问题一次暴露：
+
+    - 放大模型就绪；
+    - 二采画布（target_hw ×16）超上限即停并提示可用的最大倍率；
+      >2.5MP 提示 fp16 高频溢出花屏风险（不硬停，不挡正当高清需求）；
+    - 显存账目 = 当前可回收集 对比 高清重采样新增峰值（不含已在显存的 UNET），
+      连最小新增需求都盖不住即停。
+
+    每行 "✓/⚠/✗ …"，任一 ✗ -> 完整报告 append 进 report 并抛 UpscaleAbortError，
+    终止整链。正常返回报告行（供调用方登记，非致命 ⚠ 已含）。
+    """
+    lines = []
+    fail = []
+
+    # 1) 放大模型就绪
+    try:
+        dev = next(net.parameters()).device
+        lines.append(f"✓ 放大模型就绪：{cfg.get('arch', '2D')} @ {dev}")
+    except (StopIteration, AttributeError):
+        lines.append("✗ 放大模型不可用——请先在二采面板选择有效权重")
+        fail.append("放大模型不可用")
+
+    # 2) 二采画布（latent 偶数 -> 像素 ·32）
+    h, w = video_t.shape[-2], video_t.shape[-1]
+    scale = float(cfg.get("scale", 2.0) or 2.0)
+    h2, w2 = target_hw(h, w, scale)
+    tw, th = h2 * 16, w2 * 16
+    mp = tw * th / 1e6
+    lines.append(f"… 画布：基础 {w * 16}×{h * 16} → 二采 {tw}×{th}"
+                 f"（{mp:.1f}MP，×{scale:g}）")
+    if mp > _CANVAS_ABORT_MP:
+        cap = _calc_scale_cap(h, w)
+        lines.append(f"✗ 二采画布 {tw}×{th}（{mp:.1f}MP）超上限 {_CANVAS_ABORT_MP:.0f}MP"
+                     f"——VAE 解码与显存双重爆点；请把放大倍率降到 ≤{cap:g}×")
+        fail.append(f"画布超限 {mp:.1f}MP")
+    elif mp > 2.5:
+        lines.append(f"⚠ 高清画布 {mp:.1f}MP 超 2.5MP 安全解码区，注意 fp16 高频溢出"
+                     f"（出花屏/色块就降倍率或提采样精度）")
+
+    # 3) 显存账目：当前可回收集 vs 高清重采样新增峰值（UNET 已在显存，不计双重）
+    free = _vram_gb()
+    unet_gb = _unet_size_gb(模型)
+    frames = grid.latent_t_to_frames(video_t.shape[2])
+    latent_gb = (int(video_t.shape[1]) * frames * h2 * w2 * 4.0) / (1024 ** 3)
+    need = latent_gb * _ACTIVATION_FACTOR + _SAFE_MARGIN_GB
+    lines.append(f"… 显存账目：UNET≈{unet_gb:.1f}GB（已在显存）· 高清重采样需新增≈"
+                 f"{need:.1f}GB（含 {_SAFE_MARGIN_GB:.1f}GB 余量）· 当前可回收集 {free:.1f}GB")
+    if free > 0 and free < need:
+        cap = _calc_scale_cap(h, w)
+        lines.append(f"✗ 显存不足：放大后重采样至少还需 {need:.1f}GB，当前可回收集仅 {free:.1f}GB"
+                     f"——请把放大倍率降到 ≤{cap:g}×、把二采步数调低/加噪调小，或降低基础"
+                     "分辨率/增大显存。本报告在分配任何高清内存前生成。")
+        fail.append("显存不足")
+
+    if fail:
+        msg = "二采健康预检未通过（已停止运行）：\n" + "\n".join(lines)
+        if report is not None:
+            report.append(msg)
+        raise UpscaleAbortError(msg)
+    return lines
+
+
 def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
                   pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
-                  采样器, 调度器):
+                  采样器, 调度器, report=None):
     """基础段 AV latent -> 高清视频 latent（放大 + 低强度重采样）。
 
     kind: "prompt"（提示词段，cond 带本段提示词/参考素材/首帧）
@@ -284,6 +406,10 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     h, w = video_t.shape[-2], video_t.shape[-1]
     tw, th = target_hw(h, w, cfg["scale"])[0] * 16, target_hw(h, w, cfg["scale"])[1] * 16
     length = grid.latent_t_to_frames(video_t.shape[2])
+
+    # 前置健康预检：在放大/分配高清内存【之前】把显存不足、画布越界、模型缺失
+    # 一次暴露——任一 ✗ 抛 UpscaleAbortError，由主循环 re-raise 终止整链（不降级）。
+    preflight(模型, cfg, net, video_t, audio_t, report)
 
     # 放大网络放大视频 latent 到 scale×（常驻 GPU，放大完卸回 CPU 腾给高清重采样）
     up_v = upscale_video(video_t, net, cfg["scale"], cfg["arch"])
@@ -330,6 +456,9 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
 
     # 低强度重采样（高清 latent）：初始 = 放大后的视频 latent + 原音频 latent；
     # 采样输出的音频丢弃，分段/成片音轨 = 原轨（零音频回归）。
+    # 强度由用户选择：denoise=加噪比例（默认 0.3 低噪声区间），steps=短步数（默认 5）；
+    # 参考工作流即「放大后 3-5 步低噪声 refine」，提分辨率靠放大网络、二采只补细节，
+    # 因此显存开销小。步数/加噪全走导演台可调，这里仅给默认。
     seed = (int(cur_seed) + 1) % 0xffffffffffffffff if cur_seed is not None else 1
     latent["samples"] = comfy.nested_tensor.NestedTensor(
         (up_v.to(dev, torch.float32), audio_t.to(dev, torch.float32)))
@@ -340,32 +469,23 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     def _is_oom(e):
         return "out of memory" in str(e).lower()
 
-    def _sample():
-        return comfy_nodes.common_ksampler(
+    # ⚠ 显存不足直接报错停止（用户明确要求，不做静默降级）：二采在高清 latent 上
+    # 采样需要额外显存，若 32GB 卡放不下 26GB UNET + 高清激活，当场抛出明确错误，
+    # 前端/报告会终止整链而不是降级基础分辨率继续（避免产出不一致的混合清晰度）。
+    try:
+        sampled = comfy_nodes.common_ksampler(
             模型, seed, cfg["steps"], cfg["cfg"], 采样器, 调度器,
             cond, negative, latent, denoise=cfg["denoise"])[0]
-
-    try:
-        # 0 原样 → 1 全卸模型（common_ksampler 只回载 UNET，CLIP/VAE 让位）
-        # → 2 LOW_VRAM 分块兜底
-        try:
-            sampled = _sample()
-        except RuntimeError as e0:
-            if not _is_oom(e0):
-                raise
-            comfy.model_management.unload_all_models()
-            torch.cuda.empty_cache()
-            try:
-                sampled = _sample()
-            except RuntimeError as e1:
-                if not _is_oom(e1):
-                    raise
-                old_vs = comfy.model_management.vram_state
-                comfy.model_management.vram_state = comfy.model_management.VRAMState.LOW_VRAM
-                try:
-                    sampled = _sample()
-                finally:
-                    comfy.model_management.vram_state = old_vs
+    except RuntimeError as e:
+        if _is_oom(e):
+            msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样在超出当前显存 {1:g}GB）："
+                   "请降低放大倍率、把二采步数调低/加噪调小，或增大显存。当前步数={2}、"
+                   "加噪={3:g}。本段尚未落盘二采产物，可先行释放其他模型后重试。".format(
+                       cfg["scale"], _vram_gb(), cfg["steps"], cfg["denoise"]))
+            if report is not None:
+                report.append(msg)
+            raise UpscaleAbortError(msg) from e
+        raise
     finally:
         restore_rows()
 
@@ -403,7 +523,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
-        采样器, 调度器)
+        采样器, 调度器, report=report)
     # 解码高清 latent -> 高清帧（官方 VAE.decode 自带 OOM→tiled 降级，无需干预）
     frames = video_vae.decode(up_v)
     del up_v
