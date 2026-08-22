@@ -170,6 +170,85 @@ def test_params_hash():
         assert h != upscale.params_hash(c), key
 
 
+def test_latent_hf_energy():
+    """高频能量度量：零张量=0、噪声>平滑、维度兜底、抽样确定性。"""
+    z = torch.zeros(1, 24, 6, 16, 16)
+    assert upscale.latent_hf_energy(z) == 0.0
+    smooth = torch.zeros(1, 24, 30, 32, 32)
+    smooth[:, :, :, :, 8:] = 1.0                      # 单阶跃（低频为主）
+    noisy = smooth + torch.randn(1, 24, 30, 32, 32) * 0.05
+    e_smooth = upscale.latent_hf_energy(smooth)
+    e_noisy = upscale.latent_hf_energy(noisy)
+    assert 0.0 < e_smooth < e_noisy
+    assert upscale.latent_hf_energy(noisy) == e_noisy            # 确定性（同输入同值）
+    assert upscale.latent_hf_energy(None) == 0.0                 # 兜底
+    assert upscale.latent_hf_energy(torch.zeros(24, 30, 32, 32)) == 0.0   # 非 5D=0
+    assert upscale.latent_hf_energy(torch.zeros(1, 24, 6, 2, 2)) == 0.0   # 空间<3=0
+
+
+def test_hf_gain_ratio():
+    assert upscale.hf_gain_ratio(0.0, 5.0) == 0.0      # 基线≈0 视为无增益
+    assert upscale.hf_gain_ratio(1e-12, 5.0) == 0.0
+    assert abs(upscale.hf_gain_ratio(1.0, 1.25) - 0.25) < 1e-9
+    assert abs(upscale.hf_gain_ratio(1.0, 0.8) + 0.2) < 1e-9
+
+
+def test_time_bias_sigma():
+    """尾窗 smoothstep 偏置：窗外不动、窗内渐入、clamp≥0、关闭态原样。"""
+    f = upscale.time_bias_sigma
+    assert f(0.35, 0.35, 0.03) == 0.35          # 精化起点（p=0）不偏置
+    assert f(0.20, 0.35, 0.03) == 0.20          # p≈0.43 < start 0.70 不偏置
+    seen = f(0.035, 0.35, 0.03)                 # p=0.9 → 窗内
+    assert 0.035 - 0.03 < seen < 0.035          # 部分偏置（smoothstep 权重 <1）
+    full = f(0.0, 0.35, 0.03)                   # p=1.0 → 权重=1 → 满偏置到 clamp
+    assert full == 0.0
+    assert f(0.01, 0.35, 0.05) == 0.0           # 偏置越过 0 → clamp 0
+    assert f(0.05, 0.35, 0.0) == 0.05           # bias=0 关
+    assert f(0.05, 0.0, 0.03) == 0.05           # σ₀=0 关
+    # 窗口参数：扩窗到全程 → 任意 σ 都有偏置（权重>0）
+    assert f(0.30, 0.35, 0.03, start_progress=0.0, end_progress=1.0) < 0.30
+
+
+def test_time_bias_guard():
+    """dit.forward patch：窗外 timestep 原样、窗内替换为偏置值、恢复即还原。"""
+    calls = []
+
+    class _Dit:
+        def forward(self, x, timestep, context, transformer_options={}, **kwargs):
+            calls.append(float(timestep.flatten()[0]))
+            return x
+
+    dit = _Dit()
+    restore = upscale.time_bias_guard(dit, sigma_start=0.35, bias=0.03)
+    dit.forward(None, torch.tensor([350.0]), None)          # σ=0.35 → p=0 窗外
+    assert calls[-1] == 350.0
+    dit.forward(None, torch.tensor([35.0]), None)           # σ=0.035 → p=0.9 窗内
+    assert 0.0 < calls[-1] < 35.0                           # 偏置后 <原值且未触底
+    dit.forward(None, torch.tensor([17.5]), None)           # σ=0.0175 → 偏置越过 0 → clamp
+    assert calls[-1] == 0.0
+    restore()
+    dit.forward(None, torch.tensor([35.0]), None)           # 恢复后原样
+    assert calls[-1] == 35.0
+
+
+def test_params_hash_time_bias():
+    """time_bias 条件化指纹：0=不进指纹（既有记录不失效），>0 改变指纹。"""
+    base = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth"}})
+    off = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
+                                           "time_bias": 0}})
+    on = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
+                                          "time_bias": 0.03}})
+    h = upscale.params_hash(base)
+    assert h == upscale.params_hash(off)         # 默认关闭不改变哈希
+    assert h != upscale.params_hash(on)          # 启用才进指纹
+    # 解析归一：默认 0 / 钳上限 0.2 / 垃圾回落 0
+    assert base["time_bias"] == 0.0
+    assert upscale.parse_state({"upscale": {"mode": "跟随生成",
+                                            "time_bias": 0.5}})["time_bias"] == 0.2
+    assert upscale.parse_state({"upscale": {"mode": "跟随生成",
+                                            "time_bias": "bad"}})["time_bias"] == 0.0
+
+
 def test_base_hash():
     mf = {"prompt_hashes": ["h0", "h1"], "seeds": [10, 20]}
     assert upscale.base_hash(mf, 0) == "h0|10"

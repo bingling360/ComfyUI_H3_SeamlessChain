@@ -430,8 +430,9 @@ function defaultDs() {
 
 function defaultUpscale() {
     /* 潜空间放大二采：主循环内渲染通道（每段采样定稿后、段落盘前），参数不进基础链指纹。
-       schema 2：steps=尾段精化步数（与 denoise=尾段起始σ 解耦），旧 JSON 由 getDs 迁移 */
-    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16", include: [] };
+       schema 2：steps=尾段精化步数（与 denoise=尾段起始σ 解耦），旧 JSON 由 getDs 迁移。
+       time_bias 默认 0=关，仅启用时进后端指纹（不使既有记录失效） */
+    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16", time_bias: 0.0, include: [] };
 }
 
 function defaultSegment() {
@@ -522,6 +523,7 @@ function getDs(node) {
             steps: upSteps,
             cfg: upNum(upRaw.cfg, 1.0, 0.0, 100.0),
             precision: UP_PRECISIONS.includes(upRaw.precision) ? upRaw.precision : "fp16",
+            time_bias: upNum(upRaw.time_bias, 0.0, 0.0, 0.2),
             include: (Array.isArray(upRaw.include) ? upRaw.include : [])
                 .map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 0),
         };
@@ -3089,6 +3091,10 @@ function renderUpscaleZone(sec, data) {
         body.append(upNumField("二采 CFG", up.cfg, 0.0, 100.0, 0.1,
             "重采样 CFG：H3 常用 1.0（官方推荐低 CFG），与主链可不同",
             (v) => setUpscaleField(node, "cfg", v)));
+        body.append(upNumField("时间偏置", up.time_bias, 0.0, 0.2, 0.005,
+            "尾段精化窗口内把模型看到的时间向更干净方向偏置（Detail-Daemon/T8 机制，零额外前向）："
+            + "0=关（默认）；0.025-0.05 常用，过大可能过锐/伪细节。仅在 >0 时进二采指纹",
+            (v) => setUpscaleField(node, "time_bias", v)));
 
         /* 目标画布徽章（latent 偶数对齐 = 像素 32 倍数，与后端 target_hw 同口径） */
         const target = upTargetCanvas(node, up.scale);

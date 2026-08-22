@@ -105,6 +105,7 @@ def parse_state(ds):
         "steps": steps,
         "cfg": _num("cfg", 1.0, 0.0, 100.0),
         "precision": precision,
+        "time_bias": _num("time_bias", 0.0, 0.0, 0.2),
         "include": include,
     }
 
@@ -131,9 +132,66 @@ def tail_refine_args(sigma_start, tail_steps):
     return big_n, min(1.0, (n + 0.5) / big_n)
 
 
+def latent_hf_energy(video_t, max_frames=12):
+    """latent 高频能量（细节代理指标，纯 torch 可单测）。
+
+    逐帧空间 3×3 均值池化残差的 RMS（≈空域拉普拉斯能量），均匀抽样 ≤max_frames
+    帧、CPU 计算（避开二采峰值期的显存）。用于「细节增益」对比：放大 latent
+    （纯神经放大、无精化）vs 精化后 latent——增益为正说明尾段精化补回了高频。
+    输入 [B,C,T,H,W]；非 5D 或空间 <3 返回 0.0。
+    """
+    if video_t is None or video_t.dim() != 5 \
+            or video_t.shape[-2] < 3 or video_t.shape[-1] < 3:
+        return 0.0
+    t = int(video_t.shape[2])
+    step = max(1, t // max_frames)
+    idx = torch.arange(0, t, step)[:max_frames]
+    x = video_t.detach().to("cpu", torch.float32)[0, :, idx]     # [C,k,H,W]
+    smooth = torch.nn.functional.avg_pool2d(x, 3, stride=1, padding=1)
+    return float((x - smooth).pow(2).mean().sqrt())
+
+
+def hf_gain_ratio(hf_before, hf_after):
+    """细节增益百分比（小数）：after 相对 before 的高频能量增幅；before≈0 视为 0。"""
+    if hf_before < 1e-8:
+        return 0.0
+    return (hf_after - hf_before) / hf_before
+
+
+def time_bias_sigma(sigma_v, sigma_start, bias, start_progress=0.70,
+                    end_progress=1.0):
+    """尾段时间偏置核心数学（Detail-Daemon 类，T8mars 机制移植，纯函数可单测）。
+
+    精化进度 p = 1 − σ/σ₀（0=精化开始，1=收尾）；在 [start_progress,
+    end_progress] 尾窗内以 smoothstep 渐入，把模型「看到的 σ」向更干净方向
+    （更小）偏置 bias。不加噪声、不改积分 σ 与前向次数——只是模型时间观感。
+    bias≤0 或 σ₀≤0 时原样返回（关）。σ clamp ≥0（精化网格最小评估 σ 远大于
+    bias，钳 0 仅兜底）。
+    """
+    if bias <= 0.0 or sigma_start <= 0.0:
+        return sigma_v
+    p = 1.0 - min(sigma_v / sigma_start, 1.0)
+    span = max(end_progress - start_progress, 1e-6)
+    w = min(max((p - start_progress) / span, 0.0), 1.0)
+    w = w * w * (3.0 - 2.0 * w)             # smoothstep 渐入
+    return max(sigma_v - w * bias, 0.0)
+
+
+def _hash_params(cfg):
+    """进指纹/记录的参数字典（params_hash 与 write_record.params 同口径）。"""
+    keys = {k: cfg[k] for k in _PARAM_KEYS}
+    if cfg.get("time_bias"):
+        keys["time_bias"] = cfg["time_bias"]
+    return keys
+
+
 def params_hash(cfg):
-    """二采参数 -> 8 位指纹（mode/include 不进：不影响单段输出）。"""
-    return checkpoint.fingerprint({k: cfg[k] for k in _PARAM_KEYS})
+    """二采参数 -> 8 位指纹（mode/include 不进：不影响单段输出）。
+
+    time_bias 仅在 >0（启用）时进指纹——默认关闭不改变哈希，既有二采记录
+    不因本次新增参数而失效重做。
+    """
+    return checkpoint.fingerprint(_hash_params(cfg))
 
 
 def base_hash(manifest, g):
@@ -408,6 +466,28 @@ def preflight(模型, cfg, net, video_t, audio_t, report=None):
     return lines
 
 
+def time_bias_guard(dit, sigma_start, bias):
+    """尾段时间偏置守卫：patch dit.forward，返回恢复函数（try/finally 调用）。
+
+    Detail-Daemon 类技巧（T8mars/comfyui-minimax-h3-audio-T8 机制移植，GPL）：
+    在精化尾窗内只把喂给共享 AV Transformer 的 timestep（=σ×1000）向更干净方向
+    偏置——模型「看到稍干净的时间」从而多抠细节；不加噪声、NFE 不变。二采
+    输出的音频 latent 被丢弃，偏置波及音频 token 的时间嵌入也不影响产物。
+    与 cond_audio_rows_guard（挂 _cond_audio_rows 属性）不冲突；bias≤0 不安装。
+    """
+    orig_forward = dit.forward
+
+    def patched_forward(x, timestep, context, transformer_options={}, **kwargs):
+        sigma_v = float((timestep.flatten()[0] / 1000.0).clamp(min=1e-6))
+        seen = time_bias_sigma(sigma_v, sigma_start, bias)
+        if seen != sigma_v:
+            timestep = torch.full_like(timestep, seen * 1000.0)
+        return orig_forward(x, timestep, context, transformer_options, **kwargs)
+
+    dit.forward = patched_forward
+    return lambda: setattr(dit, "forward", orig_forward)
+
+
 def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
                   pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
@@ -419,7 +499,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     guide: 本段生成时用的上段尾帧桥（None=首段/断链/插入段）——视频 latent
     神经放大后注入重采样 cond（CondSync：锚住段首与上段高清尾的连续性）。
     tail_kf_latent: 尾帧身份锚定的基础 latent（与主循环同语义，同步放大注入）。
-    返回 (up_out_v 高清视频 latent, tw, th, 二采种子, 是否桥锚)。
+    返回 (up_out_v 高清视频 latent, tw, th, 二采种子, 是否桥锚, 细节增益小数)。
     """
     import comfy.model_management
     import comfy.nested_tensor
@@ -449,8 +529,10 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 一次暴露——任一 ✗ 抛 UpscaleAbortError，由主循环 re-raise 终止整链（不降级）。
     preflight(模型, cfg, net, video_t, audio_t, report)
 
-    # 放大网络放大视频 latent 到 scale×（常驻 GPU，放大完卸回 CPU 腾给高清重采样）
+    # 放大网络放大视频 latent 到 scale×（常驻 GPU，放大完卸回 CPU 腾给高清重采样）；
+    # hf_up = 纯放大（无精化）的高频能量基线——细节增益度量的「前」
     up_v = upscale_video(video_t, net, cfg["scale"], cfg["arch"])
+    hf_up = latent_hf_energy(up_v)
 
     # cond 构造：按【高清目标分辨率】（重采样画布），refs/首帧由官方节点编码到高清尺寸
     if kind == "prompt":
@@ -512,13 +594,16 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 采样需要额外显存，若 32GB 卡放不下 26GB UNET + 高清激活，当场抛出明确错误，
     # 前端/报告会终止整链而不是降级基础分辨率继续（避免产出不一致的混合清晰度）。
     ks_steps, ks_denoise = tail_refine_args(cfg["denoise"], cfg["steps"])
+    n_eff = int(ks_steps * ks_denoise)
+    tb = float(cfg.get("time_bias") or 0.0)
+    restore_tb = time_bias_guard(模型.model.diffusion_model, n_eff / ks_steps, tb) \
+        if tb > 0.0 else None
     try:
         sampled = comfy_nodes.common_ksampler(
             模型, seed, ks_steps, cfg["cfg"], 采样器, 调度器,
             cond, negative, latent, denoise=ks_denoise)[0]
     except RuntimeError as e:
         if _is_oom(e):
-            n_eff = int(ks_steps * ks_denoise)
             msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样在超出当前显存 {1:g}GB）："
                    "请降低放大倍率、把精化步数调低/起始σ调小，或增大显存。"
                    "当前精化 {2} 步 @ σ≈{3:g}。本段尚未落盘二采产物，可先行释放其他模型后重试。".format(
@@ -529,11 +614,14 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         raise
     finally:
         restore_rows()
+        if restore_tb is not None:
+            restore_tb()
 
     up_out_v, _discarded_audio = sampled["samples"].unbind()
     del cond, latent, sampled
     torch.cuda.empty_cache()
-    return up_out_v, tw, th, seed, bridged
+    hf_gain = hf_gain_ratio(hf_up, latent_hf_energy(up_out_v))
+    return up_out_v, tw, th, seed, bridged, hf_gain
 
 
 def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
@@ -559,7 +647,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     t0 = time.perf_counter()
     purge_legacy(root, g)
 
-    up_v, tw, th, up_seed, bridged = render_latent(
+    up_v, tw, th, up_seed, bridged, hf_gain = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
@@ -576,27 +664,33 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     checkpoint.save_thumb(root, g, frames[0])
     files = checkpoint.upscale_files(g)
     _save_png(os.path.join(root, files["last"]), frames[-1])
-    up_state = write_record(root, g, cfg, up_seed, (tw, th), bh)
+    up_state = write_record(root, g, cfg, up_seed, (tw, th), bh, hf_gain=hf_gain)
     _n, _d = tail_refine_args(cfg["denoise"], cfg["steps"])
     _n_eff = int(_n * _d)
+    _tb = float(cfg.get("time_bias") or 0.0)
     report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
-                  f"精化 {_n_eff} 步 @ σ≈{_n_eff / _n:g} · {time.perf_counter() - t0:.0f}s"
-                  + (" · 桥锚" if bridged else ""))
+                  f"精化 {_n_eff} 步 @ σ≈{_n_eff / _n:g} · 细节 {hf_gain:+.0%} · "
+                  f"{time.perf_counter() - t0:.0f}s"
+                  + (" · 桥锚" if bridged else "")
+                  + (f" · 偏置{_tb:g}" if _tb > 0 else ""))
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
     torch.cuda.empty_cache()
     return frames[-1].detach().float().cpu(), up_state
 
 
-def write_record(root, g, cfg, seed, size, bh):
+def write_record(root, g, cfg, seed, size, bh, hf_gain=None):
     """段 g 高清渲染记录原子写盘（重读 manifest 防竞态覆盖并发进度）。
 
     bh=该段基础身份指纹（调用方用本地 full_hashes/seeds 现算，不依赖磁盘
-    manifest 的写入时机）；返回最新 upscale dict（调用方回填 proj_upscale，
+    manifest 的写入时机）；hf_gain=细节增益小数（仅记录供 ab_report 复盘，
+    不参与重做判定）；返回最新 upscale dict（调用方回填 proj_upscale，
     后续主循环的 manifest 快照写盘才不会把记录冲掉）。
     """
     ph = params_hash(cfg)
     rec = {"hash": ph, "base_hash": bh, "seed": seed, "done": True,
            "files": checkpoint.upscale_files(g), "size": list(size)}
+    if hf_gain is not None:
+        rec["hf_gain"] = round(float(hf_gain), 4)
     fresh = checkpoint.load_manifest(root) or {}
     up_state = dict(fresh["upscale"]) if isinstance(fresh.get("upscale"), dict) else {}
     segs = list(up_state.get("segs") or [])
@@ -605,7 +699,7 @@ def write_record(root, g, cfg, seed, size, bh):
     segs[g] = rec
     up_state["segs"] = segs
     up_state["hash"] = ph
-    up_state["params"] = {k: cfg[k] for k in _PARAM_KEYS}
+    up_state["params"] = _hash_params(cfg)
     fresh["upscale"] = up_state
     fresh["updated_at"] = time.time()
     checkpoint.save_manifest(root, fresh)
