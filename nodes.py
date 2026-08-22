@@ -894,7 +894,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(f"独立镜头：{len(_unlink_pos)} 段与上段断链（无桥接/硬切，段 {'、'.join(_unlink_pos)}）")
         if up_cfg:
             report.append(f"潜空间放大二采：{up_cfg['mode']} · {up_cfg['arch']} {up_cfg['scale']:g}× · "
-                          f"强度 {up_cfg['denoise']:g} · 步数 {up_cfg['steps']}——每段采样定稿后立即"
+                          f"精化 {up_cfg['steps']} 步 @ σ≈{up_cfg['denoise']:g}——每段采样定稿后立即"
                           "渲染高清，分段视频与成片直接保存二采结果")
         elif _up_err:
             report.append(f"潜空间放大二采：面板已开启但本次跳过——{_up_err}")

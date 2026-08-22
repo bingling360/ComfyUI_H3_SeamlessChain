@@ -82,12 +82,14 @@ def test_parse_state_normalize():
     cfg = upscale.parse_state({"upscale": {"mode": "乱写"}})   # 非法模式回落跟随生成
     assert cfg["mode"] == "跟随生成" and cfg["include"] is None
     assert cfg["model"] == "" and cfg["arch"] == "2D"
-    assert cfg["scale"] == 2.0 and cfg["denoise"] == 0.45
-    assert cfg["steps"] == 15 and cfg["cfg"] == 1.0
-    assert cfg["precision"] == "fp32"
+    assert cfg["scale"] == 2.0
+    assert cfg["denoise"] == 0.35              # 未存过字段=新默认（无 schema 键按 v1 迁移也无损）
+    assert cfg["steps"] == 6                   # 未存过 steps=新默认精化步数
+    assert cfg["cfg"] == 1.0
+    assert cfg["precision"] == "fp16"
 
     full = upscale.parse_state({"upscale": {
-        "mode": "手动选择", "model": " up2d.pth ", "arch": "3d", "scale": "9",
+        "schema": 2, "mode": "手动选择", "model": " up2d.pth ", "arch": "3d", "scale": "9",
         "denoise": "0.01", "steps": "0", "cfg": "-5", "precision": "x",
         "include": [2, "1", 1.0, "bad", None]}})
     assert full["mode"] == "手动选择"
@@ -97,12 +99,61 @@ def test_parse_state_normalize():
     assert full["denoise"] == 0.05              # 钳下限
     assert full["steps"] == 1
     assert full["cfg"] == 0.0
-    assert full["precision"] == "fp32"          # 非法精度回落
+    assert full["precision"] == "fp16"          # 非法精度回落
     assert full["include"] == [1, 2]            # 去重排序，垃圾项剔除
 
     nan = upscale.parse_state({"upscale": {"mode": "跟随生成", "scale": float("nan"),
                                            "denoise": float("nan")}})
-    assert nan["scale"] == 2.0 and nan["denoise"] == 0.45   # NaN 回落默认
+    assert nan["scale"] == 2.0 and nan["denoise"] == 0.35   # NaN 回落默认
+
+
+def test_parse_state_schema_migration():
+    """v1「steps=调度总步数」-> v2「steps=精化步数」：显式存过的按 int(N×强度) 折算保行为。"""
+    v1 = upscale.parse_state({"upscale": {"mode": "跟随生成", "denoise": 0.45, "steps": 15}})
+    assert v1["denoise"] == 0.45 and v1["steps"] == 6      # int(15×0.45)=6，恰为新默认步数
+    v1b = upscale.parse_state({"upscale": {"mode": "跟随生成", "denoise": 0.3, "steps": 20}})
+    assert v1b["denoise"] == 0.3 and v1b["steps"] == 6     # int(20×0.3)
+    v1c = upscale.parse_state({"upscale": {"mode": "跟随生成", "denoise": 0.05, "steps": 10}})
+    assert v1c["steps"] == 1                               # int(0.5)=0 钳到 1
+    # v1 完全没存过二采参数（没碰过面板）= 直接落 v2 新默认
+    v1d = upscale.parse_state({"upscale": {"mode": "跟随生成"}})
+    assert v1d["denoise"] == 0.35 and v1d["steps"] == 6
+    # schema 2：steps 即精化步数（不乘强度），新默认 0.35/6
+    v2 = upscale.parse_state({"upscale": {"mode": "跟随生成", "schema": 2}})
+    assert v2["denoise"] == 0.35 and v2["steps"] == 6
+    v2b = upscale.parse_state({"upscale": {"mode": "跟随生成", "schema": 2,
+                                           "denoise": 0.4, "steps": 3}})
+    assert v2b["denoise"] == 0.4 and v2b["steps"] == 3
+
+
+def test_tail_refine_args():
+    """(尾段起始σ, 精化步数 n) -> common_ksampler(steps=N, denoise)：int(N·denoise) 恒为 n。"""
+    N, d = upscale.tail_refine_args(0.35, 6)               # 新默认档
+    assert N == 17 and int(N * d) == 6 and abs(d - 6.5 / 17) < 1e-9
+    N, d = upscale.tail_refine_args(0.45, 6)               # v1 旧默认迁移档
+    assert N == 13 and int(N * d) == 6
+    # σ≥0.95 = 全量重采（明确请求：丢弃放大 latent 从纯噪声起步）
+    assert upscale.tail_refine_args(1.0, 6) == (6, 1.0)
+    assert upscale.tail_refine_args(0.95, 4) == (4, 1.0)
+    N, d = upscale.tail_refine_args(0.94, 6)
+    assert N == 7 and d == 6.5 / 7            # 0.94 仍是部分精化（不撞 denoise=1）
+    # 高σ小步数角落：整数网格无法同时满足「σ₀≈s 且 n 步」，退到 n/(n+1) 且绝不撞全量重采
+    N, d = upscale.tail_refine_args(0.9, 2)
+    assert N == 3 and 0.05 < d < 1.0 and int(N * d) == 2   # 2 步 @ σ≈0.667
+    N, d = upscale.tail_refine_args(0.9, 4)
+    assert N == 5 and 0.05 < d < 1.0 and int(N * d) == 4   # 4 步 @ σ≈0.8
+    # 输入钳制：步数 ≥1、σ ≥0.05
+    assert upscale.tail_refine_args(0.5, 0) == (2, 0.75)
+    N, d = upscale.tail_refine_args(0.01, 6)               # σ 钳到 0.05
+    assert N == 100 and int(N * d) == 5
+    # 常用区（σ≤0.6、步数≥3）不变量：步数精确、永不撞全量重采、σ₀ 贴请求值
+    for s in (0.05, 0.12, 0.25, 0.35, 0.45, 0.6):
+        for n in (3, 5, 6, 8, 12, 25, 50, 100):
+            N, d = upscale.tail_refine_args(s, n)
+            n_eff = int(N * d)
+            assert 1 <= N <= 100 and 0.05 < d < 1.0
+            assert n_eff == n or (N == 100 and n_eff < n)  # 只允许 100 格上限压步数
+            assert abs(n_eff / N - s) < 0.07                # 网格量化误差上限
 
 
 def test_params_hash():
@@ -114,7 +165,7 @@ def test_params_hash():
     assert h == upscale.params_hash(b)          # mode/include 不进指纹（不影响单段输出）
     assert h == upscale.params_hash(upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth"}}))
     for key, val in (("denoise", 0.6), ("scale", 1.5), ("steps", 20), ("cfg", 2.0),
-                     ("arch", "3D"), ("precision", "fp16"), ("model", "other.pth")):
+                     ("arch", "3D"), ("precision", "fp32"), ("model", "other.pth")):
         c = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth", key: val}})
         assert h != upscale.params_hash(c), key
 

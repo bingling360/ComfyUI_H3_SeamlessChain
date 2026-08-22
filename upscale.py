@@ -67,9 +67,18 @@ def parse_state(ds):
             v = default
         return min(max(v, lo), hi)
 
-    precision = str(up.get("precision") or "fp32")
+    # 参数 schema v2：steps 语义从「调度总步数 N」改为「尾段精化步数 n」（denoise 语义
+    # 同步明确为尾段起始 σ）。v1 旧 JSON 字段级迁移：显式存过的 steps 按旧口径
+    # int(N×强度) 折算保行为（旧默认 15×0.45=6 恰为新默认）；没存过的字段直接
+    # 落 v2 新默认（从未配置=用最新推荐值，而不是旧默认）。
+    try:
+        schema = int(up.get("schema"))
+    except (TypeError, ValueError):
+        schema = 1
+
+    precision = str(up.get("precision") or "fp16")
     if precision not in PRECISIONS:
-        precision = "fp32"
+        precision = "fp16"
     include = None
     if mode == "手动选择":
         vals = set()
@@ -80,17 +89,46 @@ def parse_state(ds):
                 except (TypeError, ValueError):
                     continue
         include = sorted(vals)
+    denoise = _num("denoise", 0.35, 0.05, 1.0)
+    if schema < 2:
+        has_steps = up.get("steps") not in (None, "")
+        steps = (min(max(int(_num("steps", 15, 1, 100) * denoise), 1), 100)
+                 if has_steps else 6)
+    else:
+        steps = int(_num("steps", 6, 1, 100))
     return {
         "mode": mode,
         "model": str(up.get("model") or "").strip(),
         "arch": "3D" if str(up.get("arch") or "").strip().upper() == "3D" else "2D",
         "scale": _num("scale", 2.0, 1.0, 4.0),
-        "denoise": _num("denoise", 0.45, 0.05, 1.0),
-        "steps": int(_num("steps", 15, 1, 100)),
+        "denoise": denoise,
+        "steps": steps,
         "cfg": _num("cfg", 1.0, 0.0, 100.0),
         "precision": precision,
         "include": include,
     }
+
+
+def tail_refine_args(sigma_start, tail_steps):
+    """(尾段起始σ, 精化步数 n) -> common_ksampler 的 (steps=N, denoise)。
+
+    common_ksampler 对 denoise<1 的内部行为 = N 步调度序列取尾 int(N·denoise) 步，
+    flow-matching 下初始加噪 (1-σ₀)x0+σ₀ε 落在截断后的 σ₀——本就是 sigma 尾段精化；
+    本函数把「σ 起点 × 精化步数」两个直接语义换算回该公开 API：
+    - N=round(n/σ)：simple 线性调度下截断点 σ₀≈n/N 即请求值（非 simple/带 shift
+      调度为网格近似，报告行打印实际生效值兜底）；
+    - N≥n+1 且 denoise=(n+0.5)/N<1：部分精化档永不撞全量重采（denoise=1 会完全
+      丢弃放大后的 latent），σ≥0.95 视为明确请求全量重采才返回 denoise=1.0；
+    - +0.5 抵御 int(N·denoise) 的浮点截断少 1 步。
+    """
+    n = min(max(int(tail_steps), 1), 100)
+    s = min(max(float(sigma_start), 0.05), 1.0)
+    if s >= 0.95:
+        return n, 1.0
+    big_n = min(max(int(round(n / s)), n + 1), 100)
+    if big_n == 100:
+        n = min(n, max(1, int(big_n * s)))   # σ 过小受 100 格上限，反向钳步数
+    return big_n, min(1.0, (n + 0.5) / big_n)
 
 
 def params_hash(cfg):
@@ -358,7 +396,7 @@ def preflight(模型, cfg, net, video_t, audio_t, report=None):
     if free > 0 and free < need:
         cap = _calc_scale_cap(h, w)
         lines.append(f"✗ 显存不足：放大后重采样至少还需 {need:.1f}GB，当前可回收集仅 {free:.1f}GB"
-                     f"——请把放大倍率降到 ≤{cap:g}×、把二采步数调低/加噪调小，或降低基础"
+                     f"——请把放大倍率降到 ≤{cap:g}×、把精化步数调低/起始σ调小，或降低基础"
                      "分辨率/增大显存。本报告在分配任何高清内存前生成。")
         fail.append("显存不足")
 
@@ -456,9 +494,10 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
 
     # 低强度重采样（高清 latent）：初始 = 放大后的视频 latent + 原音频 latent；
     # 采样输出的音频丢弃，分段/成片音轨 = 原轨（零音频回归）。
-    # 强度由用户选择：denoise=加噪比例（默认 0.3 低噪声区间），steps=短步数（默认 5）；
-    # 参考工作流即「放大后 3-5 步低噪声 refine」，提分辨率靠放大网络、二采只补细节，
-    # 因此显存开销小。步数/加噪全走导演台可调，这里仅给默认。
+    # 参数即「sigma 尾段精化」直接语义：denoise=尾段起始 σ（默认 0.35 低噪声区间）、
+    # steps=精化步数（默认 6，建议 3-8；参考工作流即「放大后 3-5 步低噪声 refine」）。
+    # 提分辨率靠放大网络、二采只补细节，显存开销小；tail_refine_args 把两个
+    # 直接语义换算回 common_ksampler(denoise) 的尾段截断口径。
     seed = (int(cur_seed) + 1) % 0xffffffffffffffff if cur_seed is not None else 1
     latent["samples"] = comfy.nested_tensor.NestedTensor(
         (up_v.to(dev, torch.float32), audio_t.to(dev, torch.float32)))
@@ -472,16 +511,18 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # ⚠ 显存不足直接报错停止（用户明确要求，不做静默降级）：二采在高清 latent 上
     # 采样需要额外显存，若 32GB 卡放不下 26GB UNET + 高清激活，当场抛出明确错误，
     # 前端/报告会终止整链而不是降级基础分辨率继续（避免产出不一致的混合清晰度）。
+    ks_steps, ks_denoise = tail_refine_args(cfg["denoise"], cfg["steps"])
     try:
         sampled = comfy_nodes.common_ksampler(
-            模型, seed, cfg["steps"], cfg["cfg"], 采样器, 调度器,
-            cond, negative, latent, denoise=cfg["denoise"])[0]
+            模型, seed, ks_steps, cfg["cfg"], 采样器, 调度器,
+            cond, negative, latent, denoise=ks_denoise)[0]
     except RuntimeError as e:
         if _is_oom(e):
+            n_eff = int(ks_steps * ks_denoise)
             msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样在超出当前显存 {1:g}GB）："
-                   "请降低放大倍率、把二采步数调低/加噪调小，或增大显存。当前步数={2}、"
-                   "加噪={3:g}。本段尚未落盘二采产物，可先行释放其他模型后重试。".format(
-                       cfg["scale"], _vram_gb(), cfg["steps"], cfg["denoise"]))
+                   "请降低放大倍率、把精化步数调低/起始σ调小，或增大显存。"
+                   "当前精化 {2} 步 @ σ≈{3:g}。本段尚未落盘二采产物，可先行释放其他模型后重试。".format(
+                       cfg["scale"], _vram_gb(), n_eff, n_eff / ks_steps))
             if report is not None:
                 report.append(msg)
             raise UpscaleAbortError(msg) from e
@@ -544,8 +585,10 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     files = checkpoint.upscale_files(g)
     _save_png(os.path.join(root, files["last"]), frames[-1])
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh)
+    _n, _d = tail_refine_args(cfg["denoise"], cfg["steps"])
+    _n_eff = int(_n * _d)
     report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
-                  f"强度 {cfg['denoise']:g} · {cfg['steps']}步 · {time.perf_counter() - t0:.0f}s"
+                  f"精化 {_n_eff} 步 @ σ≈{_n_eff / _n:g} · {time.perf_counter() - t0:.0f}s"
                   + (" · 桥锚" if bridged else "") + (" · 接缝平滑" if blended else ""))
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
     torch.cuda.empty_cache()
