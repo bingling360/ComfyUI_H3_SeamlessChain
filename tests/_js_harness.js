@@ -176,7 +176,7 @@ eq("upscale scale 钳上限", dsP.upscale.scale, 4);
 eq("upscale denoise 钳下限", dsP.upscale.denoise, 0.05);
 eq("upscale steps 钳下限取整", dsP.upscale.steps, 1);
 eq("upscale cfg 钳下限", dsP.upscale.cfg, 0);
-eq("upscale precision 回落 fp32", dsP.upscale.precision, "fp32");
+eq("upscale precision 回落 fp16", dsP.upscale.precision, "fp16");
 eq("upscale include 只留非负整数", dsP.upscale.include, [1, 2]);
 /* 旧 JSON 无 upscale 键 -> 默认注入（关闭，与后端 parse_state 同口径） */
 const nodeO = { widgets: [{ name: "导演台状态", value: JSON.stringify({ mode: "文生视频", prompts: ["a"] }) }], setDirtyCanvas() {} };

@@ -866,7 +866,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(f"独立镜头：{len(_unlink_pos)} 段与上段断链（无桥接/硬切，段 {'、'.join(_unlink_pos)}）")
         if up_cfg:
             report.append(f"潜空间放大二采：{up_cfg['mode']} · {up_cfg['arch']} {up_cfg['scale']:g}× · "
-                          f"强度 {up_cfg['denoise']:g} · 步数 {up_cfg['steps']}——每段采样定稿后立即"
+                          f"精化 {up_cfg['steps']} 步 @ σ≈{up_cfg['denoise']:g}——每段采样定稿后立即"
                           "渲染高清，分段视频与成片直接保存二采结果")
         elif _up_err:
             report.append(f"潜空间放大二采：面板已开启但本次跳过——{_up_err}")
@@ -1104,12 +1104,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     skip_f, vis_len,
                     wav, rate, bh, report, 采样器, 调度器)
                 return True, False
-            except Exception as e:   # 单段失败只降级该段，整链照常
+            except upscale.UpscaleAbortError:
+                raise   # 预检/二采显存致命：报告已 append，终止整链，不降级
+            except Exception as e:   # 单段偶发失败只降级该段，整链照常
+                oom = "out of memory" in str(e).lower()
                 report.append(f"段{g + 1} 二采失败：{type(e).__name__}: {e}"
-                              "——本段按基础分辨率保存（基础链产物不受影响）")
-                # 释放二采失败可能残留的显存（放大 latent / 推理缓存），
-                # 给后续基础采样腾空间；放大网络可能已在 CPU（render_latent 内 net.cpu()），
-                # 下段二采开始时 render_latent 会自愈装回 GPU
+                              "——本段按基础分辨率保存（基础链产物不受影响）"
+                              + ("；显存不够：可把放大倍率降到 1.5× 或把精化步数调低/起始σ调小"
+                                 "（本段会自动补渲染，基础链不重做）" if oom else ""))
+                # 释放二采残留（放大 latent / 解码帧 / 推理缓存）给后续基础采样腾空间；
+                # 放大网络可能已在 CPU（render_latent 内 net.cpu()），下段二采自愈装回 GPU
                 try:
                     import comfy.model_management
                     comfy.model_management.soft_empty_cache()

@@ -429,8 +429,9 @@ function defaultDs() {
 }
 
 function defaultUpscale() {
-    /* 潜空间放大二采：主循环内渲染通道（每段采样定稿后、段落盘前），参数不进基础链指纹 */
-    return { on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.45, steps: 15, cfg: 1.0, precision: "fp32", include: [] };
+    /* 潜空间放大二采：主循环内渲染通道（每段采样定稿后、段落盘前），参数不进基础链指纹。
+       schema 2：steps=尾段精化步数（与 denoise=尾段起始σ 解耦），旧 JSON 由 getDs 迁移 */
+    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16", include: [] };
 }
 
 function defaultSegment() {
@@ -493,23 +494,34 @@ function getDs(node) {
             .filter((x) => (insSeen.has(x.pos) ? false : insSeen.add(x.pos)))
             .map((x) => ({ pos: Number(x.pos), file: x.file.trim() }))
             .sort((a, b) => a.pos - b.pos);
-        /* 潜空间放大二采配置（v3 新增；旧 JSON 无此键=默认关闭，后端 parse_state 同口径） */
+        /* 潜空间放大二采配置（v3 新增；旧 JSON 无此键=默认关闭，后端 parse_state 同口径）
+           schema 2：steps=尾段精化步数；v1「调度总步数」在此迁移为 int(N×强度) 等价口径 */
         const upRaw = raw.upscale && typeof raw.upscale === "object" ? raw.upscale : {};
         const upNum = (v, def, lo, hi) => {
             const n = Number(v);
             const x = isFinite(n) ? n : def;
             return Math.min(hi, Math.max(lo, x));
         };
+        const upSchema = Number.isInteger(Number(upRaw.schema)) ? Number(upRaw.schema) : 1;
+        const upDenoise = upNum(upRaw.denoise, 0.35, 0.05, 1.0);
+        /* v1「调度总步数」迁移为 int(N×强度) 等价口径；没存过 steps 的直接落新默认 6 */
+        const hasUpSteps = upRaw.steps !== undefined && upRaw.steps !== null && upRaw.steps !== "";
+        const upSteps = upSchema >= 2
+            ? Math.round(upNum(upRaw.steps, 6, 1, 100))
+            : (hasUpSteps
+                ? Math.min(100, Math.max(1, Math.floor(upNum(upRaw.steps, 15, 1, 100) * upDenoise)))
+                : 6);
         const upscale = {
+            schema: 2,
             on: upRaw.on !== false,
             mode: UP_MODES.includes(upRaw.mode) ? upRaw.mode : "关闭",
             model: typeof upRaw.model === "string" ? upRaw.model : "",
             arch: upRaw.arch === "3D" ? "3D" : "2D",
             scale: upNum(upRaw.scale, 2.0, 1.0, 4.0),
-            denoise: upNum(upRaw.denoise, 0.45, 0.05, 1.0),
-            steps: Math.round(upNum(upRaw.steps, 15, 1, 100)),
+            denoise: upDenoise,
+            steps: upSteps,
             cfg: upNum(upRaw.cfg, 1.0, 0.0, 100.0),
-            precision: UP_PRECISIONS.includes(upRaw.precision) ? upRaw.precision : "fp32",
+            precision: UP_PRECISIONS.includes(upRaw.precision) ? upRaw.precision : "fp16",
             include: (Array.isArray(upRaw.include) ? upRaw.include : [])
                 .map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 0),
         };
@@ -3052,7 +3064,8 @@ function renderUpscaleZone(sec, data) {
         precField.append(el("label", "", "精度"));
         const precSel = document.createElement("select");
         precSel.className = "h3d-select";
-        precSel.title = "放大网络推理精度：fp32 最稳；fp16/bf16 省显存（放大后重采样仍在原精度）";
+        precSel.title = "放大网络推理精度：fp16 默认（参考工作流口径，省显存；放大后重采样仍在原精度）。"
+            + "目标画布 >2.5MP 出现高频花屏时可回 fp32";
         for (const p of UP_PRECISIONS) {
             const o = document.createElement("option");
             o.value = p;
@@ -3068,10 +3081,10 @@ function renderUpscaleZone(sec, data) {
             "latent H/W 同乘（时间维不变）；目标画布见下方徽章。倍率 1.0 = 纯二采不放大",
             (v) => setUpscaleField(node, "scale", v)));
         body.append(upNumField("二采强度", up.denoise, 0.05, 1.0, 0.05,
-            "低强度重去噪补回放大丢失的高频细节：0.35-0.55 常用；过高会改写画面内容，过低无细节增益",
+            "尾段起始噪声 σ（sigma 尾段精化区间的起点）：0.3-0.45 常用；越大越接近重生成（会改写画面内容），越小仅轻修细节",
             (v) => setUpscaleField(node, "denoise", v)));
         body.append(upNumField("二采步数", up.steps, 1, 100, 1,
-            "重去噪步数（总步数×强度的有效步）：15 步起步，追求细节可 20-25",
+            "尾段精化步数：在 [强度σ → 0] 区间内的实际采样步数，与强度解耦（建议 3-8，参考工作流常用 3-5）",
             (v) => setUpscaleField(node, "steps", v)));
         body.append(upNumField("二采 CFG", up.cfg, 0.0, 100.0, 0.1,
             "重采样 CFG：H3 常用 1.0（官方推荐低 CFG），与主链可不同",
