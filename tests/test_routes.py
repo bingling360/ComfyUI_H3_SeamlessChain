@@ -20,9 +20,9 @@ for _p in (os.path.dirname(_HERE), os.path.dirname(os.path.dirname(_HERE)), _HER
 from test_node_structure import _install_stubs
 
 ROUTE_SET = {"/h3chain/ping", "/h3chain/projects", "/h3chain/project",
-             "/h3chain/upscale_models", "/h3chain/create_project", "/h3chain/save_prompts",
-             "/h3chain/delete", "/h3chain/delete_project", "/h3chain/delete_file",
-             "/h3chain/merge", "/h3chain/upscale_reset"}
+             "/h3chain/upscale_models", "/h3chain/experiments", "/h3chain/create_project",
+             "/h3chain/save_prompts", "/h3chain/delete", "/h3chain/delete_project",
+             "/h3chain/delete_file", "/h3chain/merge", "/h3chain/upscale_reset"}
 # 新版前端 api.fetchApi() 强制给非 /api 路径加 /api 前缀（ComfyApi.apiURL），
 # 自定义路由必须同时挂 /api 副本，否则新前端全部 404
 API_ROUTE_SET = {"/api" + p for p in ROUTE_SET}
@@ -281,6 +281,28 @@ def test_upscale_models_endpoint():
         handler = router.table["/h3chain/upscale_models"]
         resp = asyncio.run(handler(_Req()))
         assert resp["json"] == {"ok": True, "models": []}       # stub 无模型目录 -> 空
+
+
+def test_experiments_endpoint():
+    """实验定义下发端点：前端面板唯一数据源；含 force_disabled 与全量参数元数据。"""
+    with _server_env() as (out, router):
+        handler = router.table["/h3chain/experiments"]
+        resp = asyncio.run(handler(_Req()))
+        body = resp["json"]
+        assert body["ok"] is True
+        assert "force_disabled" in body
+        exps = body["experiments"]
+        assert len(exps) == 4
+        ids = {e["id"] for e in exps}
+        assert ids == {"e1_bridge_shard", "e2_memory_anchor", "e3_motion_gate", "e4_transition_res"}
+        for e in exps:
+            assert e["name"] and e["group"] and e["desc"]
+            for p in e["params"]:
+                assert p["key"] and p["type"] in ("num", "enum")
+                if p["type"] == "num":
+                    assert p["min"] <= p["def"] <= p["max"] and p["step"] > 0
+                else:
+                    assert p["def"] in p["opts"]
 
 
 def test_upscale_reset_endpoint():

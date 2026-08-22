@@ -41,6 +41,7 @@ ROUTES = [
     ("GET", "/h3chain/projects"),
     ("GET", "/h3chain/project"),
     ("GET", "/h3chain/upscale_models"),
+    ("GET", "/h3chain/experiments"),
     ("POST", "/h3chain/create_project"),
     ("POST", "/h3chain/save_prompts"),
     ("POST", "/h3chain/delete"),
@@ -172,6 +173,15 @@ def add_routes(routes):
             models = []
         return web.json_response({"ok": True, "models": models})
 
+    async def experiment_defs(request):
+        """实验定义与参数元数据（前端实验面板动态渲染唯一数据源；含后端硬开关状态）。"""
+        try:
+            from . import experiments
+            payload = experiments.experiment_defs_payload()
+        except Exception:
+            payload = {"ok": False, "force_disabled": True, "experiments": []}
+        return web.json_response(payload)
+
     async def upscale_reset(request):
         data = await request.json()
         try:
@@ -185,6 +195,7 @@ def add_routes(routes):
         ("GET", "/h3chain/projects", list_projects),
         ("GET", "/h3chain/project", project_detail),
         ("GET", "/h3chain/upscale_models", upscale_models),
+        ("GET", "/h3chain/experiments", experiment_defs),
         ("POST", "/h3chain/create_project", create_project),
         ("POST", "/h3chain/save_prompts", save_prompts),
         ("POST", "/h3chain/delete", delete),

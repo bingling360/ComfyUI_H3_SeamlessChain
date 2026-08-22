@@ -32,6 +32,42 @@ def test_defs_wellformed():
     for exp_id, meta in experiments.EXPERIMENT_DEFS.items():
         assert meta["name"] and meta["group"] and meta["default"] is False
         assert isinstance(meta["params"], tuple) and meta["params"]
+        # 全量参数元数据（端点下发前端的唯一权威）：与兼容视图一一对应、数值域合法
+        pm = meta["params_meta"]
+        assert [p["key"] for p in pm] == list(meta["params"])
+        for p in pm:
+            assert p["type"] in ("num", "enum")
+            if p["type"] == "num":
+                assert p["min"] <= p["def"] <= p["max"] and p["step"] > 0
+            else:
+                assert p["def"] in p["opts"]
+
+
+def test_experiment_defs_payload():
+    import json
+    payload = experiments.experiment_defs_payload()
+    # JSON 可序列化（端点直接下发）
+    json.dumps(payload, ensure_ascii=False)
+    assert payload["ok"] is True
+    assert "force_disabled" in payload
+    exps = payload["experiments"]
+    assert len(exps) == len(experiments.EXPERIMENT_DEFS)
+    assert {e["id"] for e in exps} == set(experiments.EXPERIMENT_DEFS)
+    for e in exps:
+        assert e["name"] and e["group"] and e["desc"]
+        for p in e["params"]:
+            assert p["key"] and p["type"] in ("num", "enum")
+
+
+def test_nested_on_not_recognized():
+    # 扁平契约唯一：早期嵌套 {on: {...}} 脏数据不再被识别（兼容层已删除）
+    c = experiments.resolve({"experiments": {"on": {"e1_bridge_shard": True}, "params": {}}})
+    assert not c.enabled
+    assert not c.has("e1_bridge_shard")
+    # locked 是前端 UI 键，后端天然忽略、不影响开关与指纹
+    c2 = experiments.resolve({"experiments": {"e1_bridge_shard": True, "locked": False, "params": {}}})
+    assert c2.has("e1_bridge_shard")
+    assert "locked" not in c2.fingerprint()
 
 
 def test_empty_context_false_for_all():
@@ -285,6 +321,8 @@ def test_e3_motion_trigger():
 
 _MAIN = {
     "test_defs_wellformed": test_defs_wellformed,
+    "test_experiment_defs_payload": test_experiment_defs_payload,
+    "test_nested_on_not_recognized": test_nested_on_not_recognized,
     "test_empty_context_false_for_all": test_empty_context_false_for_all,
     "test_parse_on_and_params": test_parse_on_and_params,
     "test_unknown_id_ignored": test_unknown_id_ignored,

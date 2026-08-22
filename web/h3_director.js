@@ -76,64 +76,64 @@ const MODES = [
 const MODE_DEFAULT = "文生视频";
 const MAX_SEG = 64;
 
-/* ---- 实验性功能（镜像后端 experiments.py 的 EXPERIMENT_DEFS）----
- * 状态存进「导演台状态」JSON 的 ds.experiments（不新增画布控件、不进 paramsSig），
- * 由后端 ExperimentContext 归一化：on 只记开启 id，params 记每项参数字典。 */
-const EXPERIMENT_DEFS = [
-    { id: "e1_bridge_shard", name: "强化引导桥 + 段内分片", group: "生成结构",
-      desc: "滑窗/重叠条件采样强化段间桥，单段内拆子片抑制中段漂移",
-      params: [
-          { key: "滑窗token", type: "num", def: 6, min: 1, max: 128, step: 1 },
-          { key: "子片帧数", type: "num", def: 0, min: 0, max: 512, step: 17 },
-          { key: "重叠token", type: "num", def: 2, min: 0, max: 16, step: 1 },
-      ] },
-    { id: "e2_memory_anchor", name: "全局记忆锚", group: "长链记忆",
-      desc: "提取首段关键帧沿整链恒定注入，抑制长链逐段累积漂移",
-      params: [
-          { key: "记忆帧数", type: "num", def: 2, min: 1, max: 8, step: 1 },
-          { key: "注入位置", type: "enum", def: "段首", opts: ["段首", "全程"] },
-      ] },
-    { id: "e3_motion_gate", name: "运动感知闭环门控", group: "闭环调控",
-      desc: "把接缝重摇触发信号从『帧差』扩展为帧差+光流/相机 z-score",
-      params: [
-          { key: "运动z阈值", type: "num", def: 2.0, min: 0.5, max: 6.0, step: 0.1 },
-          { key: "触发动作", type: "enum", def: "重摇", opts: ["重摇", "重锚"] },
-      ] },
-    { id: "e4_transition_res", name: "双向过渡重生成", group: "过渡重采样",
-      desc: "对超阈值缝区做 past|transition|future 双锚 + 缝区独占噪声定向重采样",
-      params: [
-          { key: "过渡窗帧数", type: "num", def: 17, min: 5, max: 512, step: 17 },
-          { key: "重生成步数", type: "num", def: 20, min: 1, max: 100, step: 1 },
-          { key: "双锚强度", type: "num", def: 1.0, min: 0.0, max: 2.0, step: 0.1 },
-      ] },
-];
-const EXPERIMENT_MAP = (() => { const m = {}; for (const e of EXPERIMENT_DEFS) m[e.id] = e; return m; })();
+/* ---- 实验性功能（唯一权威 = 后端 experiments.py，经 /h3chain/experiments 动态拉取）----
+ * 状态存进「导演台状态」JSON 的 ds.experiments（不新增画布控件、不进 paramsSig）。
+ * 契约端到端扁平：ds.experiments = {<id>: true, params: {<id>: {...}}, locked?: bool}
+ * （locked 为前端 UI 主开关状态键，后端 ExperimentContext 只认 defs 内 id 与 params，自动忽略） */
+const EXP = { defs: null, forceDisabled: false, failed: "", loading: null };
 
-function defaultExperiments() {
-    const params = {};
-    for (const e of EXPERIMENT_DEFS) {
-        const pd = {};
-        for (const p of e.params) pd[p.key] = p.def;
-        params[e.id] = pd;
-    }
-    return { on: {}, params };
+function loadExperimentDefs() {
+    if (EXP.defs || EXP.loading) return EXP.loading;    // 幂等：已缓存/在途不重复拉
+    EXP.failed = "";
+    EXP.loading = apiGet("/h3chain/experiments").then((r) => {
+        if (r.ok && Array.isArray(r.data?.experiments)) {
+            EXP.defs = r.data.experiments;
+            EXP.forceDisabled = !!r.data.force_disabled;
+        } else {
+            EXP.failed = `HTTP ${r.status || "??"}`;
+        }
+        EXP.loading = null;
+        scheduleRefresh(0);                              // defs 到达后触发面板重渲
+    }).catch(() => { EXP.failed = "network"; EXP.loading = null; scheduleRefresh(0); });
+    return EXP.loading;
 }
 
-/* 从导演台状态 raw.experiments 归一化：只认已知 id，参数字典合并前端默认值 */
-function normalizeExperiments(raw) {
-    const out = defaultExperiments();
-    if (raw && typeof raw === "object") {
-        for (const e of EXPERIMENT_DEFS) { if (raw[e.id] === true) out.on[e.id] = true; }
-        const rp = raw.params && typeof raw.params === "object" ? raw.params : {};
-        for (const e of EXPERIMENT_DEFS) {
-            const src = rp[e.id] && typeof rp[e.id] === "object" ? rp[e.id] : {};
-            for (const p of e.params) {
-                if (p.type === "num") {
-                    const n = Number(src[p.key]);
-                    out.params[e.id][p.key] = isFinite(n) ? Math.min(p.max, Math.max(p.min, n)) : p.def;
-                } else if (p.opts && p.opts.includes(src[p.key])) {
-                    out.params[e.id][p.key] = src[p.key];
-                }
+function defaultExperiments(defs = EXP.defs) {
+    const out = { params: {} };
+    for (const e of defs || []) {
+        const pd = {};
+        for (const p of e.params || []) pd[p.key] = p.def;
+        out.params[e.id] = pd;
+    }
+    return out;
+}
+
+/* 扁平归一：defs 未到达时宽进（布尔 true 键与参数字典原样保留，避免 defs 到达前的
+ * 早窗口期 setDs 把已存参数清掉；未知 id 交给后端过滤）；
+ * defs 到达后严进（只认已知 id），参数按 defs 元数据钳位/白名单；
+ * locked 键透传（前端主开关 UI 状态）。 */
+function normalizeExperiments(raw, defs = EXP.defs) {
+    const out = defaultExperiments(defs);
+    if (!raw || typeof raw !== "object") return out;
+    if (typeof raw.locked === "boolean") out.locked = raw.locked;
+    for (const [k, v] of Object.entries(raw)) {
+        if (k === "params" || k === "locked" || v !== true) continue;
+        if (defs && !defs.some((e) => e.id === k)) continue;
+        out[k] = true;
+    }
+    const rp = raw.params && typeof raw.params === "object" ? raw.params : {};
+    if (!defs) {
+        out.params = JSON.parse(JSON.stringify(rp));   // 宽进：参数字典深拷贝透传
+        return out;
+    }
+    for (const e of defs) {
+        const src = rp[e.id] && typeof rp[e.id] === "object" ? rp[e.id] : {};
+        for (const p of e.params || []) {
+            if (p.type === "num") {
+                const n = Number(src[p.key]);
+                out.params[e.id][p.key] = isFinite(n) ? Math.min(p.max, Math.max(p.min, n)) : p.def;
+            } else if (p.opts && p.opts.includes(src[p.key])) {
+                out.params[e.id][p.key] = src[p.key];
             }
         }
     }
@@ -371,21 +371,50 @@ function remapOldWidgetValues(wv) {
     ];
 }
 
-/* 导演台时代（25 值）→ 统一接缝后端（35 值）：尾部错位修正。
- * 仅用于导入「导演台时代」极老工作流（widgets_values.length === 25）。
- * 第二阶段剔除后后端已不再有潜空间精修/像素混合/智能切镜，接缝区仅保留
- * 重摇/锚定/递减；此处仍按 25→35 顺序重排（防止生成模式/导演台状态错位），
- * 残余的已删控件默认值会被 ComfyUI 按当前控件顺序自然截断，不影响新布局。 */
-const V25_WIDGET_COUNT = 25;   // 24 控件 + 种子 control 占 1 位
-const SEAM_LEGACY_MAP = { "smoothstep": "smoothstep像素混合", "潜空间精修": "潜空间精修", "关闭": "关闭" };
-const V35_SEAM_DEFAULTS = [0.45, "39", "自动", 0.06, 1, "关闭", "关闭", 17, 48, "开启"];
+/* 旧版工作流 widget 布局迁移到当前 28 值 schema。
+ * 当前后端 define_schema 共 28 个控件值（27 控件 + 种子 control 占 1 位）。
+ * 第二阶段提交 7435084 剔除了 8 个接缝/精修控件（接缝处理/混合帧数/精修强度/
+ * 精修窗口/智能切镜/切镜最多丢帧/全链丢弃预算/自适应精修）并新增「自动成片」，
+ * 旧 35 值布局因此中段错位、缺自动成片；更早的「导演台时代」极老工作流为 25 值。
+ * 下面统一把这两种（及任意短于 28 的）旧布局直接映射到当前 28 值：
+ * 头部 0..16 位与当前一致，中段已删控件取当前默认值，自动成片插在生成模式前，
+ * 生成模式/导演台状态从尾部取，缺失尾部按默认值补齐。 */
+const V35_WIDGET_COUNT = 35;   // 第二阶段剔除控件后、未加自动成片的陈旧布局
+const CUR_WIDGET_COUNT = 28;   // 当前 schema 控件值总数
 
-function remapV25WidgetValues(wv) {
-    const out = wv.slice(0, 23);             // 宽高比…重跑起始段（0..22 位布局不变）
-    out[17] = SEAM_LEGACY_MAP[out[17]] || "标准";   // 接缝混合旧值 → 接缝处理
-    out.push(...V35_SEAM_DEFAULTS);          // 新增 10 个接缝控件取后端默认值
-    out.push(...wv.slice(23));               // 生成模式 / 导演台状态原样保留
-    return out;
+// 当前 schema「中段」默认值（位置 17..26）：锚定加噪, 审片模式, 自动保存, 重跑起始段,
+// 接缝重摇, 重摇阈值, 重摇上限, 递减锚定, 自动成片
+const CUR_MID_DEFAULTS = [0.0, "关闭", "分段", 0, "自动", 0.06, 1, "关闭", "开启"];
+
+// 旧 35 值布局中、与当前控件一一对应的源下标
+const V35_PICK = {
+    aod: 19, review: 20, autosave: 21, rerun: 22,   // 锚定加噪, 审片模式, 自动保存, 重跑起始段
+    reseam: 25, resth: 26, resmax: 27, decr: 29,    // 接缝重摇, 重摇阈值, 重摇上限, 递减锚定
+    genmode: 33, ds: 34,                            // 生成模式, 导演台状态
+};
+
+/* 旧布局 wv → 当前 28 值布局。头部 0..16 原样；中段 8 个控件从 V35 对应位取
+ * （更老布局这些位不存在则取 CUR_MID_DEFAULTS）；自动成片固定 "开启"；
+ * 生成模式/导演台状态取尾部（35 值取末两位，更老布局取最后两元素）。 */
+function remapOldWidgetValuesToCurrent(wv) {
+    const head = wv.slice(0, 17);                    // 宽高比…回退上限（0..16）
+    const pick = (i) => (i < wv.length ? wv[i] : undefined);
+    const body = [
+        pick(V35_PICK.aod), pick(V35_PICK.review), pick(V35_PICK.autosave), pick(V35_PICK.rerun),
+        pick(V35_PICK.reseam), pick(V35_PICK.resth), pick(V35_PICK.resmax), pick(V35_PICK.decr),
+    ];
+    for (let i = 0; i < body.length; i++) {
+        if (body[i] === undefined) body[i] = CUR_MID_DEFAULTS[i];
+    }
+    const tailGen = (wv.length >= V35_WIDGET_COUNT) ? pick(V35_PICK.genmode) : wv[wv.length - 2];
+    const tailDs = (wv.length >= V35_WIDGET_COUNT) ? pick(V35_PICK.ds) : wv[wv.length - 1];
+    return [
+        ...head,
+        ...body,
+        (tailGen !== undefined ? tailGen : "文生视频"),  // 生成模式（idx25）
+        "开启",                                         // 自动成片（新增控件，恒开启，idx26）
+        (tailDs !== undefined ? tailDs : ""),           // 导演台状态（应为 JSON 字符串，idx27）
+    ];
 }
 
 function migrateGraphWidgets(graphData) {
@@ -393,17 +422,18 @@ function migrateGraphWidgets(graphData) {
     let migrated = 0;
     for (const n of graphData.nodes) {
         if (n.type !== NODE_TYPE || !Array.isArray(n.widgets_values) || !n.widgets_values.length) continue;
+        const wv = n.widgets_values;
+        // 已是当前合法布局则跳过；否则（极老数字首项 / 35 值陈旧 / 其它长短不一）统一迁移
+        const legacy = (typeof wv[0] !== "string") || (wv.length !== CUR_WIDGET_COUNT);
+        if (!legacy) continue;
         try {
-            if (typeof n.widgets_values[0] !== "string") {
-                n.widgets_values = remapOldWidgetValues(n.widgets_values);
-                migrated += 1;
-            } else if (n.widgets_values.length === V25_WIDGET_COUNT) {
-                n.widgets_values = remapV25WidgetValues(n.widgets_values);
-                migrated += 1;
-            }
-        } catch (e) { /* 解析失败保持原样，交给兜底修正 */ }
+            n.widgets_values = remapOldWidgetValuesToCurrent(wv);
+            migrated += 1;
+        } catch (e) {
+            console.warn(`[h3-director] 节点 ${n.type} 参数迁移失败，保持原样交由兜底修正`, e);
+        }
     }
-    if (migrated) console.log(`[h3-director] 已迁移 ${migrated} 个旧版 H3 节点的参数（旧布局 → 宽高比+百万像素+秒 / 统一接缝后端）`);
+    if (migrated) console.log(`[h3-director] 已迁移 ${migrated} 个旧版 H3 节点的参数（旧布局 → 当前 28 控件）`);
     return graphData;
 }
 
@@ -553,6 +583,7 @@ function setDs(node, ds) {
         ds.ref_images = ds.ref_assets.filter((a) => (a.kind || "image") === "image")
             .map((a) => String(a.file));
     }
+    /* 实验开关已是端到端扁平契约 {<id>:true, params:{...}}，直接序列化即存档格式 */
     w.value = JSON.stringify(ds);
     if (typeof w.callback === "function") {
         try { w.callback(w.value); } catch (e) { /* callback 可选 */ }
@@ -905,9 +936,13 @@ async function loadDefaultWorkflow() {
     }
     if (!confirm("将载入配套工作流并替换当前画布（未保存的画布修改会丢失），继续？")) return;
     try {
-        await app.loadGraphData(JSON.parse(JSON.stringify(window.H3_DEFAULT_WORKFLOW)));
+        const p = app.loadGraphData(JSON.parse(JSON.stringify(window.H3_DEFAULT_WORKFLOW)));
+        // 新版 ComfyUI 前端 loadGraphData 返回 Promise；极老旧前端返回 undefined，按成功降级处理
+        if (p && typeof p.then === "function") await p;
     } catch (e) {
-        console.warn("[h3-director] loadGraphData 返回值非 Promise（旧版前端），忽略", e);
+        console.error("[h3-director] 载入配套工作流失败", e);
+        alert("载入配套工作流失败：" + (e && e.message ? e.message : e) + "\n请检查 H3_DEFAULT_WORKFLOW 模板与当前后端节点版本是否一致。");
+        return;
     }
     await new Promise((r) => setTimeout(r, 150));
     const node = findNode();
@@ -1405,6 +1440,7 @@ async function collectData() {
         if (r.ok) projects = r.data?.projects || [];
         const um = await apiGet("/h3chain/upscale_models");
         if (um.ok) upscaleModels = um.data?.models || [];
+        loadExperimentDefs();    // 实验定义随刷新周期尽早到达（函数自身幂等）
     }
     setApiError(ping.ok ? "" :
         `项目存档接口未注册（HTTP ${ping.status || "??"}）：请重启 ComfyUI 并检查控制台是否出现`
@@ -1732,11 +1768,19 @@ function injectStyles() {
     .h3d-select:focus,.h3d-seedrow input:focus{border-color:#a8d8bd}
     /* 实验性功能面板 */
     .h3d-expsec{padding-bottom:14px}
-    .h3d-exp-top{display:flex;gap:8px;align-items:center;padding:10px 12px 4px}
+    .h3d-exp-sec{margin:0 0 4px}
+    .h3d-exp-sec>summary{display:flex;gap:8px;align-items:center;padding:10px 12px;cursor:pointer;list-style:none;user-select:none;flex-wrap:wrap}
+    .h3d-exp-sec>summary::-webkit-details-marker{display:none}
+    .h3d-exp-sec>summary::before{content:"▸";color:var(--h3d-muted);font-size:11px}
+    .h3d-exp-sec[open]>summary::before{content:"▾";color:var(--h3d-cyan)}
+    .h3d-exp-sec>summary small{color:var(--h3d-muted);font-weight:400}
+    .h3d-exp-sec>summary .h3d-btn{margin-left:auto}
+    .h3d-exp-ban{margin:8px 12px 0;padding:7px 10px;border:1px solid #9a4144;border-radius:7px;background:#402227;color:#f0a0a4;font-size:11.5px;line-height:1.6}
     .h3d-exp-card{margin:8px 12px 0;border:1px solid #332f27;border-radius:9px;background:#1b1a16;overflow:hidden}
     .h3d-exp-card.on{border-color:#3f6b52;box-shadow:inset 3px 0 0 var(--h3d-cyan)}
     .h3d-exp-head{display:flex;gap:8px;align-items:center;padding:9px 10px}
     .h3d-exp-head input[type=checkbox]{accent-color:#7fc79f;width:15px;height:15px;cursor:pointer}
+    .h3d-exp-head input[type=checkbox]:disabled{opacity:.35;cursor:not-allowed}
     .h3d-exp-head strong{font-size:12px;flex:1;min-width:0}
     .h3d-exp-desc{display:block;padding:0 10px 9px;color:var(--h3d-muted);font-size:11px;line-height:1.55}
     .h3d-exp-params{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px;border-top:1px solid #2a261f}
@@ -1941,8 +1985,10 @@ function updateDesk(data) {
         z.rParams.dataset.sig = psig;
         renderParamsZone(z.rParams, data);
     }
-    /* 实验性功能面板（ds.experiments 驱动；编辑中不重建防丢焦） */
-    const esig = JSON.stringify(data.ds?.experiments ?? {});
+    /* 实验性功能面板（ds.experiments 驱动；编辑动作经 setExp* -> repaintExperiments() 即时重渲，
+     * 不走此守卫；此处守卫仅为保护「全局刷新时区内有输入框正在打字」不丢焦；defs 到达/失败/硬开关变化也触发） */
+    const esig = JSON.stringify([data.ds?.experiments ?? {},
+        EXP.defs ? EXP.defs.length : 0, EXP.forceDisabled, EXP.failed]);
     if (!z.rExp.contains(document.activeElement) && z.rExp.dataset.sig !== esig) {
         z.rExp.dataset.sig = esig;
         renderExperimentsZone(z.rExp, data);
@@ -2837,106 +2883,168 @@ function renderParamsZone(sec, data) {
         "全部节点参数已收纳于此：改「高级设置」同样随工作流保存；「生成模式」由左侧模式条控制。"));
 }
 
-/* ---- 实验性功能面板（右栏，ds.experiments 驱动；默认全关，可单独/任意组合开启） ---- */
+/* ---- 实验性功能面板（右栏，ds.experiments 扁平契约 {<id>:true, params:{...}} 驱动） ---- */
 
-function expActive(node) {
-    return Object.keys((getDs(node)?.experiments || {}).on || {}).length;
+function expActiveList(ex) { return Object.keys(ex || {}).filter((k) => ex[k] === true); }
+
+/* 主开关锁定态：ds JSON 里的 locked 键优先；缺省时 有开启=解锁 / 全关=锁定。
+ * locked 持久化进 ds JSON（后端 ExperimentContext 只认 defs 内 id 与 params，自动忽略该键），
+ * 保证刷新页面后「启用实验功能」的解锁选择不丢失。 */
+function expLocked(ex) {
+    if (ex && typeof ex.locked === "boolean") return ex.locked;
+    return expActiveList(ex).length === 0;
 }
 
 /* 落盘实验开关/参数并联动重渲面板（切换实验组合由后端指纹判整链重做） */
 function setExpOn(node, id, on) {
     const ds = getDs(node);
-    if (on) ds.experiments.on[id] = true;
-    else delete ds.experiments.on[id];
+    if (on) ds.experiments[id] = true;
+    else delete ds.experiments[id];
     setDs(node, ds);
-    scheduleRefresh(0);
+    repaintExperiments();        // 勾选后参数区当场出现（任意编辑动作即时重渲）
 }
 
 function setExpParam(node, id, key, value) {
     const ds = getDs(node);
-    ds.experiments.params[id][key] = value;
+    (ds.experiments.params[id] = ds.experiments.params[id] || {})[key] = value;
     setDs(node, ds);
-    scheduleRefresh(0);
+    repaintExperiments();
 }
 
-function setExpAll(node, on) {
+/* 主开关：true=锁定（全部关闭并禁用子项），false=解锁（子项可勾选，仍保持全关） */
+function setExpLocked(node, locked) {
     const ds = getDs(node);
-    ds.experiments.on = {};
-    if (on) for (const e of EXPERIMENT_DEFS) ds.experiments.on[e.id] = true;
+    if (locked) for (const id of expActiveList(ds.experiments)) delete ds.experiments[id];
+    ds.experiments.locked = !!locked;
     setDs(node, ds);
-    scheduleRefresh(0);
+    repaintExperiments();   // 任意编辑动作即时重渲（绕过 updateDesk 焦点守卫）
+}
+
+/* 实验面板局部重渲：编辑动作（勾选/改参/主开关）后即时反映，不依赖全局 refresh，
+ * 因而绕过 updateDesk 的「焦点在区内则不重建」守卫——那些守卫是为保护全局刷新时
+ * 正在输入的文本框而设；而此处都是「提交型」编辑：勾选框提交后即重建无妨，数值输入
+ * 走 onchange（提交时焦点本就离开）。直接读画布控件，零网络往返，点一下当场更新
+ * （参数区出现 / 父级徽章计数 / 子项禁用态）。父级 <details> 折叠态由 renderExperimentsZone 自身保留。
+ * 同步更新 rExp.dataset.sig，避免紧随的全局 refresh 因签名已一致而重复重建。 */
+function repaintExperiments() {
+    if (!desk) return;
+    const z = desk.zones;
+    if (!z.rExp) return;
+    try {
+        const node = findNode();
+        const ds = node ? getDs(node) : {};
+        const esig = JSON.stringify([ds?.experiments ?? {},
+            EXP.defs ? EXP.defs.length : 0, EXP.forceDisabled, EXP.failed]);
+        z.rExp.dataset.sig = esig;   // 与 updateDesk 同公式，防止后续全局刷新重复重建
+        renderExperimentsZone(z.rExp, { node });
+    } catch (e) {
+        console.warn("[h3-director] repaintExperiments failed:", e);
+    }
 }
 
 function renderExperimentsZone(sec, data) {
     const { node } = data;
+    // 重渲前记住父级折叠态，避免每次 setDs 触发的重渲把面板弹回默认
+    const wasOpen = sec.querySelector("details.h3d-exp-sec")?.open;
     sec.replaceChildren();
     if (!node) {
         sec.append(el("div", "h3d-empty", "画布上未找到节点，实验性功能面板不可用"));
         return;
     }
+    loadExperimentDefs();   // 兜底触发（幂等）
     const ds = getDs(node);
-    const on = ds.experiments?.on || {};
-    sec.append(el("div", "h3d-sechead",
-        "<strong>🧪 实验性功能</strong><small>生成期干预 · 默认全关 · 逐项试效果再试组合</small>"));
-    if (node) {
-        const top = el("div", "h3d-exp-top");
-        const active = Object.keys(on).length;
-        const offbtn = el("button", "h3d-btn h3d-btn-warn" + (active ? "" : " disabled"),
-            active ? `✕ 全部关闭（当前${active}项）` : "✓ 全部关闭（已全关）");
-        offbtn.title = "一键关闭所有实验。建议逐项开启实测，再试着组合——不同实验组合会触发对应段重新生成（后端指纹），结论请用同一项目文件夹对比。";
-        offbtn.onclick = () => { if (active) setExpAll(node, false); };
-        top.append(offbtn);
-        if (active) top.append(badge(`开启 ${active} 项`, "cyan"));
-        sec.append(top);
-    }
-    for (const e of EXPERIMENT_DEFS) {
-        const isOn = !!on[e.id];
-        const card = el("div", "h3d-exp-card" + (isOn ? " on" : ""));
-        const head = el("div", "h3d-exp-head");
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.checked = isOn;
-        cb.onchange = () => setExpOn(node, e.id, cb.checked);
-        head.append(cb);
-        head.append(el("strong", "", escapeHtml(e.name)));
-        head.append(badge(e.group, "media"));
-        card.append(head);
-        card.append(el("small", "h3d-exp-desc", escapeHtml(e.desc)));
-        const paramBox = el("div", "h3d-exp-params");
-        for (const p of e.params) {
-            const row = el("div", "h3d-param");
-            row.append(el("label", "", escapeHtml(p.key)));
-            if (p.type === "enum" && p.opts) {
-                const sel = document.createElement("select");
-                sel.className = "h3d-select";
-                for (const v of p.opts) {
-                    const o = document.createElement("option");
-                    o.value = v; o.textContent = v;
-                    if (String(v) === String(ds.experiments.params[e.id][p.key])) o.selected = true;
-                    sel.append(o);
-                }
-                sel.onchange = () => setExpParam(node, e.id, p.key, sel.value);
-                row.append(sel);
-            } else {
-                const inp = document.createElement("input");
-                inp.type = "number";
-                inp.value = ds.experiments.params[e.id][p.key];
-                inp.min = String(p.min); inp.max = String(p.max); inp.step = String(p.step);
-                inp.addEventListener("wheel", (ev) => ev.preventDefault(), { passive: false });
-                inp.onchange = () => {
-                    const n = Number(inp.value);
-                    if (isFinite(n)) setExpParam(node, e.id, p.key, Math.min(p.max, Math.max(p.min, n)));
-                };
-                row.append(inp);
-            }
-            paramBox.append(row);
+    const ex = ds.experiments || {};
+    const active = expActiveList(ex).length;
+    const locked = expLocked(ex);
+
+    // 父级单 <details> 折叠（与「高级设置」一致）；子卡不折叠
+    const det = el("details", "h3d-exp-sec");
+    det.open = wasOpen ?? active > 0;          // 首次：有开启项默认展开，全关默认收起
+    const sum = document.createElement("summary");
+    sum.insertAdjacentHTML("beforeend",
+        "<strong>🧪 实验性功能</strong><small>生成期干预 · 默认全关 · 逐项试效果再试组合</small>");
+    if (active) sum.insertAdjacentHTML("beforeend", badge(`开启 ${active} 项`, "cyan"));
+    // 主开关：永远真实可按（不用 disabled 属性）；点在 summary 里须阻止折叠联动
+    const msbtn = el("button", "h3d-btn " + (locked ? "h3d-btn-cyan" : "h3d-btn-warn"),
+        locked ? "▶ 启用实验功能" : `✕ 全部关闭（当前${active}项）`);
+    msbtn.title = locked
+        ? "解锁下方实验复选框（仍保持全关，逐项手动开启）"
+        : "一键关闭所有实验并锁定复选框；不同实验组合会触发对应段重新生成（后端指纹），结论请用同一项目文件夹对比。";
+    msbtn.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); setExpLocked(node, !locked); };
+    sum.append(msbtn);
+    det.append(sum);
+
+    if (EXP.forceDisabled) {
+        det.append(el("div", "h3d-exp-ban",
+            "后端已强制关闭实验性功能（H3_EXPERIMENTS=0），以下开关不生效。"));
+    } else if (!EXP.defs) {
+        det.append(el("div", "h3d-empty", EXP.failed
+            ? `实验定义拉取失败（${EXP.failed}）：请确认后端已重启、路由已注册。`
+            : "实验定义加载中…"));
+        if (EXP.failed) {
+            const retry = el("button", "h3d-btn", "重试");
+            retry.onclick = () => { EXP.failed = ""; loadExperimentDefs(); };
+            det.append(retry);
         }
-        card.append(paramBox);
-        sec.append(card);
+    } else {
+        for (const e of EXP.defs) {
+            const isOn = ex[e.id] === true;
+            const card = el("div", "h3d-exp-card" + (isOn ? " on" : ""));
+            const head = el("div", "h3d-exp-head");
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.checked = isOn;
+            cb.disabled = locked || EXP.forceDisabled;   // 锁定/后端强制关闭时子项灰显不可选
+            cb.onchange = () => setExpOn(node, e.id, cb.checked);
+            head.append(cb);
+            head.append(el("strong", "", escapeHtml(e.name)));
+            head.insertAdjacentHTML("beforeend", badge(e.group, "media"));  // badge 返回 HTML 字符串，须以 HTML 方式插入
+            card.append(head);
+            card.append(el("small", "h3d-exp-desc", escapeHtml(e.desc)));
+            // 参数区：仅该实验开启时渲染；setExpOn -> repaintExperiments() 保证勾选即现
+            if (isOn) {
+                const paramBox = el("div", "h3d-exp-params");
+                for (const p of e.params || []) {
+                    const row = el("div", "h3d-param");
+                    row.append(el("label", "", escapeHtml(p.key)));
+                    const cur = ds.experiments.params?.[e.id]?.[p.key] ?? p.def;
+                    if (p.type === "enum" && p.opts) {
+                        const sel = document.createElement("select");
+                        sel.className = "h3d-select";
+                        for (const v of p.opts) {
+                            const o = document.createElement("option");
+                            o.value = v; o.textContent = v;
+                            if (String(v) === String(cur)) o.selected = true;
+                            sel.append(o);
+                        }
+                        sel.onchange = () => setExpParam(node, e.id, p.key, sel.value);
+                        row.append(sel);
+                    } else {
+                        // 包 .h3d-seedrow 命中既有深色 width:100% 样式，避免浏览器默认亮色/宽度溢出
+                        const sr = el("div", "h3d-seedrow");
+                        const inp = document.createElement("input");
+                        inp.type = "number";
+                        inp.value = cur;
+                        inp.min = String(p.min); inp.max = String(p.max); inp.step = String(p.step);
+                        inp.addEventListener("wheel", (ev) => ev.preventDefault(), { passive: false });
+                        inp.onchange = () => {
+                            const n = Number(inp.value);
+                            if (isFinite(n)) setExpParam(node, e.id, p.key, Math.min(p.max, Math.max(p.min, n)));
+                        };
+                        sr.append(inp);
+                        row.append(sr);
+                    }
+                    paramBox.append(row);
+                }
+                card.append(paramBox);
+            }
+            det.append(card);
+        }
+        det.append(el("div", "h3d-foot",
+            "全部默认关闭；切换实验组合会触发对应段重新生成（改存档指纹判定整链重做）。"
+            + "逐项开启试效果，再试组合；结论请用同一项目文件夹对比，避免缓存污染。"));
     }
-    sec.append(el("div", "h3d-foot",
-        "全部默认关闭；切换实验组合会触发对应段重新生成（改存档指纹判定整链重做）。"
-        + "逐项开启试效果，再试组合；结论请用同一项目文件夹对比，避免缓存污染。"));
+    sec.append(det);
 }
 
 /* ---- 潜空间放大二采面板（右栏，独立后处理通道：主链完成后的清扫执行） ---- */

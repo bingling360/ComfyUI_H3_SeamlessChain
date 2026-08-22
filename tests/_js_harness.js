@@ -5,7 +5,7 @@ let src = fs.readFileSync(path.join(__dirname, "../web/h3_director.js"), "utf8")
 src = src
     .replace('import { app } from "/scripts/app.js";', "const app = { graph: null, registerExtension() {} };")
     .replace('import { api } from "/scripts/api.js";', "const api = { addEventListener() {}, fetchApi: async () => ({ ok: true }) };");
-const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapV25WidgetValues, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, toggleUpscaleInclude, upTargetCanvas };")(() => {}, () => true);
+const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapOldWidgetValuesToCurrent, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, toggleUpscaleInclude, upTargetCanvas, defaultExperiments, normalizeExperiments, expActiveList, expLocked };")(() => {}, () => true);
 let fails = 0;
 function eq(name, got, want) {
     const ok = JSON.stringify(got) === JSON.stringify(want);
@@ -45,19 +45,23 @@ eq("迁移尾部保留", remapped.slice(8), [25, 1.0, "res_multistep", "simple"]
 const remapped2 = mod.remapOldWidgetValues([1344, 768, 124, "22", 9, "randomize", 30, 2.0]);
 eq("迁移命中组合", remapped2.slice(0, 7), ["16:9", 0.98, 1344, 768, 5.2, "22", 9]);
 
-/* 导演台时代 25 值 → 统一接缝后端 35 值：头部不变、接缝混合映射、新控件默认值插入、尾部保留 */
-const v25 = ["16:9", "0.5", 864, 480, 5.0, "22", 0, "fixed", 25, 1.0,
+/* 旧布局（35 值陈旧 / 25 值导演台时代，两者 0..22 位一致）→ 当前 28 值 schema：
+ * 头部 0..16 不变，中段按当前控件取位（V25 缺失的接缝四件取默认），
+ * 生成模式(idx25)/自动成片(idx26 恒"开启")/导演台状态(idx27) 落尾 */
+const v35old = ["16:9", 0.5, 864, 480, 5.0, "22", 0, "fixed", 25, 1.0,
     "res_multistep", "simple", "关闭", "", "标注", 30.0, 34,
-    "smoothstep", 6, 0.0, "关闭", "分段", 0, "多参视频", "{\"prompts\":[\"x\"]}"];
-const v35 = mod.remapV25WidgetValues(v25);
-eq("v25→v35 长度", v35.length, 35);
-eq("v25→v35 头部不变", v35.slice(0, 17), v25.slice(0, 17));
-eq("v25→v35 接缝混合映射", v35[17], "smoothstep像素混合");
-eq("v25→v35 混合帧数保留", v35[18], 6);
-eq("v25→v35 新控件默认值", v35.slice(23, 33), [0.45, "39", "自动", 0.06, 1, "关闭", "关闭", 17, 48, "开启"]);
-eq("v25→v35 尾部保留", v35.slice(33), ["多参视频", "{\"prompts\":[\"x\"]}"]);
-const v35b = mod.remapV25WidgetValues(v25.map((v, i) => (i === 17 ? "关闭" : v)));
-eq("v25→v35 关闭值保留", v35b[17], "关闭");
+    "标准", 6, 0.0, "关闭", "分段", 0, 0.45, "39", "自动", 0.06, 1,
+    "关闭", "关闭", 17, 48, "开启", "多参视频", "{\"prompts\":[\"x\"]}"];
+const mig35 = mod.remapOldWidgetValuesToCurrent(v35old);
+eq("v35→v28 长度", mig35.length, 28);
+eq("v35→v28 头部不变", mig35.slice(0, 17), v35old.slice(0, 17));
+eq("v35→v28 中段取位", mig35.slice(17, 25), [0.0, "关闭", "分段", 0, "自动", 0.06, 1, "关闭"]);
+eq("v35→v28 尾部", mig35.slice(25), ["多参视频", "开启", "{\"prompts\":[\"x\"]}"]);
+const v25old = v35old.slice(0, 23).concat(["文生视频", ""]);   // 25 值：尾部为生成模式/导演台状态
+const mig25 = mod.remapOldWidgetValuesToCurrent(v25old);
+eq("v25→v28 长度", mig25.length, 28);
+eq("v25→v28 中段取位+默认", mig25.slice(17, 25), [0.0, "关闭", "分段", 0, "自动", 0.06, 1, "关闭"]);
+eq("v25→v28 尾部", mig25.slice(25), ["文生视频", "开启", ""]);
 
 /* v1 状态迁移 + v2 读写回环 */
 const node = { widgets: [{ name: "导演台状态", value: JSON.stringify({ mode: "多参视频", prompts: ["画面"], ref_images: ["a.png", "b.png"] }) }], setDirtyCanvas() {} };
@@ -202,6 +206,46 @@ eq("目标画布 1.5x", mod.upTargetCanvas(nodeC, 1.5), "2016×1152");
 eq("目标画布 2.6x 取偶", mod.upTargetCanvas(nodeC, 2.6), "3488×2016");
 eq("目标画布缺控件", mod.upTargetCanvas({}, 2), "");
 
+/* ---- 实验性功能（扁平契约 + 主开关）：注入迷你 defs 无头校验 ---- */
+const MINI_DEFS = [
+    { id: "e1_test", name: "测试1", group: "g", desc: "d", params: [
+        { key: "强度", type: "num", def: 5, min: 0, max: 10, step: 1 },
+        { key: "模式", type: "enum", def: "甲", opts: ["甲", "乙"] },
+    ] },
+    { id: "e2_test", name: "测试2", group: "g", desc: "d", params: [] },
+];
+eq("defaultExperiments 注入 defs", mod.defaultExperiments(MINI_DEFS),
+    { params: { e1_test: { "强度": 5, "模式": "甲" }, e2_test: {} } });
+const flatIn = { e1_test: true, locked: false, ghost: true,
+    params: { e1_test: { "强度": 99, "模式": "丙" } } };
+const n1 = mod.normalizeExperiments(flatIn, MINI_DEFS);
+eq("扁平 normalize 保留已知开关", n1.e1_test, true);
+eq("扁平 normalize 丢弃未知 id", "ghost" in n1, false);
+eq("扁平 normalize locked 透传", n1.locked, false);
+eq("num 钳位到 max", n1.params.e1_test["强度"], 10);
+eq("enum 白名单回退默认", n1.params.e1_test["模式"], "甲");
+const n2 = mod.normalizeExperiments(flatIn, null);      // defs 未到达宽进
+eq("宽进保留未知布尔键", n2.ghost, true);
+eq("宽进参数字典透传", n2.params, flatIn.params);
+eq("宽进 locked 透传", n2.locked, false);
+/* setDs 回环：写入扁平契约，JSON 原文无 on 键、locked 持久化 */
+const nodeE = { widgets: [{ name: "导演台状态", value: "" }], setDirtyCanvas() {} };
+const dsE = mod.getDs(nodeE);
+dsE.experiments = mod.normalizeExperiments({ e1_test: true, locked: false,
+    params: { e1_test: { "强度": 7, "模式": "乙" } } }, MINI_DEFS);
+mod.setDs(nodeE, dsE);
+const rawE = JSON.parse(nodeE.widgets[0].value);
+ok("存档为扁平契约", rawE.experiments.e1_test === true && !("on" in rawE.experiments));
+eq("locked 持久化", rawE.experiments.locked, false);
+eq("参数随存档保留", rawE.experiments.params.e1_test["强度"], 7);
+const dsE2 = mod.getDs(nodeE);
+ok("回环保留开关（宽进）", dsE2.experiments.e1_test === true);
+/* 主开关逻辑：缺省推导 + 显式 locked 优先 */
+eq("主开关缺省 全关=锁定", mod.expLocked({ params: {} }), true);
+eq("主开关缺省 有开启=解锁", mod.expLocked({ e1_test: true, params: {} }), false);
+eq("主开关显式 locked 优先", mod.expLocked({ e1_test: true, locked: true, params: {} }), true);
+eq("expActiveList 只认 true 键", mod.expActiveList({ e1_test: true, locked: false, params: {} }), ["e1_test"]);
+
 /* ---- 默认工作流模板结构校验 ---- */
 const tplSrc = fs.readFileSync(path.join(__dirname, "../web/h3_default_workflow.js"), "utf8");
 const sandbox = new Function("window", tplSrc);
@@ -246,11 +290,12 @@ if (wf) {
     }
     /* 分段视频不再单独打包：改由主节点「自动保存」存进项目文件夹（导演台段卡片预览） */
     ok("无遗留分段打包链", ![...byId.values()].some((n) => n.type === "CreateVideo" || n.type === "SaveVideo"));
-    /* widgets_values 顺序与后端 schema 控件数一致（35 项 = 34 控件 + 种子 control 占 1 位） */
-    eq("主节点 widgets 数量", h3n.widgets_values.length, 35);
+    /* widgets_values 顺序与后端 schema 控件数一致（28 项 = 27 控件 + 种子 control 占 1 位） */
+    eq("主节点 widgets 数量", h3n.widgets_values.length, 28);
     eq("百万像素浮点默认 0.5", h3n.widgets_values[1], 0.5);
-    eq("主节点接缝处理默认值", h3n.widgets_values[17], "标准");
-    eq("主节点生成模式/导演台状态尾部", h3n.widgets_values.slice(33), ["文生视频", ""]);
+    eq("主节点锚定加噪默认值", h3n.widgets_values[17], 0.0);
+    eq("主节点自动保存默认值", h3n.widgets_values[19], "分段");
+    eq("主节点尾部 生成模式/自动成片/导演台状态", h3n.widgets_values.slice(25), ["文生视频", "开启", ""]);
     /* last_link_id / last_node_id 覆盖全部 */
     eq("last_node_id", wf.last_node_id, Math.max(...wf.nodes.map((n) => n.id)));
     eq("last_link_id", wf.last_link_id, Math.max(...wf.links.map((l) => l[0])));

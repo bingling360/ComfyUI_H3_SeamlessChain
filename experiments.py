@@ -20,6 +20,8 @@
 import os
 
 # 实验定义与参数槽位（前端面板据此渲染；放顺序即面板展示顺序）
+# 双键结构：params = 参数名元组（后端兼容视图，零改动）；params_meta = 全量参数元数据
+# （GET /h3chain/experiments 下发给前端动态渲染的唯一权威数据源，数值与前端的渲染逻辑一一对应）。
 EXPERIMENT_DEFS = {
     "e1_bridge_shard": dict(
         name="强化引导桥+段内分片",
@@ -27,6 +29,11 @@ EXPERIMENT_DEFS = {
         desc="滑窗/重叠条件采样强化段间桥，并把单段内部拆子片抑制中段漂移",
         default=False,
         params=("滑窗token", "子片帧数", "重叠token"),
+        params_meta=[
+            {"key": "滑窗token", "type": "num", "def": 6, "min": 1, "max": 128, "step": 1},
+            {"key": "子片帧数", "type": "num", "def": 0, "min": 0, "max": 512, "step": 17},
+            {"key": "重叠token", "type": "num", "def": 2, "min": 0, "max": 16, "step": 1},
+        ],
     ),
     "e2_memory_anchor": dict(
         name="全局记忆锚",
@@ -34,6 +41,10 @@ EXPERIMENT_DEFS = {
         desc="提取首段关键帧沿整链恒定注入，抑制长链逐段累积漂移",
         default=False,
         params=("记忆帧数", "注入位置"),
+        params_meta=[
+            {"key": "记忆帧数", "type": "num", "def": 2, "min": 1, "max": 8, "step": 1},
+            {"key": "注入位置", "type": "enum", "def": "段首", "opts": ["段首", "全程"]},
+        ],
     ),
     "e3_motion_gate": dict(
         name="运动感知闭环门控",
@@ -41,6 +52,10 @@ EXPERIMENT_DEFS = {
         desc="把接缝重摇的触发信号从『帧差』扩展为帧差+光流/相机 z-score",
         default=False,
         params=("运动z阈值", "触发动作"),
+        params_meta=[
+            {"key": "运动z阈值", "type": "num", "def": 2.0, "min": 0.5, "max": 6.0, "step": 0.1},
+            {"key": "触发动作", "type": "enum", "def": "重摇", "opts": ["重摇", "重锚"]},
+        ],
     ),
     "e4_transition_res": dict(
         name="双向过渡重生成",
@@ -48,6 +63,11 @@ EXPERIMENT_DEFS = {
         desc="对超阈值缝区做 past|transition|future 双锚 + 缝区独占噪声的定向重采样",
         default=False,
         params=("过渡窗帧数", "重生成步数", "双锚强度"),
+        params_meta=[
+            {"key": "过渡窗帧数", "type": "num", "def": 17, "min": 5, "max": 512, "step": 17},
+            {"key": "重生成步数", "type": "num", "def": 20, "min": 1, "max": 100, "step": 1},
+            {"key": "双锚强度", "type": "num", "def": 1.0, "min": 0.0, "max": 2.0, "step": 0.1},
+        ],
     ),
 }
 
@@ -117,6 +137,29 @@ class ExperimentContext:
 def resolve(ds=None):
     """便捷工厂：外部统一用 experiments.resolve(ds) 构建 context。"""
     return ExperimentContext(ds)
+
+
+def experiment_defs_payload():
+    """GET /h3chain/experiments 的响应体（JSON 安全；前端实验面板唯一数据源）。
+
+    前端不再硬编码 EXPERIMENT_DEFS 镜像，面板定义（名称/分组/描述/参数元数据）
+    与后端硬开关 force_disabled 一律以本载荷为准。
+    """
+    return {
+        "ok": True,
+        "force_disabled": FORCE_DISABLED,
+        "experiments": [
+            {
+                "id": exp_id,
+                "name": meta["name"],
+                "group": meta["group"],
+                "desc": meta["desc"],
+                "default": bool(meta.get("default", False)),
+                "params": [dict(p) for p in meta.get("params_meta", ())],
+            }
+            for exp_id, meta in EXPERIMENT_DEFS.items()
+        ],
+    }
 
 
 # ---- E1 强化引导桥：段首引导 latent 的滑窗/重叠窗口布局（纯数学，可无 torch 单测） ----
