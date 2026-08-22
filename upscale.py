@@ -273,103 +273,70 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         # 上段二采异常后放大网络留在 CPU，装回 GPU
         dev = comfy.model_management.intermediate_device()
         net.to(dev)
-    up_v = upscale_video(video_t, net, cfg["scale"], cfg["arch"])
-    tw, th = int(up_v.shape[4]) * 16, int(up_v.shape[3]) * 16
+
+    # 二采两段式（根治 32GB 卡高清重采样 OOM）：
+    #   1. 低强度重采样在【基础分辨率 latent】上做（显存 = 基础采样水平，必然能跑），补细节
+    #   2. 放大网络单独把重采样后的 latent 超分到 scale×（1-2GB 网络 + 高清 latent，能跑）
+    #      ——不再在高清 latent 上跑 common_ksampler，彻底摆脱「26GB UNET 权重 + 4× 激活」放不下的死结
+    # 重采样画布 = 基础分辨率，故 cond/桥锚/尾锚全部沿用基础尺寸（无需 CondSync 放大桥）。
+    h, w = video_t.shape[-2], video_t.shape[-1]
+    tw, th = target_hw(h, w, cfg["scale"])[0] * 16, target_hw(h, w, cfg["scale"])[1] * 16
     length = grid.latent_t_to_frames(video_t.shape[2])
 
-    # cond 构造：官方节点按目标分辨率（refs/首帧由官方节点重编码到目标尺寸）
+    # cond 构造：按【基础分辨率】（重采样画布），refs/首帧由官方节点编码到基础尺寸
+    bw, bh = video_t.shape[-1] * 16, video_t.shape[-2] * 16
     if kind == "prompt":
         has_refs = any(pool_tensors.values()) or any(refs.values())
         if has_refs:
             out = MiniMaxH3ReferenceToVideo.execute(
                 clip=clip, vae=video_vae, audio_vae=audio_vae,
-                prompt=seg_prompts[idx], width=tw, height=th, length=length,
+                prompt=seg_prompts[idx], width=bw, height=bh, length=length,
                 ref_image_size="match",
                 **_build_seg_refs(idx, seg_label_orders, pool_tensors, refs))
         else:
             out = MiniMaxH3ImageToVideo.execute(
                 clip=clip, vae=video_vae, prompt=seg_prompts[idx],
-                width=tw, height=th, length=length,
+                width=bw, height=bh, length=length,
                 first_frame=first_frame if idx == 0 else None)
     else:
         out = MiniMaxH3ImageToVideo.execute(
-            clip=clip, vae=video_vae, prompt="", width=tw, height=th, length=length)
+            clip=clip, vae=video_vae, prompt="", width=bw, height=bh, length=length)
     cond, latent = out[0], out[1]
 
-    # 桥锚 CondSync：上段尾帧桥的 video latent 同步神经放大后注入 keyframe——
-    # 只依赖上段基础 latent + scale，与处理顺序/模式无关（单段可独立重做）；
-    # 尾帧身份锚定同式放大注入（首尾双锚隧道与主循环同构）
+    # 桥锚：基础尺寸直接注入（重采样画布=基础，无需放大桥）
     bridged = False
     if kind == "prompt" and (guide is not None or tail_kf_latent is not None):
-        up_guide = None
+        up_guide = dict(guide) if guide is not None else None
         if guide is not None:
-            up_guide = dict(guide)
-            up_guide["latent"] = upscale_video(guide["latent"].to(dev, torch.float32),
-                                               net, cfg["scale"], cfg["arch"])
+            up_guide["latent"] = guide["latent"].to(dev, torch.float32)
             bridged = True
-        up_tail = None
-        if tail_kf_latent is not None:
-            up_tail = upscale_video(tail_kf_latent.to(dev, torch.float32),
-                                    net, cfg["scale"], cfg["arch"])
+        up_tail = tail_kf_latent.to(dev, torch.float32) if tail_kf_latent is not None else None
         cond = plugin_nodes.H3SeamlessChainSampler._apply_guide(
             cond, up_guide, length, tail_kf_latent=up_tail)
 
-    # 放大网络不再需要：卸至 CPU 释放显存给重采样（重采样结束后再装回，
-    # 供下一段二采的放大步骤）。32GB 卡上这一步能腾出 ~1-2GB，恰好够用
-    net.cpu()
-    torch.cuda.empty_cache()
-
-    # 低强度重采样：初始 latent = 放大后的视频 latent + 原音频 latent；
-    # 采样输出的音频丢弃，分段/成片音轨 = 原轨（零音频回归）。
-    # OOM 三级降级重试（基础链采样后 CLIP/VAE/UNET 全部驻留 GPU ~28GB，
-    # 2× 分辨率的激活放不下）：
-    #   0 原样尝试 → 1 卸载全部驻留模型（重采样只需 UNET，CLIP/VAE 腾出数 GB）
-    #   → 2 LOW_VRAM 模式（UNET 权重分块换入换出，慢数倍但确保能出结果）
+    # 低强度重采样（基础分辨率 latent，显存=基础采样水平）：初始 = 视频 latent + 原音频。
     seed = (int(cur_seed) + 1) % 0xffffffffffffffff if cur_seed is not None else 1
     latent["samples"] = comfy.nested_tensor.NestedTensor(
-        (up_v.to(dev, torch.float32), audio_t.to(dev, torch.float32)))
-
-    def _is_oom(e):
-        return "out of memory" in str(e).lower()
-
-    def _sample():
-        return comfy_nodes.common_ksampler(
-            模型, seed, cfg["steps"], cfg["cfg"], 采样器, 调度器,
-            cond, negative, latent, denoise=cfg["denoise"])[0]
+        (video_t.to(dev, torch.float32), audio_t.to(dev, torch.float32)))
 
     restore_rows = plugin_nodes.cond_audio_rows_guard(模型.model.diffusion_model)
-    vram_level = 0
-    last_oom = None
     try:
-        for level in (0, 1, 2):
-            if level:
-                comfy.model_management.unload_all_models()
-                torch.cuda.empty_cache()
-            if level == 2:
-                old_vs = comfy.model_management.vram_state
-                comfy.model_management.vram_state = comfy.model_management.VRAMState.LOW_VRAM
-            try:
-                sampled = _sample()
-                vram_level = level
-                break
-            except RuntimeError as e:   # torch.OutOfMemoryError 是其子类
-                if not _is_oom(e):
-                    raise
-                last_oom = e
-            finally:
-                if level == 2:
-                    comfy.model_management.vram_state = old_vs
-        else:
-            raise last_oom
+        sampled = comfy_nodes.common_ksampler(
+            模型, seed, cfg["steps"], cfg["cfg"], 采样器, 调度器,
+            cond, negative, latent, denoise=cfg["denoise"])[0]
     finally:
         restore_rows()
-
-    # 先释放重采样中间张量，再装回放大网络——顺序反了会因重采样缓存还在而 OOM。
-    # try/finally 确保异常时 net 也能装回（下段二采的放大步骤需要 GPU 上的 net）
     up_out_v, _discarded_audio = sampled["samples"].unbind()
     del cond, latent, sampled
     torch.cuda.empty_cache()
-    return up_out_v, tw, th, seed, bridged, vram_level
+
+    # 放大网络超分到 scale×（此刻 UNET/VAE/CLIP 已随函数返回释放重采样上下文，
+    # 显存足够容纳 1-2GB 放大网络 + 高清 latent）
+    net.to(dev)
+    hi_v = upscale_video(up_out_v, net, cfg["scale"], cfg["arch"])
+    del up_out_v
+    torch.cuda.empty_cache()
+    return hi_v, tw, th, seed, bridged
 
 
 def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
@@ -396,22 +363,19 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     t0 = time.perf_counter()
     purge_legacy(root, g)
 
-    # 释放基础链采样残留（KV cache / conditioning / 推理缓存），给二采腾显存——
-    # 基础采样刚结束显存占用 ~28GB，二采放大需额外 ~2GB，不清理必 OOM
-    comfy.model_management.soft_empty_cache()
-    torch.cuda.empty_cache()
-
-    up_v, tw, th, up_seed, bridged, vram_level = render_latent(
+    up_v, tw, th, up_seed, bridged = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
         采样器, 调度器)
+    # 解码高清 latent -> 高清帧（官方 VAE.decode 自带 OOM→tiled 降级，无需干预）
     frames = video_vae.decode(up_v)
     del up_v
     torch.cuda.empty_cache()
     if len(frames.shape) == 5:
         frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
     frames = frames[skip_f:skip_f + vis_len]
+    # 接缝平滑在高清帧上做（二采在接缝判定前接管）：锚上段高清尾帧 smoothstep
     blended = False
     if blend_span and prev_hi_tail is not None \
             and tuple(prev_hi_tail.shape[-2:]) == tuple(frames.shape[-2:]):
@@ -426,9 +390,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh)
     report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
                   f"强度 {cfg['denoise']:g} · {cfg['steps']}步 · {time.perf_counter() - t0:.0f}s"
-                  + (" · 桥锚" if bridged else "") + (" · 接缝平滑" if blended else "")
-                  + (" · 低显存模式" if vram_level == 2 else
-                     "（显存吃紧已卸载驻留模型重试）" if vram_level == 1 else ""))
+                  + (" · 桥锚" if bridged else "") + (" · 接缝平滑" if blended else ""))
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
     torch.cuda.empty_cache()
     return frames[-1].detach().float().cpu(), up_state

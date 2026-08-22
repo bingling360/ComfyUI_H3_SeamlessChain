@@ -1158,16 +1158,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 oom = "out of memory" in str(e).lower()
                 report.append(f"段{g + 1} 二采失败：{type(e).__name__}: {e}"
                               "——本段按基础分辨率保存（基础链产物不受影响）"
-                              + ("；显存不够：建议把放大倍率降到 1.5× 或以下再重跑（本段"
+                              + ("；显存不够：可把放大倍率降到 1.5× 或关闭重采样只超分（本段"
                                  "会自动补渲染，基础链不重做）" if oom else ""))
                 prev_hi_tail = None
-                # 释放二采失败可能残留的显存（放大 latent / 推理缓存 / 驻留模型权重），
-                # 给后续基础采样腾空间；放大网络可能已在 CPU（render_latent 内 net.cpu()），
-                # 下段二采开始时 render_latent 会自愈装回 GPU。模型卸载后基础采样/
-                # cond 构造会由 ComfyUI 按需自动重载
+                # 释放二采残留（放大 latent / 解码帧），给后续基础采样腾空间；
+                # 新方案重采样在基础分辨率跑、放大网络 1-2GB，不触发重型卸载
                 try:
                     import comfy.model_management
-                    comfy.model_management.unload_all_models()
                     comfy.model_management.soft_empty_cache()
                     torch.cuda.empty_cache()
                 except Exception:
