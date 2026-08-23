@@ -270,6 +270,35 @@ eq("回环 段数", rt.segs.length, 2);
 eq("回环 五字段+时长", [rt.segs[0].scene, rt.segs[0].character, rt.segs[0].soundscape, rt.segs[0].music, rt.segs[0].seconds],
     ["夜景", "侦探", "雨声", "爵士", 6.5]);
 eq("回环 空段仅主体", [rt.segs[1].main, rt.segs[1].scene], ["主体二", undefined]);
+/* ---- 总提示词扩展标签：独立镜头 / 参考 / 【完】截断 ---- */
+const mp3 = mod.parseMasterPrompt("【段1】\n独立镜头：是\n参考：角色1，图片2、图片3\n提示词：x\n【段2】\n独立镜头：否\n参考：\n提示词：y\n【完】\n参考素材建议：\n角色1 = 三视图……（应整体忽略）");
+eq("独立镜头 是", mp3.segs[0].unlink, true);
+eq("独立镜头 否", mp3.segs[1].unlink, false);
+eq("参考 多分隔符切分", mp3.segs[0].refs, ["角色1", "图片2", "图片3"]);
+eq("参考 写空=清空标记", mp3.segs[1].refs, []);
+eq("【完】后内容不进主体", mp3.segs[1].main, "y");
+ok("【完】后内容零警告", mp3.notes.length === 0);
+eq("独立镜头 非法值忽略", mod.parseMasterPrompt("【段1】\n独立镜头：随便\n提示词：x").segs[0].unlink, undefined);
+eq("独立镜头 变体 断链", mod.parseMasterPrompt("【段1】\n独立镜头：断链\n提示词：x").segs[0].unlink, true);
+/* 应用：参考按已有素材标签过滤，未知剔除并提示；unlink 写入 */
+const nodeR = { widgets: [{ name: "导演台状态", value: JSON.stringify({
+    mode: "多参视频", prompts: ["a"],
+    ref_assets: [{ file: "c.png", kind: "image", label: "角色1" }, { file: "s.png", kind: "image", label: "风格板" }],
+}) }], setDirtyCanvas() {} };
+const rp = mod.applyMasterPrompt(nodeR, "【段1】\n独立镜头：是\n参考：角色1，不存在的标签\n提示词：主体");
+const dsR = mod.getDs(nodeR);
+eq("参考 过滤未知标签", dsR.segments[0].refs, ["角色1"]);
+eq("unlink 应用", dsR.segments[0].unlink, true);
+ok("未知标签进提示", rp.notes.some((n) => n.includes("不存在的标签")));
+/* 导出回环：unlink/refs/【完】 */
+const nodeR2 = { widgets: [{ name: "导演台状态", value: JSON.stringify({
+    mode: "多参视频", prompts: ["a"],
+    segments: [{ unlink: true, refs: ["角色1", "风格板"] }],
+    ref_assets: [{ file: "c.png", kind: "image", label: "角色1" }, { file: "s.png", kind: "image", label: "风格板" }],
+}) }], setDirtyCanvas() {} };
+const rt2 = mod.parseMasterPrompt(mod.exportMasterPrompt(nodeR2));
+eq("回环 unlink/refs", [rt2.segs[0].unlink, rt2.segs[0].refs], [true, ["角色1", "风格板"]]);
+ok("导出带【完】", mod.exportMasterPrompt(nodeR2).includes("【完】"));
 
 /* ---- 实验性功能（扁平契约 + 主开关）：注入迷你 defs 无头校验 ---- */
 const MINI_DEFS = [

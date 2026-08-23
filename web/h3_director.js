@@ -803,24 +803,29 @@ function removeLastFrame(node) {
 }
 
 /* ---- 总提示词（多段一次性导入 / 导出）----
- * 格式（skill「h3 总提示词」同一规范，AI 按此生成的全文可直接粘贴分配）：
+ * 格式（skill「h3-video-prompts」同一规范，AI 按此生成的全文可直接粘贴分配）：
  *   【段1】          ← 段头：【段1】/【第1段】/【段落1】等价；序号可省略，按出现顺序排段
- *   场景：…         → seg.scene_prompt（风格+环境+光照）
- *   角色：…         → seg.character_prompt（外观+服饰+位置）
- *   环境音：…       → seg.soundscape（overall_soundscape）
- *   配乐：…         → seg.music（non_diegetic_music）
+ *   场景：…         → seg.scene_prompt（风格契约：媒介+质感+调色板+光照）
+ *   角色：…         → seg.character_prompt（外观+服饰+位置；弱编码器下逐段原样复用）
+ *   环境音：…       → seg.soundscape（overall_soundscape；写每個声音及其进入时间）
+ *   配乐：…         → seg.music（non_diegetic_music；乐器+节奏+进入时间）
  *   时长：5         → seg.seconds（可选，秒；缺省=沿用全局「每段时长」）
- *   提示词：…       → 段主体（ds.prompts[i]），可多行（续行不写标签）
- * 规则：段头后未带标签的正文行视为提示词内容；只认上述 6 个行首标签，其余文本原样进
+ *   独立镜头：是    → seg.unlink（是/否；是=断链不锚定上段尾帧，跳转/闪回/蒙太奇用）
+ *   参考：角色1，图片2 → seg.refs（逗号/顿号分隔的素材标签；不存在的标签分配时剔除并提示）
+ *   提示词：…       → 段主体（ds.prompts[i]），可多行（续行不写标签），官方 [2s-4s] 时间线写在这里
+ *   【完】          ← 结束标记（可选）：其后的所有内容（如 AI 的参考素材建议）不参与解析
+ * 规则：段头后未带标签的正文行视为提示词内容；只认上述 8 个行首标签，其余文本原样进
  * 主体（官方字段标签 integrated_multimodal_description: 等不受影响）；某标签「写了即生效
  * （含写空=清空），没写不动该字段」。整个文本无任何段头时视为单段主体。 */
-/* 段头：【段1】/【第2段】/【段落1】/【第 3 段落】/【段】等价；序号可省略 */
 const MP_HEAD_RE = /^【\s*(?:第\s*)?(?:段(?:落)?\s*(\d+)?|(\d+)\s*段(?:落)?)\s*】\s*$/;
-const MP_FIELD_RE = /^(场景|角色|环境音|配乐|时长|提示词)\s*[：:]\s*(.*)$/;
-const MP_FIELDS = { "场景": "scene", "角色": "character", "环境音": "soundscape", "配乐": "music", "时长": "seconds", "提示词": "main" };
+const MP_END_RE = /^【\s*(?:完|END|end|结束)\s*】$/;
+const MP_FIELD_RE = /^(场景|角色|环境音|配乐|时长|独立镜头|参考|提示词)\s*[：:]\s*(.*)$/;
+const MP_FIELDS = { "场景": "scene", "角色": "character", "环境音": "soundscape", "配乐": "music", "时长": "seconds", "独立镜头": "unlink", "参考": "refs", "提示词": "main" };
+const MP_YES = ["是", "独立", "断链", "开", "true", "yes"];
+const MP_NO = ["否", "连续", "关", "false", "no"];
 
 function newMasterSeg() {
-    return { main: undefined, scene: undefined, character: undefined, soundscape: undefined, music: undefined, seconds: undefined };
+    return { main: undefined, scene: undefined, character: undefined, soundscape: undefined, music: undefined, seconds: undefined, unlink: undefined, refs: undefined };
 }
 
 /** 解析总提示词文本。返回 { segs:[{main,scene,character,soundscape,music,seconds}…],
@@ -834,6 +839,7 @@ function parseMasterPrompt(text) {
     const openSeg = () => { cur = newMasterSeg(); out.segs.push(cur); field = "main"; };
     for (const raw of lines) {
         const line = raw.trim();
+        if (MP_END_RE.test(line)) break;               // 【完】：其后的建议/解说不参与解析
         const hm = line.match(MP_HEAD_RE);
         if (hm) {
             openSeg();
@@ -852,6 +858,13 @@ function parseMasterPrompt(text) {
                 const v = Number(fm[2]);
                 cur.seconds = isFinite(v) && v > 0 ? v : undefined;
                 if (!isFinite(v) || v <= 0) out.notes.push(`「时长：${fm[2]}」不是有效秒数，已忽略`);
+            } else if (key === "unlink") {
+                const v = fm[2].trim().toLowerCase();
+                if (MP_YES.includes(v)) cur.unlink = true;
+                else if (MP_NO.includes(v)) cur.unlink = false;
+                else out.notes.push(`「独立镜头：${fm[2].trim()}」应为 是/否，已忽略`);
+            } else if (key === "refs") {
+                cur.refs = fm[2].split(/[，,、;；]+/).map((s) => s.trim()).filter(Boolean);
             } else {
                 cur[key] = cur[key] === undefined ? fm[2].trim() : `${cur[key]}\n${fm[2].trim()}`;
             }
@@ -885,20 +898,24 @@ function exportMasterPrompt(node) {
         if (seg.soundscape) rows.push(`环境音：${seg.soundscape}`);
         if (seg.music) rows.push(`配乐：${seg.music}`);
         if (Number.isFinite(Number(seg.seconds)) && Number(seg.seconds) > 0) rows.push(`时长：${seg.seconds}`);
+        if (seg.unlink) rows.push("独立镜头：是");
+        if (Array.isArray(seg.refs) && seg.refs.length) rows.push(`参考：${seg.refs.join("，")}`);
         const main = String(prompts[i] ?? "").trim();
         rows.push(main ? `提示词：${main}` : "提示词：");
         blocks.push(rows.join("\n"));
     }
-    return blocks.join("\n\n");
+    return blocks.join("\n\n") + "\n\n【完】";
 }
 
 /** 解析并分配到当前链：prompts 重排为 N 段，segments 同步伸缩（既有段保留 refs/unlink
- *  等未提及字段），插入视频段（inserts）不动。返回 parse 结果供界面提示。 */
+ *  等未提及字段），插入视频段（inserts）不动；参考标签按「素材与参考」已有标签过滤
+ *  （未知标签剔除并进 notes，防止运行期「引用未知素材标签」报错）。返回解析结果供界面提示。 */
 function applyMasterPrompt(node, text) {
     const p = parseMasterPrompt(text);
     if (!p.segs.length) return p;
     const ds = getDs(node);
     const old = Array.isArray(ds.segments) ? ds.segments : [];
+    const labels = new Set((Array.isArray(ds.ref_assets) ? ds.ref_assets : []).map((a) => a && a.label).filter(Boolean));
     ds.prompts = p.segs.map((s) => (s.main === undefined ? "" : s.main));
     ds.segments = p.segs.map((s, i) => {
         const base = (i < old.length && old[i] && typeof old[i] === "object") ? { ...old[i] } : defaultSegment();
@@ -907,6 +924,13 @@ function applyMasterPrompt(node, text) {
         if (s.soundscape !== undefined) base.soundscape = s.soundscape;
         if (s.music !== undefined) base.music = s.music;
         if (s.seconds !== undefined) base.seconds = s.seconds;
+        if (s.unlink !== undefined) base.unlink = s.unlink;
+        if (s.refs !== undefined) {
+            const valid = s.refs.filter((r) => labels.has(r));
+            const dropped = s.refs.filter((r) => !labels.has(r));
+            if (dropped.length) p.notes.push(`段${i + 1} 参考标签不存在已剔除：${dropped.join("、")}（先在「素材与参考」上传素材获得标签）`);
+            base.refs = valid;
+        }
         return base;
     });
     setDs(node, ds);
@@ -3764,10 +3788,12 @@ function openMasterPromptModal() {
     const dialog = el("div", "h3d-dialog h3d-dialog-wide");
     dialog.innerHTML = `
         <h3>📋 总提示词 · 多段一次性分配</h3>
-        <p class="h3d-lead">按「段头 + 六标签」格式粘贴全文（可用 AI 按 skill「h3 总提示词」生成），
-        一次分给所有段：<b>场景 / 角色 / 环境音 / 配乐 / 时长 / 提示词</b>。
+        <p class="h3d-lead">按「段头 + 八标签」格式粘贴全文（可用 AI 按 skill「h3-video-prompts」生成），
+        一次分给所有段：<b>场景 / 角色 / 环境音 / 配乐 / 时长 / 独立镜头 / 参考 / 提示词</b>。
         标签<b>写了即生效（写空=清空），没写的字段不动</b>；段数按段头数量重排，
-        插入视频段与各段的素材勾选/断链标记保留。下方可先把现有段落导出改写再贴回。</p>`;
+        插入视频段与各段的素材勾选/断链标记保留；「参考」只认「素材与参考」已有标签，
+        未上传的会剔除并提示；<b>【完】</b>之后的内容（如 AI 的素材建议）不参与解析。
+        下方可先把现有段落导出改写再贴回。</p>`;
     const ta = document.createElement("textarea");
     ta.className = "h3d-mpta";
     ta.spellcheck = false;
@@ -3794,7 +3820,8 @@ function openMasterPromptModal() {
         const cnt = (k) => p.segs.filter((s) => s[k] !== undefined && s[k] !== "").length;
         const bits = [`识别 <b>${p.segs.length}</b> 段`,
             `场景 ${cnt("scene")} · 角色 ${cnt("character")} · 环境音 ${cnt("soundscape")}`,
-            `配乐 ${cnt("music")} · 时长 ${p.segs.filter((s) => s.seconds !== undefined).length} · 主体 ${cnt("main")}`];
+            `配乐 ${cnt("music")} · 时长 ${p.segs.filter((s) => s.seconds !== undefined).length} · 主体 ${cnt("main")}`,
+            `独立镜头 ${p.segs.filter((s) => s.unlink === true).length} · 参考 ${p.segs.filter((s) => (s.refs || []).length > 0).length}`];
         info.innerHTML = bits.join("　");
         if (p.notes.length) err.textContent = "⚠ " + p.notes.join("；");
     };
