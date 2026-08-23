@@ -103,7 +103,7 @@ def frame_pair_series(video, must_pairs=(), enable_pose=False):
     if cv2 is not None:
         flags["flow"] = "farneback"
         for i in range(pairs):
-            fl = cv2.calcOpticalFlowFarneBack(
+            fl = cv2.calcOpticalFlowFarneback(
                 grays[i], grays[i + 1], None, 0.5, 3, 15, 3, 5, 1.2, 0)
             out["flow"][i] = float(np.hypot(fl[..., 0], fl[..., 1]).mean())
     else:

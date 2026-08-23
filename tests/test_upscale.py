@@ -12,6 +12,7 @@ render_latent / render_segment 本体依赖 ComfyUI 运行环境，不在本测�
 torch 切片与前向；包 __init__ 在无 ComfyUI 环境下自行降级（静默导入）。
 """
 import contextlib
+import copy
 import io
 import json
 import os
@@ -19,6 +20,8 @@ import shutil
 import sys
 import tempfile
 import types
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # 插件父目录（包名可导入）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                   # tests 目录
@@ -41,6 +44,16 @@ else:
     if "pytest" in sys.modules:
         import pytest
         pytest.skip("需要真 torch（stub/无 torch 环境跳过）", allow_module_level=True)
+
+
+def _install_comfy_stubs(monkeypatch, **modules):
+    """给只依赖 ComfyUI 运行期 API 的小函数安装最小模块桩。"""
+    comfy = types.ModuleType("comfy")
+    comfy.__path__ = []
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    for name, module in modules.items():
+        setattr(comfy, name, module)
+        monkeypatch.setitem(sys.modules, f"comfy.{name}", module)
 
 
 @contextlib.contextmanager
@@ -422,6 +435,302 @@ def test_base_hash():
     assert upscale.base_hash(mf, 9) == "|"       # 越界=双空串
 
 
+# ---- 抗糊武器库（cascade / 锐化 / STG 数学 / 重试；纯函数） ----
+
+def test_parse_state_antiblur():
+    """抗糊新键归一化：未存过=默认全关；存值钳制；布尔仅 JSON true。"""
+    d = upscale.parse_state({"upscale": {"mode": "跟随生成"}})
+    assert d["stg"] == 0.0 and d["stg_block"] == 25
+    assert d["passes"] == 1 and d["decay"] == 0.5
+    assert d["sharpen"] == 0.0 and d["pixel_sharpen"] == 0.0
+    assert d["encode"] == "标准"
+    assert d["sampler"] == "" and d["scheduler"] == ""
+    assert d["retry"] is False and d["retry_target"] == 0.15
+
+    full = upscale.parse_state({"upscale": {"mode": "跟随生成", "schema": 2,
+        "stg": "9", "stg_block": "99", "passes": "0", "decay": "0.1",
+        "sharpen": "2", "pixel_sharpen": "-1", "encode": "乱写",
+        "sampler": " euler ", "scheduler": " simple ", "retry": "yes",
+        "retry_target": "5"}})
+    assert full["stg"] == 2.0 and full["stg_block"] == 49    # 双钳上限
+    assert full["passes"] == 1 and full["decay"] == 0.2      # 钳下限
+    assert full["sharpen"] == 1.0 and full["pixel_sharpen"] == 0.0
+    assert full["encode"] == "标准"                          # 非法档回落
+    assert full["sampler"] == "euler" and full["scheduler"] == "simple"  # strip
+    assert full["retry"] is False                            # 非 JSON true 一律关
+    assert full["retry_target"] == 1.0                       # 钳上限
+
+    nan = upscale.parse_state({"upscale": {"mode": "跟随生成", "stg": float("nan"),
+                                           "passes": float("nan")}})
+    assert nan["stg"] == 0.0 and nan["passes"] == 1          # NaN 回落默认
+
+
+def test_cascade_sigmas():
+    """多轮递降 σ 序列：单轮=[σ₀]；多轮严格递减且每轮在合法域内。"""
+    assert upscale.cascade_sigmas(0.35, 1, 0.5) == [0.35]            # 1 轮=现状
+    assert upscale.cascade_sigmas(0.45, 3, 0.5) == [0.45, 0.225, 0.1125]
+    # 输入钳制：σ₀ 落 [0.05,0.95]、passes 钳 1-3、decay 钳 0.2-0.8
+    assert upscale.cascade_sigmas(2.0, 9, 0.1)[0] == 0.95
+    assert len(upscale.cascade_sigmas(0.4, 9, 0.5)) == 3
+    s = upscale.cascade_sigmas(0.4, 2, 0.1)
+    assert s[1] == round(0.4 * 0.2, 4)                                # decay 钳 0.2
+    # 递减 + 每轮 ≥0.05（衰减撞下限后钳住重复=换种子的低噪声再抠，见 docstring）
+    for sig in (upscale.cascade_sigmas(0.9, 3, 0.8),
+                upscale.cascade_sigmas(0.08, 3, 0.2),
+                upscale.cascade_sigmas(0.95, 3, 0.2)):
+        assert all(sig[i + 1] <= sig[i] for i in range(len(sig) - 1))
+        assert all(0.05 <= x <= 0.95 for x in sig)
+    assert upscale.cascade_sigmas(0.9, 3, 0.8) == [0.9, 0.72, 0.576]  # 域内严格递减
+    # 决定论：同参同序列
+    assert upscale.cascade_sigmas(0.5, 3, 0.6) == upscale.cascade_sigmas(0.5, 3, 0.6)
+
+
+def test_sharpen_latents():
+    """latent 锐化：0=关不克隆；增高频能量；常量场不动（无高频可放大）；分块一致；纯函数。"""
+    z = torch.randn(1, 4, 9, 8, 8)
+    out0 = upscale.sharpen_latents(z, 0.0)
+    assert out0 is z                                              # 关=原对象直通
+    out = upscale.sharpen_latents(z, 0.4)
+    assert out.shape == z.shape
+    assert upscale.latent_hf_energy(out) > upscale.latent_hf_energy(z)
+    # 常量场：x−blur(x)=0 → 输出=输入（无中生有的高频是 bug）
+    flat = torch.zeros(1, 4, 5, 8, 8) + 3.0
+    assert torch.allclose(upscale.sharpen_latents(flat, 0.5), flat)
+    # 分块一致（chunk=1 与 8 逐位同）
+    a = upscale.sharpen_latents(z, 0.3, chunk=1)
+    b = upscale.sharpen_latents(z, 0.3, chunk=8)
+    assert torch.equal(a, b)
+    # 纯函数：不改入参
+    zc = z.clone()
+    upscale.sharpen_latents(z, 0.5)
+    assert torch.equal(z, zc)
+    # 退化兜底：None/非 5D 原样返回
+    assert upscale.sharpen_latents(None, 0.5) is None
+    z4 = torch.randn(4, 8, 8)
+    assert upscale.sharpen_latents(z4, 0.5) is z4
+
+
+def test_pixel_sharpen_frames():
+    """像素锐化：0=关原对象；提升清晰度度量；钳 [0,1]；分块一致；退化直通。"""
+    f = torch.rand(9, 16, 16, 3)
+    assert upscale.pixel_sharpen_frames(f, 0.0) is f            # 关=原对象
+    out = upscale.pixel_sharpen_frames(f, 0.4)
+    assert out.shape == f.shape
+    assert float(out.min()) >= 0.0 and float(out.max()) <= 1.0
+    assert upscale.pixel_sharpness(out) > upscale.pixel_sharpness(f)
+    # 常量帧不动；分块一致
+    flat = torch.full((4, 12, 12, 3), 0.5)
+    assert torch.allclose(upscale.pixel_sharpen_frames(flat, 0.5), flat)
+    a = upscale.pixel_sharpen_frames(f, 0.3, chunk=2)
+    b = upscale.pixel_sharpen_frames(f, 0.3, chunk=16)
+    assert torch.equal(a, b)
+    # 退化兜底
+    assert upscale.pixel_sharpen_frames(None, 0.3) is None
+    small = torch.rand(3, 2, 2, 3)
+    assert upscale.pixel_sharpen_frames(small, 0.3) is small
+
+
+def test_pixel_sharpness():
+    """像素清晰度度量：噪声>平滑、决定论、退化=0、抽样帧数不影响量级。"""
+    noise = torch.rand(6, 24, 24, 3)
+    flat = torch.full((6, 24, 24, 3), 0.5)
+    sn = upscale.pixel_sharpness(noise)
+    sf = upscale.pixel_sharpness(flat)
+    assert sn > sf > 0.0 or sf == 0.0
+    assert upscale.pixel_sharpness(noise) == upscale.pixel_sharpness(noise.clone())
+    assert upscale.pixel_sharpness(None) == 0.0
+    assert upscale.pixel_sharpness(torch.rand(2, 2, 2, 3)) == 0.0
+
+
+def test_refine_progress_and_should_retry():
+    """精化局部进度 + 重试判定：边界与钳制。"""
+    assert upscale.refine_progress(0.35, 0.35) == 0.0     # 精化刚开始
+    assert upscale.refine_progress(0.0, 0.35) == 1.0      # 收尾
+    assert upscale.refine_progress(0.7, 0.35) == 0.0      # σ>σ₀ 钳 0
+    assert abs(upscale.refine_progress(0.175, 0.35) - 0.5) < 1e-9
+    assert upscale.refine_progress(0.1, 0.0) == 1.0       # σ₀≤0 兜底
+
+    assert upscale.should_retry(0.10, 0.15, 0.35) is True     # 增益不足、有上调空间
+    assert upscale.should_retry(0.20, 0.15, 0.35) is False    # 已达标
+    assert upscale.should_retry(0.10, 0.15, 0.90) is False    # σ 顶格（再升撞全量重采）
+    assert upscale.should_retry(0.10, 0.15, 0.95) is False
+
+
+def test_stg_model_guards_and_weak_branch(monkeypatch):
+    """STG fail-closed：不覆盖既有 hook/块补丁，运行时重检；正常弱分支数学正确。"""
+    calls = {}
+
+    model_patcher = types.ModuleType("comfy.model_patcher")
+
+    def clone_options(options):
+        return copy.deepcopy(options)
+
+    def set_patch(options, patch, name, block_name, number, transformer_index=None):
+        out = copy.deepcopy(options)
+        replacements = (out.setdefault("transformer_options", {})
+                         .setdefault("patches_replace", {}).setdefault(name, {}))
+        key = ((block_name, number, transformer_index) if transformer_index is not None
+               else (block_name, number))
+        replacements[key] = patch
+        return out
+
+    model_patcher.create_model_options_clone = clone_options
+    model_patcher.set_model_options_patch_replace = set_patch
+
+    samplers = types.ModuleType("comfy.samplers")
+
+    def calc_cond_batch(model, conds, x, sigma, options):
+        calls["conds"] = conds
+        calls["options"] = options
+        return (torch.full_like(x, 0.25),)
+
+    samplers.calc_cond_batch = calc_cond_batch
+    _install_comfy_stubs(monkeypatch, model_patcher=model_patcher, samplers=samplers)
+
+    class FakeModel:
+        def __init__(self, options=None):
+            self.model_options = copy.deepcopy(options or {"transformer_options": {}})
+
+        def clone(self):
+            return FakeModel(self.model_options)
+
+        def set_model_sampler_post_cfg_function(self, fn):
+            self.model_options.setdefault("sampler_post_cfg_function", []).append(fn)
+
+    # scale=0 严格直通，不要求 Comfy hook 状态可组合。
+    base = FakeModel()
+    assert upscale._stg_model(base, 0.35, 0.0, 25) is base
+
+    with pytest.raises(ValueError, match="sampler_post_cfg_function"):
+        upscale._stg_model(FakeModel({
+            "transformer_options": {}, "sampler_post_cfg_function": [object()]
+        }), 0.35, 0.8, 25)
+
+    with pytest.raises(ValueError, match="double block 25"):
+        upscale._stg_model(FakeModel({"transformer_options": {
+            "patches_replace": {"dit": {("double_block", 25): object()}}
+        }}), 0.35, 0.8, 25)
+
+    patched = upscale._stg_model(base, 0.35, 0.8, 25)
+    post_cfg = patched.model_options["sampler_post_cfg_function"][0]
+    denoised = torch.ones(1)
+    args = {
+        "sigma": torch.tensor([0.35]), "denoised": denoised,
+        "cond_denoised": torch.full((1,), 0.75), "cond": ["positive"],
+        "model": object(), "input": torch.zeros(1),
+        "model_options": {"transformer_options": {}},
+    }
+    assert post_cfg(args) is denoised                         # p=0，在激活窗外
+
+    args["sigma"] = torch.tensor([0.175])                    # p=0.5，激活
+    out = post_cfg(args)
+    assert torch.allclose(out, torch.tensor([1.4]))           # 1 + (0.75-0.25)*0.8
+    assert calls["conds"] == [["positive"]]
+    assert ("double_block", 25) in (calls["options"]["transformer_options"]
+                                     ["patches_replace"]["dit"])
+
+    args["model_options"] = {"transformer_options": {
+        "patches_replace": {"dit": {("double_block", 25): object()}}
+    }}
+    with pytest.raises(RuntimeError, match="运行时.*冲突"):
+        post_cfg(args)
+    args["model_options"] = {"transformer_options": {}}
+    args["cond"] = None
+    with pytest.raises(RuntimeError, match="conditioning"):
+        post_cfg(args)
+
+
+def test_shifted_model_current_comfy_contract(monkeypatch):
+    """shift 克隆镜像当前 ComfyUI API，并在旧 API 上给出可操作错误。"""
+    model_sampling = types.ModuleType("comfy.model_sampling")
+
+    class ModelSamplingAV:
+        def __init__(self, model_config=None):
+            self.model_config = model_config
+
+        def set_parameters(self, shift=1.0, audio_shift=None):
+            self.shift = shift
+            self.audio_shift = audio_shift
+
+        def set_noise_scale(self, value):
+            self.noise_scale = float(value)
+
+    class CONST:
+        pass
+
+    model_sampling.ModelSamplingAV = ModelSamplingAV
+    model_sampling.CONST = CONST
+    _install_comfy_stubs(monkeypatch, model_sampling=model_sampling)
+
+    class FakeModel:
+        def __init__(self):
+            self.model = types.SimpleNamespace(model_config={"kind": "h3"})
+            self.model_options = {}
+            self.original_sampling = types.SimpleNamespace(
+                audio_shift=None, noise_scale=0.75)
+            self.object_patches = {}
+
+        def clone(self):
+            out = FakeModel()
+            out.model = self.model
+            out.model_options = copy.deepcopy(self.model_options)
+            out.original_sampling = self.original_sampling
+            return out
+
+        def get_model_object(self, name):
+            assert name == "model_sampling"
+            return self.original_sampling
+
+        def add_object_patch(self, name, value):
+            self.object_patches[name] = value
+
+    source = FakeModel()
+    shifted = upscale._shifted_model(source, 6.0)
+    ms = shifted.object_patches["model_sampling"]
+    assert ms.shift == 6.0 and ms.audio_shift == 3.0           # None 按 H3 默认回落
+    assert ms.noise_scale == 0.75
+    assert shifted.model_options["transformer_options"] == {
+        "minimax_h3_sigma_shift_video": 6.0,
+        "minimax_h3_sigma_shift_audio": 3.0,
+    }
+    assert source.model_options == {} and source.object_patches == {}   # 主模型零改动
+
+    del model_sampling.ModelSamplingAV
+    with pytest.raises(RuntimeError, match="ModelSamplingAV"):
+        upscale._shifted_model(source, 6.0)
+
+
+def test_params_hash_antiblur():
+    """抗糊八项条件化指纹：默认全关不进（既有记录不失效），启用才进、互相独立。"""
+    base = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth"}})
+    h = upscale.params_hash(base)
+    mods = {
+        "stg": {"stg": 0.8}, "stg_block": {"stg": 0.8, "stg_block": 10},
+        "passes": {"passes": 2}, "decay": {"passes": 2, "decay": 0.3},
+        "sharpen": {"sharpen": 0.3}, "pixel": {"pixel_sharpen": 0.3},
+        "encode": {"encode": "高清"}, "sampler": {"sampler": "euler"},
+        "scheduler": {"scheduler": "beta"}, "retry": {"retry": True},
+    }
+    for name, over in mods.items():
+        c = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth", **over}})
+        assert h != upscale.params_hash(c), f"{name} 应改变指纹"
+    # 关联键：stg>0 才带 stg_block；passes>1 才带 decay；retry 开才带 retry_target
+    hp = upscale._hash_params(upscale.parse_state(
+        {"upscale": {"mode": "跟随生成", "stg": 0.8}}))
+    assert hp["stg_block"] == 25
+    assert "stg_block" not in upscale._hash_params(base)
+    assert "decay" not in upscale._hash_params(upscale.parse_state(
+        {"upscale": {"mode": "跟随生成", "stg_block": 10}}))      # 无 passes 的关联键不进
+    assert upscale._hash_params(upscale.parse_state(
+        {"upscale": {"mode": "跟随生成", "retry": True}}))["retry"] == 0.15
+    # 默认全关 = 与基线同指纹
+    assert h == upscale.params_hash(upscale.parse_state(
+        {"upscale": {"mode": "跟随生成", "model": "m.pth",
+                     "stg": 0, "passes": 1, "sharpen": 0, "pixel_sharpen": 0,
+                     "encode": "标准", "sampler": "", "scheduler": "",
+                     "retry": False}}))
+
+
 # ---- 重做判定 ----
 
 def test_record_stale():
@@ -693,6 +1002,45 @@ def test_try_final_gating():
         report = []
         assert upscale.try_final(root, cfg, report) is False
         assert "尺寸不一致" in report[-1]
+
+
+def test_try_final_uses_selected_encode_profile(monkeypatch):
+    """最终高清成片必须沿用分段的 CRF/preset/AQ 档位，而非退回标准编码。"""
+    with _env() as (out, _):
+        from ComfyUI_H3_SeamlessChain import media
+
+        root = os.path.join(out, "h3_projects", "高清编码")
+        os.makedirs(root)
+        cfg = upscale.parse_state({"upscale": {
+            "mode": "跟随生成", "model": "m.pth", "encode": "高清"
+        }})
+        files = checkpoint.upscale_files(0)
+        for name in files.values():
+            open(os.path.join(root, name), "wb").close()
+        checkpoint.save_manifest(root, {
+            "schema": "h3seamless/ckpt-v3", "done": 1, "total": 1,
+            "prompt_hashes": ["a"], "seeds": [1],
+            "upscale": {"segs": [{
+                "hash": upscale.params_hash(cfg), "base_hash": "a|1",
+                "done": True, "size": [1280, 720], "files": files,
+            }]},
+        })
+        called = {}
+
+        def fake_concat(sources, out_path, **kwargs):
+            called.update(kwargs)
+            called["sources"] = sources
+            called["out_path"] = out_path
+            return True
+
+        monkeypatch.setattr(media, "probe_video_size", lambda _p: (1280, 720))
+        monkeypatch.setattr(media, "concat_av_mp4", fake_concat)
+        report = []
+        assert upscale.try_final(root, cfg, report) is True
+        assert called["crf"] == 16 and called["preset"] == "medium"
+        assert called["aq_mode"] == 3 and called["dither"] is True
+        assert called["sources"] == [os.path.join(root, files["mp4"])]
+        assert "1280×720" in report[-1]
 
 
 def test_upscale_reset():

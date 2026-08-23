@@ -121,6 +121,25 @@ def test_concat_two_segments():
         assert 0.9 <= a_dur <= 1.2, a_dur                    # 音轨 ~1.0s（AAC priming 容差）
 
 
+def test_concat_hq_profile_preserves_luma():
+    """HQ 拼接不能把已量化的 RGB 当 0..1 浮点再次抖动，否则整片会截成白色。"""
+    if not _HAS:
+        print("SKIP (无 av)")
+        return
+    from ComfyUI_H3_SeamlessChain import media
+    with tempfile.TemporaryDirectory() as d:
+        a, o = (os.path.join(d, x) for x in ("a.mp4", "out.mp4"))
+        _make_mp4(a, n_frames=8, audio=False)
+        assert media.concat_av_mp4([a], o, crf=16, preset="medium",
+                                   aq_mode=3, dither=True) is True
+        with av.open(o) as c:
+            means = [float(f.to_ndarray(format="rgb24").mean())
+                     for f in c.decode(video=0)]
+        assert len(means) == 8
+        assert max(means) < 180.0                              # 非全白/高光截断
+        assert means[-1] - means[0] > 80.0                    # 原亮度阶梯仍存在
+
+
 def test_concat_reformat_and_silence():
     if not _HAS:
         print("SKIP (无 av)")

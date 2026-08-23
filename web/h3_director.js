@@ -46,7 +46,7 @@ const W_DS = "导演台状态";
 const W_AR = "宽高比";
 const W_MP = "百万像素";
 /* 版本标记：浏览器控制台过滤 [h3-director] 可确认加载的是新 JS 还是缓存旧版 */
-const H3D_VER = "4606579+null-node-safe";
+const H3D_VER = "20260824+upscale-antiblur";
 const W_DUR = "每段时长";
 const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
@@ -468,9 +468,16 @@ function defaultDs() {
 function defaultUpscale() {
     /* 潜空间放大二采：主循环内渲染通道（每段采样定稿后、段落盘前），参数不进基础链指纹。
        schema 2：steps=尾段精化步数（与 denoise=尾段起始σ 解耦），旧 JSON 由 getDs 迁移。
-       time_bias / mix / shift 默认 0=关、adaptive 默认 false=关，仅启用时进后端指纹
-       （不使既有记录失效） */
-    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16", time_bias: 0.0, mix: 0.0, adaptive: false, shift: 0.0, include: [] };
+       time_bias / mix / shift / stg / sharpen / pixel_sharpen 默认 0=关、adaptive / retry
+       默认 false=关、passes=1=单轮、encode=标准、采样器空=沿用主链——仅启用时进后端
+       指纹（不使既有记录失效）。抗糊武器库详见《更新说明_二采抗糊抗条纹》 */
+    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0,
+             denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16",
+             time_bias: 0.0, mix: 0.0, adaptive: false, shift: 0.0,
+             stg: 0.0, stg_block: 25, passes: 1, decay: 0.5,
+             sharpen: 0.0, pixel_sharpen: 0.0, encode: "标准",
+             sampler: "", scheduler: "", retry: false, retry_target: 0.15,
+             include: [] };
 }
 
 function defaultSegment() {
@@ -565,6 +572,18 @@ function getDs(node) {
             mix: upNum(upRaw.mix, 0.0, 0.0, 1.0),
             adaptive: upRaw.adaptive === true,
             shift: upNum(upRaw.shift, 0.0, 0.0, 100.0),
+            /* 抗糊武器库（旧 JSON 缺键 = 默认关，后端 parse_state 同口径） */
+            stg: upNum(upRaw.stg, 0.0, 0.0, 2.0),
+            stg_block: Math.round(upNum(upRaw.stg_block, 25, 0, 49)),
+            passes: Math.round(upNum(upRaw.passes, 1, 1, 3)),
+            decay: upNum(upRaw.decay, 0.5, 0.2, 0.8),
+            sharpen: upNum(upRaw.sharpen, 0.0, 0.0, 1.0),
+            pixel_sharpen: upNum(upRaw.pixel_sharpen, 0.0, 0.0, 1.0),
+            encode: UP_ENCODES.includes(upRaw.encode) ? upRaw.encode : "标准",
+            sampler: typeof upRaw.sampler === "string" ? upRaw.sampler.trim() : "",
+            scheduler: typeof upRaw.scheduler === "string" ? upRaw.scheduler.trim() : "",
+            retry: upRaw.retry === true,
+            retry_target: upNum(upRaw.retry_target, 0.15, 0.05, 1.0),
             include: (Array.isArray(upRaw.include) ? upRaw.include : [])
                 .map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 0),
         };
@@ -993,6 +1012,7 @@ function applyMasterPrompt(node, text) {
 
 const UP_MODES = ["关闭", "跟随生成", "手动选择"];
 const UP_PRECISIONS = ["fp32", "fp16", "bf16"];
+const UP_ENCODES = ["标准", "高清", "极致"];
 
 function setUpscaleField(node, field, value) {
     const ds = getDs(node);
@@ -3345,6 +3365,9 @@ function upscaleSig(data) {
         up.mode ?? "", up.model ?? "", up.arch ?? "", up.scale ?? 0, up.denoise ?? 0,
         up.steps ?? 0, up.cfg ?? 0, up.precision ?? "", up.time_bias ?? 0, up.mix ?? 0,
         up.adaptive === true, up.shift ?? 0, (up.include || []).join(","),
+        up.stg ?? 0, up.stg_block ?? 25, up.passes ?? 1, up.decay ?? 0.5,
+        up.sharpen ?? 0, up.pixel_sharpen ?? 0, up.encode ?? "标准",
+        up.sampler ?? "", up.scheduler ?? "", up.retry === true, up.retry_target ?? 0,
         (data.upscaleModels || []).join(","),
         data.mf?.upscale?.hash ?? "",
         (data.mf?.upscale?.segs || []).filter((r) => r && r.done).length,
@@ -3519,6 +3542,96 @@ function renderUpscaleZone(sec, data) {
             + "镜像官方 MiniMaxH3SigmaShift 的克隆补丁，主链模型零改动）：0=关（默认，沿用主链 "
             + "H3 默认 12）；6=推荐档。仅在 >0 时进二采指纹",
             (v) => setUpscaleField(node, "shift", v)));
+
+        /* ---- 抗糊武器库（全部默认关；详见《更新说明_二采抗糊抗条纹》） ---- */
+        body.append(el("div", "h3d-convbadge", "⟡ 抗糊增强（全部默认关，按需开启）"));
+        body.append(upNumField("STG 引导", up.stg, 0.0, 2.0, 0.05,
+            "跳块差分细节引导（T8 机制移植，GPL）：激活窗内每步多跑一次「跳掉一个 double block」"
+            + "的弱前向，把完整前向多出来的细节显式放大——CFG=1.0 下也有效。0=关（默认）；"
+            + "0.5-1.0 常用（每激活步约 +1 次前向 ≈ +50% 精化耗时）。仅在 >0 时进二采指纹",
+            (v) => setUpscaleField(node, "stg", v)));
+        body.append(upNumField("STG 跳块", up.stg_block, 0, 49, 1,
+            "STG 弱前向跳过的 double block 编号（H3 共 50 个）：T8 默认 25（中段块，"
+            + "细节/纹理引导最稳）；换块号可改变引导性质（前段块=构图、后段块=质感）",
+            (v) => setUpscaleField(node, "stg_block", v)));
+        body.append(upNumField("精化轮数", up.passes, 1, 3, 1,
+            "多轮递降精化：每轮以更小 σ 在上一轮输出上再精化（先修结构、再抠细节）。"
+            + "1=单轮（默认，现行为）；2-3=递进（耗时×轮数）。仅在 >1 时进二采指纹",
+            (v) => setUpscaleField(node, "passes", v)));
+        body.append(upNumField("σ 衰减", up.decay, 0.2, 0.8, 0.05,
+            "多轮递降的每轮 σ 缩放系数：第 k 轮 σ=σ₀·衰减^k（默认 0.5 → 0.35/0.18/0.09）。"
+            + "仅精化轮数 >1 时生效",
+            (v) => setUpscaleField(node, "decay", v)));
+        body.append(upNumField("latent 锐化", up.sharpen, 0.0, 1.0, 0.05,
+            "latent 域 unsharp 锐化（精化输出高频再放大一档，CPU 零显存零前向）："
+            + "0=关（默认）；0.2-0.4 常用；过大可能放大噪声/伪影。仅在 >0 时进二采指纹",
+            (v) => setUpscaleField(node, "sharpen", v)));
+        body.append(upNumField("像素锐化", up.pixel_sharpen, 0.0, 1.0, 0.05,
+            "解码后逐帧 unsharp 锐化（连 VAE 解码的软化一起补偿，编码前生效）："
+            + "0=关（默认）；0.2-0.4 常用。与 latent 锐化正交可叠加。仅在 >0 时进二采指纹",
+            (v) => setUpscaleField(node, "pixel_sharpen", v)));
+
+        /* 编码档位（抗条纹主手段） */
+        const encField = el("div", "h3d-param");
+        encField.append(el("label", "", "编码档位"));
+        const encSel = document.createElement("select");
+        encSel.className = "h3d-select";
+        encSel.title = "二采分段及最终高清成片的 mp4 编码质量（基础链不变）："
+            + "标准=crf20 veryfast（现状兼容）；高清=crf16 medium + 暗部自适应量化 + Bayer 抖动；"
+            + "极致=crf13 slow + 同上。8bit 渐变色带（暗部/天空横向条纹）靠抖动消解，"
+            + "编码层二次模糊靠 crf/preset 消解——极致档编码明显变慢。非标准档进二采指纹";
+        for (const e of UP_ENCODES) {
+            const o = document.createElement("option");
+            o.value = e;
+            o.textContent = e;
+            if (e === up.encode) o.selected = true;
+            encSel.append(o);
+        }
+        encSel.onchange = () => setUpscaleField(node, "encode", encSel.value);
+        encField.append(encSel);
+        body.append(encField);
+
+        /* 独立采样器/调度器（空 = 沿用主链） */
+        const upTextField = (label, value, tip, commit) => {
+            const field = el("div", "h3d-param");
+            field.append(el("label", "", label));
+            const row = el("div", "h3d-seedrow");
+            const inp = document.createElement("input");
+            inp.type = "text";
+            inp.value = value;
+            inp.placeholder = "沿用主链";
+            inp.title = tip;
+            inp.onchange = () => commit(inp.value.trim());
+            row.append(inp);
+            field.append(row);
+            return field;
+        };
+        body.append(upTextField("采样器", up.sampler,
+            "二采独立采样器（空=沿用主链；名字须为 ComfyUI 注册名，如 euler / res_multistep，"
+            + "写错自动回退主链并报告）。非空进二采指纹",
+            (v) => setUpscaleField(node, "sampler", v)));
+        body.append(upTextField("调度器", up.scheduler,
+            "二采独立调度器（空=沿用主链；如 simple / beta / ddim_uniform，"
+            + "写错自动回退主链并报告）。非空进二采指纹",
+            (v) => setUpscaleField(node, "scheduler", v)));
+
+        /* 增益自适应重试 */
+        const rtField = el("div", "h3d-param");
+        rtField.append(el("label", "", "增益重试"));
+        const rtRow = el("div", "h3d-seedrow");
+        const rtCb = document.createElement("input");
+        rtCb.type = "checkbox";
+        rtCb.checked = up.retry === true;
+        rtCb.title = "精化后细节增益未达目标时，自动以 σ+0.1 重跑整条精化链一次、"
+            + "按增益取优（耗时最多翻倍，只在确实不达标时发生）。开启即进二采指纹";
+        rtCb.onchange = () => setUpscaleField(node, "retry", rtCb.checked);
+        rtRow.append(rtCb);
+        rtField.append(rtRow);
+        body.append(rtField);
+        body.append(upNumField("重试目标", up.retry_target, 0.05, 1.0, 0.05,
+            "细节增益目标（+15%=0.15 健康线下限）：增益低于此值才触发重试。"
+            + "仅增益重试开启时生效",
+            (v) => setUpscaleField(node, "retry_target", v)));
 
         /* 目标画布徽章（latent 偶数对齐 = 像素 32 倍数，与后端 target_hw 同口径） */
         const target = upTargetCanvas(node, up.scale);

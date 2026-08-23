@@ -28,7 +28,9 @@ if torch is not None:
 
     def _canvas(h=120, w=160):
         """噪声纹理画布：高频角点利于 ORB/光流，噪声保证帧间估计有自然方差。"""
-        return torch.rand(h, w) * 0.6 + 0.2
+        # 独立生成器避免合集运行时其他测试消耗全局 RNG 后造成接缝阈值抖动。
+        gen = torch.Generator().manual_seed(7)
+        return torch.rand(h, w, generator=gen) * 0.6 + 0.2
 
     def _pan_frames(canvas, x0, speed, n, color_shift=0.0):
         """从画布按 x0 + i*speed 取窗，n 帧 [n,h,w,3] 0-1。"""

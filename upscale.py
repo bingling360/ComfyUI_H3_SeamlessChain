@@ -36,6 +36,17 @@ from . import grid
 
 MODES = ("跟随生成", "手动选择")
 PRECISIONS = ("fp32", "fp16", "bf16")
+ENCODE_PROFILES = ("标准", "高清", "极致")
+# HQ 编码档 → (crf, preset, aq-mode, 抖动)：x264 率失真 + 自适应量化 + 有序抖动。
+# 「标准」= 现状（crf20 veryfast 无抖动，兼容）；「高清/极致」为抗糊抗条纹档——
+# veryfast 比 medium 率失真差约 5-15%（编码层二次模糊），crf 20→16/13 保高清
+# 细节；aq-mode=3 暗部自适应量化（保暗场细节）；Bayer 抖动打散 8bit 量化
+# ——平滑渐变区的横向色带（条纹主源）。
+_ENCODE_SETTINGS = {
+    "标准": (20, "veryfast", None, False),
+    "高清": (16, "medium", 3, True),
+    "极致": (13, "slow", 3, True),
+}
 _PARAM_KEYS = ("model", "arch", "scale", "denoise", "steps", "cfg", "precision")
 
 
@@ -96,6 +107,12 @@ def parse_state(ds):
                  if has_steps else 6)
     else:
         steps = int(_num("steps", 6, 1, 100))
+    encode = str(up.get("encode") or "").strip()
+    if encode not in ENCODE_PROFILES:
+        encode = "标准"
+    # 抗糊武器库（全部默认关：STG=0 / passes=1 / 锐化=0 / 标准编码 / 采样器沿用
+    # 主链 / retry 关——启用任一项才进指纹，既有二采记录不失效）
+    stg_block = int(_num("stg_block", 25, 0, 49))
     return {
         "mode": mode,
         "model": str(up.get("model") or "").strip(),
@@ -109,6 +126,17 @@ def parse_state(ds):
         "mix": _num("mix", 0.0, 0.0, 1.0),
         "adaptive": up.get("adaptive") is True,
         "shift": _num("shift", 0.0, 0.0, 100.0),
+        "stg": _num("stg", 0.0, 0.0, 2.0),
+        "stg_block": stg_block,
+        "passes": int(_num("passes", 1, 1, 3)),
+        "decay": _num("decay", 0.5, 0.2, 0.8),
+        "sharpen": _num("sharpen", 0.0, 0.0, 1.0),
+        "pixel_sharpen": _num("pixel_sharpen", 0.0, 0.0, 1.0),
+        "encode": encode,
+        "sampler": str(up.get("sampler") or "").strip(),
+        "scheduler": str(up.get("scheduler") or "").strip(),
+        "retry": up.get("retry") is True,
+        "retry_target": _num("retry_target", 0.15, 0.05, 1.0),
         "include": include,
     }
 
@@ -195,6 +223,139 @@ def freq_mix_latents(base_v, refined_v, ratio, chunk=8):
         sl = slice(t0, t0 + chunk)
         out[0, :, sl] += r * (_lp(b[0, :, sl]) - _lp(out[0, :, sl]))
     return out
+
+
+# ---- 抗糊武器库：多轮递降精化 / 锐化 / STG / 重试（纯函数，可单测） ----
+
+def cascade_sigmas(sigma_start, passes, decay):
+    """多轮递降精化的 σ 起点序列（路线⑥ cascade 化）：[σ₀, σ₀·decay, σ₀·decay², …]。
+
+    passes=1 → [σ₀]（关，现行为）；每多一轮以更小 σ 在上一轮输出上再精化——
+    「先修结构、再抠细节」的递进口径（T8 尾段细分的通用化）。decay 钳
+    [0.2, 0.8] 保证域内严格递减；防御：若衰减后不降（decay 异常）强制减半；
+    每轮钳 [0.05, 0.95]（与 tail_refine_args 同界）——衰减到 0.05 下限后
+    序列钳住在下限重复（重复档=换种子的低噪声再抠一遍，仍有细节意义）。
+    """
+    n = min(max(int(passes), 1), 3)
+    d = min(max(float(decay), 0.2), 0.8)
+    out = []
+    s = min(max(float(sigma_start), 0.05), 0.95)
+    for _ in range(n):
+        if out:
+            s2 = s * d
+            if s2 >= out[-1]:               # 衰减后仍不降（decay 异常域）→ 强制减半
+                s2 = out[-1] / 2.0
+            s = s2
+        s = min(max(s, 0.05), 0.95)
+        out.append(round(s, 4))
+    return out
+
+
+def sharpen_latents(video_t, amount, chunk=8):
+    """latent 域 unsharp 锐化（抗糊 N3，纯 torch、CPU 分帧块可单测）。
+
+    out = x + amount·(x − 低频(x))，低频 = 逐帧 3×3 均值池化 + replicate
+    边界（与细节增益度量/频域混合同核同口径）。精化补回的高频再乘 (1+amount)
+    放大一档——零模型前向、零显存（CPU 分块，同 freq_mix_latents 模式）。
+    amount=0 原样返回（关，不克隆零开销）；退化输入（None/非 5D/空间<3）
+    原样返回。钳制输出与输入同界 ±（VAE 解码前不再二次钳制——latent 无界，
+    过量锐化由 UI 幅度参数自担）。
+    """
+    if video_t is None or amount is None or float(amount) <= 0.0:
+        return video_t
+    if video_t.dim() != 5 or video_t.shape[-2] < 3 or video_t.shape[-1] < 3:
+        return video_t
+    a = float(amount)
+    out = video_t.detach().to("cpu", torch.float32)
+    if out.data_ptr() == video_t.data_ptr():
+        out = out.clone()
+
+    def _lp(x):
+        xp = torch.nn.functional.pad(x, (1, 1, 1, 1), mode="replicate")
+        return torch.nn.functional.avg_pool2d(xp, 3, stride=1)
+
+    for t0 in range(0, out.shape[2], chunk):
+        sl = slice(t0, t0 + chunk)
+        x = out[0, :, sl]
+        out[0, :, sl] = x + a * (x - _lp(x))
+    return out
+
+
+def pixel_sharpen_frames(frames, amount, chunk=16):
+    """像素域逐帧 unsharp 锐化（抗糊 N4，解码后、编码前）。
+
+    frames [N,H,W,3] float 0-1（GPU/CPU 均可）→ CPU float32 分块逐帧
+    out = img + amount·(img − blur₃(img))，blur = 3×3 均值（replicate 边界）；
+    钳 [0,1]。amount=0 或退化输入（None/ndim≠4/H|W<3）原样返回原对象。
+    与 latent 锐化正交：一个作用于精化输出（生成侧），一个作用于解码帧
+    （交付侧，连 VAE 解码的软化也一起补偿）。
+    """
+    if frames is None or amount is None or float(amount) <= 0.0:
+        return frames
+    if frames.dim() != 4 or frames.shape[1] < 3 or frames.shape[2] < 3:
+        return frames
+    a = float(amount)
+    n = int(frames.shape[0])
+    out = torch.empty((n, frames.shape[1], frames.shape[2], frames.shape[3]),
+                      dtype=torch.float32)
+    for s in range(0, n, chunk):
+        blk = frames[s:s + chunk].detach().to("cpu", torch.float32)   # [k,H,W,3]
+        k = blk.shape[0]
+        x = blk.permute(0, 3, 1, 2)                                   # [k,3,H,W]
+        xp = torch.nn.functional.pad(x, (1, 1, 1, 1), mode="replicate")
+        blur = torch.nn.functional.avg_pool2d(xp, 3, stride=1)
+        y = (x + a * (x - blur)).clamp(0.0, 1.0).permute(0, 2, 3, 1)
+        out[s:s + k] = y
+    return out
+
+
+def pixel_sharpness(frames, max_frames=8):
+    """像素域清晰度度量（抗糊 N6）：抽样帧灰度 Laplacian 方差均值（0-255 域）。
+
+    与 latent 域 HF 增益互补——HF 只反映精化前后相对变化，本值给人眼口径的
+    绝对清晰度锚点（跨参数/跨项目可横向比较；糊帧 <30、清晰帧 90-130 量级，
+    同 qc.frame_scores 口径）。纯 CPU；退化输入返回 0.0。
+    """
+    if frames is None or frames.dim() != 4 or frames.shape[0] < 1 \
+            or frames.shape[1] < 3 or frames.shape[2] < 3:
+        return 0.0
+    n = int(frames.shape[0])
+    step = max(1, n // max_frames)
+    vals = []
+    for i in range(0, n, step)[:max_frames]:
+        img = frames[i].detach().to("cpu", torch.float32)
+        gray = (img[..., 0] * 0.299 + img[..., 1] * 0.587
+                + img[..., 2] * 0.114) * 255.0                        # [H,W]
+        x = gray[None, None]                                          # [1,1,H,W]
+        xp = torch.nn.functional.pad(x, (1, 1, 1, 1), mode="replicate")
+        blur = torch.nn.functional.avg_pool2d(xp, 3, stride=1)
+        lap = (x - blur).pow(2)
+        vals.append(float(lap.mean()))
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def refine_progress(sigma_v, sigma_start):
+    """精化局部进度 p = 1 − σ/σ₀（钳 [0,1]）：本段精化进行到哪了。
+
+    与 time_bias_sigma 同口径（不做 shift 逆变换——σ₀ 与喂给模型的 timestep
+    同在 model_sampling 域，比值即进度，自洽且与 shift 取值无关）。
+    STG 激活窗与重试判定共用。
+    """
+    s0 = float(sigma_start)
+    if s0 <= 0.0:
+        return 1.0
+    p = 1.0 - float(sigma_v) / s0
+    return min(max(p, 0.0), 1.0)
+
+
+def should_retry(hf_gain, target, sigma_start, max_sigma=0.90):
+    """增益自适应重试判定（抗糊 N7）：增益不达标且 σ 还有上调空间 → 重试。
+
+    重试 = 以 σ₀+0.1 重跑整条精化链一次、按细节增益取优（成本一整轮精化，
+    只在明确开且确实不达标时发生）。max_sigma 与 adaptive_sigma 上界一致
+    （0.95 再留 0.05 头寸防撞全量重采）。
+    """
+    return float(hf_gain) < float(target) and float(sigma_start) < float(max_sigma)
 
 
 # 段自适应 σ：latent 域相对运动量 -> 档位 -> σ 起点偏移（路线④）
@@ -295,6 +456,25 @@ def _hash_params(cfg):
         keys["adaptive"] = _ADAPTIVE_VERSION   # 策略位含阈值口径版本；重标定即升版重做
     if cfg.get("shift"):
         keys["shift"] = cfg["shift"]
+    # 抗糊武器库（全部条件化：默认关不进指纹，既有二采记录不失效）
+    if cfg.get("stg"):
+        keys["stg"] = cfg["stg"]
+        keys["stg_block"] = cfg["stg_block"]
+    if int(cfg.get("passes") or 1) > 1:
+        keys["passes"] = cfg["passes"]
+        keys["decay"] = cfg["decay"]
+    if cfg.get("sharpen"):
+        keys["sharpen"] = cfg["sharpen"]
+    if cfg.get("pixel_sharpen"):
+        keys["pixel_sharpen"] = cfg["pixel_sharpen"]
+    if cfg.get("encode") and cfg["encode"] != "标准":
+        keys["encode"] = cfg["encode"]
+    if cfg.get("sampler"):
+        keys["sampler"] = cfg["sampler"]
+    if cfg.get("scheduler"):
+        keys["scheduler"] = cfg["scheduler"]
+    if cfg.get("retry"):
+        keys["retry"] = cfg["retry_target"]
     return keys
 
 
@@ -627,17 +807,29 @@ def _shifted_model(model, shift_video):
     """
     import comfy.model_sampling
 
+    if not hasattr(comfy.model_sampling, "ModelSamplingAV"):
+        raise RuntimeError(
+            "二采调度偏移需要含 ModelSamplingAV 的新版 ComfyUI；请升级 ComfyUI 后重试")
+    if not hasattr(comfy.model_sampling, "CONST"):
+        raise RuntimeError(
+            "二采调度偏移需要 ComfyUI 的 CONST 采样预测类型；请升级 ComfyUI 后重试")
+
     m = model.clone()
 
     class ModelSamplingAdvanced(comfy.model_sampling.ModelSamplingAV,
                                 comfy.model_sampling.CONST):
         pass
 
+    model_config = getattr(getattr(model, "model", None), "model_config", None)
+    if model_config is None:
+        raise RuntimeError("二采调度偏移无法读取 H3 model_config；请确认输入为原生 MiniMax H3 模型")
     original = m.get_model_object("model_sampling")
-    ms = ModelSamplingAdvanced(model.model.model_config)
-    audio_shift = getattr(original, "audio_shift", 3.0)
+    ms = ModelSamplingAdvanced(model_config)
+    audio_shift = getattr(original, "audio_shift", None)
+    if audio_shift is None:
+        audio_shift = 3.0
     ms.set_parameters(shift=float(shift_video), audio_shift=audio_shift)
-    if hasattr(original, "noise_scale"):
+    if getattr(original, "noise_scale", None) is not None:
         ms.set_noise_scale(original.noise_scale)
     m.add_object_patch("model_sampling", ms)
     to = m.model_options["transformer_options"] = dict(
@@ -645,6 +837,80 @@ def _shifted_model(model, shift_video):
     to["minimax_h3_sigma_shift_video"] = float(shift_video)
     to["minimax_h3_sigma_shift_audio"] = float(audio_shift) \
         if audio_shift is not None else 3.0
+    return m
+
+
+# H3 共享 AV Transformer 的 double block 总数（T8 源码 H3_DOUBLE_BLOCK_COUNT=50）
+_H3_DOUBLE_BLOCK_COUNT = 50
+
+
+def _stg_model(model, sigma_start, scale, block, lo=0.15, hi=0.85):
+    """STG 细节引导（抗糊 N1）：跳块差分引导，CFG=1.0 下有效（无 CFG 分支依赖）。
+
+    机制出处：T8mars/comfyui-minimax-h3-audio-T8 的
+    apply_h3_spatiotemporal_guidance（GPL-3.0，机制移植非逐行拷贝）。本实现
+    与上游的两点口径差异：
+    - 激活窗口用【本段精化的局部进度】refine_progress = 1 − σ/σ₀（上游用
+      shift 逆变换的全程 flow progress——那是全量生成的口径；二采是尾段
+      精化，σ 已从 σ₀ 起步，局部进度才与「精化进行到哪」对齐，且与
+      shift 取值解耦、无需逆变换）；
+    - 差分弱分支经 calc_cond_batch 复用完整 cond（含桥锚 keyframe）——
+      引导方向与主精化条件一致，不会把段首拉离桥锚。
+
+    每激活步多跑一次「跳掉第 block 个 double block」的弱前向（返回输入
+    不变的 no-op patch），输出 = denoised + (cond_denoised − weak)·scale：
+    完整前向比弱前向「多出来」的细节被显式放大——CFG=1.0 下的自差分引导。
+    scale=0 不安装（关）；clone 挂 sampler_post_cfg_function + dit
+    patches_replace，主链模型对象零改动。
+    """
+    if float(scale) <= 0.0:
+        return model
+
+    import comfy.model_patcher
+    import comfy.samplers
+
+    block = int(block)
+    source_options = getattr(model, "model_options", {}) or {}
+    if source_options.get("sampler_post_cfg_function"):
+        raise ValueError(
+            "二采 STG 检测到已有 sampler_post_cfg_function，拒绝静默叠加引导回调；"
+            "请关闭其他采样后引导或使用显式组合器")
+    source_replacements = (source_options.get("transformer_options", {})
+                           .get("patches_replace", {}).get("dit", {}))
+    patch_key = ("double_block", block)
+    if patch_key in source_replacements:
+        raise ValueError(
+            f"二采 STG 检测到 double block {block} 已有 replacement，拒绝覆盖其他模型补丁")
+
+    m = model.clone()
+
+    def _skip_block(args, _extra_args):
+        return args                                   # no-op：跳过该 double block
+
+    def _post_cfg(args):
+        sigma_v = float(args["sigma"].flatten()[0].detach().cpu())
+        p = refine_progress(sigma_v, sigma_start)
+        if not (lo <= p <= hi):
+            return args["denoised"]
+        cond = args.get("cond")
+        if cond is None:
+            raise RuntimeError("二采 STG 需要正向 conditioning，当前采样回调未提供 cond")
+        runtime_replacements = (args.get("model_options", {})
+                                .get("transformer_options", {})
+                                .get("patches_replace", {}).get("dit", {}))
+        if patch_key in runtime_replacements:
+            raise RuntimeError(
+                f"二采 STG 运行时检测到 double block {block} replacement 冲突，已停止弱分支")
+        stg_options = comfy.model_patcher.create_model_options_clone(
+            args["model_options"])
+        stg_options = comfy.model_patcher.set_model_options_patch_replace(
+            stg_options, _skip_block, "dit", "double_block", block)
+        (weak,) = comfy.samplers.calc_cond_batch(
+            args["model"], [cond], args["input"], args["sigma"],
+            stg_options)
+        return args["denoised"] + (args["cond_denoised"] - weak) * float(scale)
+
+    m.set_model_sampler_post_cfg_function(_post_cfg)
     return m
 
 
@@ -660,8 +926,12 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     神经放大后注入重采样 cond（CondSync：锚住段首与上段高清尾的连续性）。
     tail_kf_latent: 尾帧身份锚定的基础 latent（与主循环同语义，同步放大注入）。
     cfg.mix>0 时精化输出做频域细节混合（低频锚回纯放大 latent，见
-    freq_mix_latents）；细节增益在混合后的交付 latent 上度量。
-    返回 (up_out_v 高清视频 latent, tw, th, 二采种子, 是否桥锚, 细节增益小数)。
+    freq_mix_latents）；cfg.sharpen>0 时再做 latent 域锐化（sharpen_latents）；
+    细节增益在混合/锐化后的交付 latent 上度量。精化链支持多轮递降 cascade
+    （passes）、STG 细节引导（stg）、独立采样器/调度器（sampler/scheduler）
+    与增益自适应重试（retry）——全部默认关，详见各参数 docstring。
+    返回 (up_out_v 高清视频 latent, tw, th, 二采种子, 是否桥锚, 细节增益小数,
+    是否重试取优)。
     """
     import comfy.model_management
     import comfy.nested_tensor
@@ -763,42 +1033,114 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # σ 起点先过段自适应（路线④：基础 latent 运动档位偏移，与 render_segment
     # 报告行同口径）；shift>0 时采样器换二采专用 shift 克隆模型（路线⑤）。
     sigma0, _tier, _motion = resolve_refine_sigma(cfg, video_t)
-    ks_steps, ks_denoise = tail_refine_args(sigma0, cfg["steps"])   # (n, σ₀)
     tb = float(cfg.get("time_bias") or 0.0)
-    restore_tb = time_bias_guard(模型.model.diffusion_model, ks_denoise, tb) \
-        if tb > 0.0 else None
     sh = float(cfg.get("shift") or 0.0)
-    ks_model = _shifted_model(模型, sh) if sh > 0.0 else 模型
-    try:
-        sampled = comfy_nodes.common_ksampler(
-            ks_model, seed, ks_steps, cfg["cfg"], 采样器, 调度器,
-            cond, negative, latent, denoise=ks_denoise)[0]
-    except RuntimeError as e:
-        if _is_oom(e):
-            msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样在超出当前显存 {1:g}GB）："
-                   "请降低放大倍率、把精化步数调低/起始σ调小，或增大显存。"
-                   "当前精化 {2} 步 @ σ≈{3:g}。本段尚未落盘二采产物，可先行释放其他模型后重试。".format(
-                       cfg["scale"], _vram_gb(), ks_steps, ks_denoise))
+    stg = float(cfg.get("stg") or 0.0)
+    stg_block = int(cfg.get("stg_block") if cfg.get("stg_block") is not None else 25)
+    stg_block = min(max(stg_block, 0), _H3_DOUBLE_BLOCK_COUNT - 1)
+    passes = int(cfg.get("passes") or 1)
+    decay = float(cfg.get("decay") or 0.5)
+    retry_on = cfg.get("retry") is True
+    retry_target = float(cfg.get("retry_target") or 0.15)
+    # 二采独立采样器/调度器（抗糊 N8：空 = 沿用主链 res_multistep/simple）；
+    # 名字不在 ComfyUI 注册表时回退主链值并报告（打错字不至于废一段）
+    ks_sampler = str(cfg.get("sampler") or "").strip()
+    ks_scheduler = str(cfg.get("scheduler") or "").strip()
+    if ks_sampler or ks_scheduler:
+        import comfy.samplers as _cs
+        if ks_sampler and ks_sampler not in _cs.KSampler.SAMPLERS:
             if report is not None:
-                report.append(msg)
-            raise UpscaleAbortError(msg) from e
-        raise
+                report.append(f"⚠ 二采采样器「{ks_sampler}」不存在，沿用主链「{采样器}」")
+            ks_sampler = ""
+        if ks_scheduler and ks_scheduler not in _cs.KSampler.SCHEDULERS:
+            if report is not None:
+                report.append(f"⚠ 二采调度器「{ks_scheduler}」不存在，沿用主链「{调度器}」")
+            ks_scheduler = ""
+    ks_sampler = ks_sampler or 采样器
+    ks_scheduler = ks_scheduler or 调度器
+
+    def _refine_once(sigma_start, cur_latent, cur_seed):
+        """单轮尾段精化：STG / time-bias / shift 各开关在此拼装（每轮 σ₀ 不同，
+        time-bias 窗口与 STG 窗口跟着本轮 σ₀ 走）。OOM → UpscaleAbortError。"""
+        ks_steps, ks_denoise = tail_refine_args(sigma_start, cfg["steps"])
+        restore_tb = time_bias_guard(模型.model.diffusion_model, ks_denoise, tb) \
+            if tb > 0.0 else None
+        try:
+            ks_model = _shifted_model(模型, sh) if sh > 0.0 else 模型
+            if stg > 0.0:
+                # STG 挂在 shift 克隆之上（两次 clone 共享权重，近零成本）；
+                # 弱分支同样过 time_bias patch 的 dit.forward——两边同偏置，
+                # 差分语义保持
+                ks_model = _stg_model(ks_model, ks_denoise, stg, stg_block)
+            try:
+                return comfy_nodes.common_ksampler(
+                    ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
+                    ks_scheduler, cond, negative, cur_latent,
+                    denoise=ks_denoise)[0]
+            except RuntimeError as e:
+                if _is_oom(e):
+                    msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样在超出当前显存 {1:g}GB）："
+                           "请降低放大倍率、把精化步数调低/起始σ调小，或增大显存。"
+                           "当前精化 {2} 步 @ σ≈{3:g}。本段尚未落盘二采产物，可先行释放其他模型后重试。".format(
+                               cfg["scale"], _vram_gb(), ks_steps, ks_denoise))
+                    if report is not None:
+                        report.append(msg)
+                    raise UpscaleAbortError(msg) from e
+                raise
+        finally:
+            if restore_tb is not None:
+                restore_tb()
+
+    def _deliver(sampled_dict):
+        """精化输出 → 交付 latent：频域细节混合（mix）→ latent 锐化（sharpen）
+        → 细节增益度量。顺序固定：mix 动低频（结构锚回放大 latent）、sharpen
+        动高频（细节再放大一档），两者正交可叠加。"""
+        v = sampled_dict["samples"].unbind()[0]
+        if up_v_base is not None:
+            v = freq_mix_latents(up_v_base, v, mix).to(v.device, torch.float32)
+        _shp = float(cfg.get("sharpen") or 0.0)
+        if _shp > 0.0:
+            v = sharpen_latents(v, _shp).to(v.device, torch.float32)
+        return v, hf_gain_ratio(hf_up, latent_hf_energy(v))
+
+    # 多轮递降精化（cascade，抗糊 N2）：passes=1 即现状单轮；σ 序列由
+    # cascade_sigmas 决定论派生（同参数同序列，重放一致）；种子逐轮 +1。
+    # restore_rows 的 finally 覆盖整条精化链（任一轮异常都恢复守卫再上抛）
+    sigmas = cascade_sigmas(sigma0, passes, decay)
+    up_out_v, hf_gain, retried = None, 0.0, False
+    try:
+        cur = latent
+        for k, sk in enumerate(sigmas):
+            cur = _refine_once(sk, cur, (seed + k) % 0xffffffffffffffff)
+
+        up_out_v, hf_gain = _deliver(cur)
+        cur = None
+        if retry_on and should_retry(hf_gain, retry_target, sigma0):
+            # 增益自适应重试（抗糊 N7）：同一起始放大 latent、σ₀+0.1 重跑整条
+            # 精化链一次，按细节增益取优——「一轮抠不动就再深一轮」的自动档
+            sigma_r = min(sigma0 + 0.1, 0.90)
+            sigmas_r = cascade_sigmas(sigma_r, passes, decay)
+            cur2 = latent
+            for k, sk in enumerate(sigmas_r):
+                cur2 = _refine_once(sk, cur2,
+                                    (seed + len(sigmas) + k) % 0xffffffffffffffff)
+            v2, g2 = _deliver(cur2)
+            cur2 = None
+            if g2 > hf_gain:
+                up_out_v, hf_gain = v2, g2
+                retried = True
+            else:
+                v2 = None
+            if report is not None:
+                report.append(f"… 段二采增益 {hf_gain:+.0%} 未达目标 {retry_target:+.0%}"
+                              f"——重试 σ≈{sigma_r:g} 取优"
+                              f"（{'采纳' if retried else '保留原轮'}）")
     finally:
         restore_rows()
-        if restore_tb is not None:
-            restore_tb()
-
-    up_out_v, _discarded_audio = sampled["samples"].unbind()
-    del cond, latent, sampled
+    del cond, latent
     torch.cuda.empty_cache()
-    if up_v_base is not None:
-        # 频域细节混合（CPU 分块）：低频锚回纯放大 latent、高频保留精化增益，
-        # 细节增益度量在【混合后的交付 latent】上取值（报告行如实反映）
-        up_out_v = freq_mix_latents(up_v_base, up_out_v, mix).to(
-            up_out_v.device, torch.float32)
-        del up_v_base
-    hf_gain = hf_gain_ratio(hf_up, latent_hf_energy(up_out_v))
-    return up_out_v, tw, th, seed, bridged, hf_gain
+    del up_v_base
+    return up_out_v, tw, th, seed, bridged, hf_gain, retried
 
 
 def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
@@ -824,7 +1166,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     t0 = time.perf_counter()
     purge_legacy(root, g)
 
-    up_v, tw, th, up_seed, bridged, hf_gain = render_latent(
+    up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
@@ -836,39 +1178,70 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     if len(frames.shape) == 5:
         frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
     frames = frames[skip_f:skip_f + vis_len]
-    if not checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate, fresh=True):
+    # 像素域锐化（抗糊 N4）：解码后、编码前——连 VAE 解码的软化一起补偿；
+    # CPU 分块零显存，amount=0 原对象直通
+    _psp = float(cfg.get("pixel_sharpen") or 0.0)
+    if _psp > 0.0:
+        frames = pixel_sharpen_frames(frames, _psp)
+    # 像素域清晰度度量（抗糊 N6）：跨参数可比的绝对清晰度锚点（记录用，
+    # 不进指纹）；HQ 编码档（抗糊 N5）解析成具体参数透传编码层
+    sharp = round(pixel_sharpness(frames), 2)
+    _enc = str(cfg.get("encode") or "标准")
+    _ecrf, _epreset, _eaq, _edith = _ENCODE_SETTINGS.get(
+        _enc, _ENCODE_SETTINGS["标准"])
+    if not checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate,
+                                       fresh=True, crf=_ecrf, preset=_epreset,
+                                       aq_mode=_eaq, dither=_edith):
         raise RuntimeError("高清分段编码失败（save_av_mp4 返回失败，详见 ComfyUI 控制台输出）")
     checkpoint.save_thumb(root, g, frames[0])
     files = checkpoint.upscale_files(g)
     _save_png(os.path.join(root, files["last"]), frames[-1])
     _sig, _tier, _mo = resolve_refine_sigma(cfg, video_t)
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh,
-                            hf_gain=hf_gain, motion=_mo)
+                            hf_gain=hf_gain, motion=_mo, sharp=sharp)
     _n, _d = tail_refine_args(_sig, cfg["steps"])   # _n=执行步数，_d=σ 起点
     _tb = float(cfg.get("time_bias") or 0.0)
     _mix = float(cfg.get("mix") or 0.0)
     _sh = float(cfg.get("shift") or 0.0)
+    _stg = float(cfg.get("stg") or 0.0)
+    _stgb = int(cfg.get("stg_block") if cfg.get("stg_block") is not None else 25)
+    _passes = int(cfg.get("passes") or 1)
+    _sigmas = cascade_sigmas(_sig, _passes, float(cfg.get("decay") or 0.5))
+    _sig_str = "/".join(f"{s:g}" for s in _sigmas)
+    _shp = float(cfg.get("sharpen") or 0.0)
+    _enc = str(cfg.get("encode") or "标准")
+    _sam = str(cfg.get("sampler") or "").strip()
+    _sch = str(cfg.get("scheduler") or "").strip()
     report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
-                  f"精化 {_n} 步 @ σ≈{_d:g} · 细节 {hf_gain:+.0%} · "
+                  f"精化 {('×'.join([str(_n)] * _passes))} 步 @ σ≈{_sig_str} · "
+                  f"细节 {hf_gain:+.0%} · 清晰 {sharp:.1f} · "
                   f"{time.perf_counter() - t0:.0f}s"
                   + (" · 桥锚" if bridged else "")
                   + (f" · 偏置{_tb:g}" if _tb > 0 else "")
                   + (f" · 混合{_mix:g}" if _mix > 0 else "")
                   + (f" · 自适应σ{_tier}({_mo:.2f})" if _tier else "")
-                  + (f" · shift{_sh:g}" if _sh > 0 else ""))
+                  + (f" · shift{_sh:g}" if _sh > 0 else "")
+                  + (f" · STG{_stg:g}(b{_stgb})" if _stg > 0 else "")
+                  + (f" · 锐化{_shp:g}" if _shp > 0 else "")
+                  + (f" · 像素锐{_psp:g}" if _psp > 0 else "")
+                  + (f" · {_enc}编码" if _enc != "标准" else "")
+                  + ((f" · {(_sam + '/' + _sch).rstrip('/')}")
+                     if (_sam or _sch) else "")
+                  + (" · 重试取优" if retried else ""))
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
     torch.cuda.empty_cache()
     return frames[-1].detach().float().cpu(), up_state
 
 
-def write_record(root, g, cfg, seed, size, bh, hf_gain=None, motion=None):
+def write_record(root, g, cfg, seed, size, bh, hf_gain=None, motion=None,
+                 sharp=None):
     """段 g 高清渲染记录原子写盘（重读 manifest 防竞态覆盖并发进度）。
 
     bh=该段基础身份指纹（调用方用本地 full_hashes/seeds 现算，不依赖磁盘
-    manifest 的写入时机）；hf_gain=细节增益 / motion=段运动量（均仅记录供
-    ab_report 复盘与自适应阈值校准，不参与重做判定）；返回最新 upscale
-    dict（调用方回填 proj_upscale，后续主循环的 manifest 快照写盘才不会
-    把记录冲掉）。
+    manifest 的写入时机）；hf_gain=细节增益 / motion=段运动量 / sharp=像素域
+    清晰度（均仅记录供 ab_report 复盘与自适应阈值校准，不参与重做判定）；
+    返回最新 upscale dict（调用方回填 proj_upscale，后续主循环的 manifest
+    快照写盘才不会把记录冲掉）。
     """
     ph = params_hash(cfg)
     rec = {"hash": ph, "base_hash": bh, "seed": seed, "done": True,
@@ -877,6 +1250,8 @@ def write_record(root, g, cfg, seed, size, bh, hf_gain=None, motion=None):
         rec["hf_gain"] = round(float(hf_gain), 4)
     if motion is not None:
         rec["motion"] = round(float(motion), 4)
+    if sharp is not None:
+        rec["sharp"] = round(float(sharp), 2)
     fresh = checkpoint.load_manifest(root) or {}
     up_state = dict(fresh["upscale"]) if isinstance(fresh.get("upscale"), dict) else {}
     segs = list(up_state.get("segs") or [])
@@ -967,7 +1342,11 @@ def try_final(root, cfg, report):
     # （tw/th 对调遗留），实测口径对旧/新记录都正确；一致性门控仍用记录值
     # （旧记录整批同向转置，互相比较不受影响）。concat 缺省即按首源实测画幅。
     sz = media.probe_video_size(sources[0]) or tuple(size0)
-    if media.concat_av_mp4(sources, os.path.join(root, out_name)):
+    _crf, _preset, _aq, _dither = _ENCODE_SETTINGS.get(
+        str(cfg.get("encode") or "标准"), _ENCODE_SETTINGS["标准"])
+    if media.concat_av_mp4(sources, os.path.join(root, out_name),
+                           crf=_crf, preset=_preset, aq_mode=_aq,
+                           dither=_dither):
         fresh = checkpoint.load_manifest(root) or dict(mf)
         fresh.setdefault("finals", []).append(out_name)
         up_state = dict(fresh.get("upscale") or {})

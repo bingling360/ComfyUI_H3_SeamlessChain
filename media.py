@@ -9,8 +9,39 @@ import os
 
 last_error = None
 
+# 4×4 Bayer 有序抖动矩阵（0-15）：标准 magic-square 排列，16 档阈值均布
+_BAYER4 = (
+    (0, 8, 2, 10),
+    (12, 4, 14, 6),
+    (3, 11, 1, 9),
+    (15, 7, 13, 5),
+)
 
-def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
+
+def dither_quantize(arr_f):
+    """[H,W,3] float 0-1 / 整数图像 -> uint8（4×4 Bayer 有序抖动）。
+
+    抗条纹（banding）核心：量化加阈值 (k+0.5)/16 后取整，常量场的量化误差
+    从「整块同值」打散为 16 档细粒度交替——平滑渐变区（天空/皮肤/暗部）的
+    8bit 横向色带被转为不可察觉的微噪，期望值无偏（E[量化] = 原值 ×255）。
+    确定性（无随机源，重放一致）；整数输入先按 dtype 满量程归一化，避免误把
+    uint8 的 0..255 当 0..1 再量化导致整帧截白。
+    """
+    import numpy as np
+    src = np.asarray(arr_f)
+    if np.issubdtype(src.dtype, np.integer):
+        x = src.astype("float32") / float(np.iinfo(src.dtype).max)
+    else:
+        x = src.astype("float32", copy=False)
+    h, w = x.shape[:2]
+    off = (np.asarray(_BAYER4, dtype="float32") + 0.5) / 16.0
+    tile = np.tile(off, ((h + 3) // 4, (w + 3) // 4))[:h, :w]
+    q = np.floor(x * 255.0 + tile[..., None]).clip(0.0, 255.0)
+    return q.astype("uint8")
+
+
+def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4,
+                preset="veryfast", aq_mode=None, dither=False):
     """可见帧 + 音轨 -> mp4（H.264 + AAC），成功返回 True。
 
     先写 .part 再原子改名：失败不留半成品、不破坏已有文件。编码失败
@@ -20,6 +51,12 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
     内存与 CPU 约束：分块（32 帧）搬运到 CPU，峰值内存 ~160MB 而非整链
     float32（长链数 GB，曾致内存耗尽假死）；threads 限 4（x264 默认
     线程=核数×1.5，会打满 CPU 导致整机卡顿）。
+
+    编码质量旋钮（抗糊 N5，默认值 = 现状兼容）：
+    - crf：恒定质量（越小越清晰，20 标准 / 16 高清 / 13 极致）；
+    - preset：x264 率失真档（veryfast 快但糊 5-15%，medium/slow 保细节）；
+    - aq_mode：自适应量化（3=暗部保细节，None=关）；
+    - dither：Bayer 有序抖动（8bit 渐变色带 → 微噪，条纹正解）。
     """
     global last_error
     try:
@@ -32,7 +69,7 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
     try:
         n = int(frames.shape[0])
         h, w = int(frames.shape[1]), int(frames.shape[2])
-        h, w = h - h % 2, w - h % 2  # yuv420p 要求偶数尺寸
+        h, w = h - h % 2, w - w % 2  # yuv420p 要求偶数尺寸
         pcm = numpy.ascontiguousarray(wav.detach().float().cpu().clamp(-1.0, 1.0).numpy())
         if pcm.ndim == 3:                    # [batch, ch, samples] → [ch, samples]
             pcm = pcm[0]
@@ -46,16 +83,21 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4):
             vstream = container.add_stream("libx264", rate=fps)
             vstream.width, vstream.height = w, h
             vstream.pix_fmt = "yuv420p"
-            vstream.options = {"crf": str(int(crf)), "preset": "veryfast",
-                               "threads": str(max(1, int(threads)))}
+            options = {"crf": str(int(crf)), "preset": str(preset),
+                       "threads": str(max(1, int(threads)))}
+            if aq_mode:
+                options["aq-mode"] = str(int(aq_mode))
+            vstream.options = options
             astream = container.add_stream("aac", rate=int(sample_rate), layout=layout)
 
             for start in range(0, n, 32):
-                block = (frames[start:start + 32].detach().float().clamp(0.0, 1.0)
-                         .cpu().numpy()[:, :h, :w, :3] * 255.0).astype("uint8")
-                for i in range(block.shape[0]):
+                raw = (frames[start:start + 32].detach().float().clamp(0.0, 1.0)
+                       .cpu().numpy()[:, :h, :w, :3])
+                for i in range(raw.shape[0]):
+                    arr = dither_quantize(raw[i]) if dither \
+                        else (raw[i] * 255.0).astype("uint8")
                     frame = av.VideoFrame.from_ndarray(
-                        numpy.ascontiguousarray(block[i]), format="rgb24")
+                        numpy.ascontiguousarray(arr), format="rgb24")
                     for packet in vstream.encode(frame):
                         container.mux(packet)
             if ch > 2:
@@ -137,7 +179,8 @@ def probe_video_size(path):
     return None
 
 
-def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, threads=4):
+def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, threads=4,
+                  preset="veryfast", aq_mode=None, dither=False):
     """多个 mp4 按序流式拼接为一个（H.264 + AAC），成功返回 True。
 
     合并导出专用：逐源 demux→decode→encode，视频帧不进 Python 侧累积
@@ -148,7 +191,10 @@ def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, th
       上传前转 24fps；H3 全链输出本身即 24fps）
     - 音频以第一个含音轨源的参数为基准，源间 AudioResampler 统一采样率/声道；
       无音轨源按其视频时长补静音
-    先写 .part 再原子改名；失败原因存 media.last_error。
+    先写 .part 再原子改名；失败原因存 media.last_error。preset/aq_mode 与
+    save_av_mp4 同口径，供二采高清成片沿用分段编码档位。dither 保留为同口径
+    调用参数，但不在拼接阶段重复量化：源分段已在 float->uint8 时完成抖动，
+    解码后的帧只有 8bit，再抖一次既无法恢复精度，还会破坏已有像素。
     """
     global last_error
     try:
@@ -192,8 +238,11 @@ def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, th
             vstream = container.add_stream("libx264", rate=fps)
             vstream.width, vstream.height = w, h
             vstream.pix_fmt = "yuv420p"
-            vstream.options = {"crf": str(int(crf)), "preset": "veryfast",
-                               "threads": str(max(1, int(threads)))}
+            options = {"crf": str(int(crf)), "preset": str(preset),
+                       "threads": str(max(1, int(threads)))}
+            if aq_mode:
+                options["aq-mode"] = str(int(aq_mode))
+            vstream.options = options
             astream = container.add_stream("aac", rate=base_rate, layout=base_layout)
             for p in sources:
                 with av.open(p) as src:

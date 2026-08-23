@@ -330,8 +330,12 @@ def save_thumb(seg_dir: str, idx: int, frame) -> str:
 
 
 def save_segment_mp4(seg_dir: str, idx: int, frames, wav, sample_rate: int,
-                     fps: int = 24, fresh: bool = True) -> str:
+                     fps: int = 24, fresh: bool = True, crf: int = 20,
+                     preset: str = "veryfast", aq_mode=None, dither=False) -> str:
     """段可见帧 + 音轨 -> seg_NNN.mp4（编码实现在 media.save_av_mp4，与成片保存共用）。
+
+    crf/preset/aq_mode/dither 为编码质量旋钮（默认值=现状兼容；二采 HQ 档
+    由 upscale.render_segment 按编码档位解析后传入，基础链仍走默认）。
 
     缺失或编码失败返回空串（上游回退为缩略图，不影响主流程）。
     fresh=False（存档回放）且文件已存在时直接沿用，避免每次续跑全链重编码。
@@ -344,4 +348,6 @@ def save_segment_mp4(seg_dir: str, idx: int, frames, wav, sample_rate: int,
         from .media import save_av_mp4    # 包内（ComfyUI 运行时）
     except ImportError:
         from media import save_av_mp4     # 顶层导入（无 ComfyUI 的单测环境）
-    return name if save_av_mp4(path, frames, wav, sample_rate, fps) else ""
+    return name if save_av_mp4(path, frames, wav, sample_rate, fps,
+                               crf=crf, preset=preset, aq_mode=aq_mode,
+                               dither=dither) else ""

@@ -892,12 +892,31 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _tb = float(up_cfg.get("time_bias") or 0.0)
             _mix = float(up_cfg.get("mix") or 0.0)
             _sh = float(up_cfg.get("shift") or 0.0)
+            _stg = float(up_cfg.get("stg") or 0.0)
+            _stgb = int(up_cfg.get("stg_block") if up_cfg.get("stg_block") is not None else 25)
+            _passes = int(up_cfg.get("passes") or 1)
+            _sig_list = upscale.cascade_sigmas(float(up_cfg["denoise"]), _passes,
+                                               float(up_cfg.get("decay") or 0.5))
+            _shp = float(up_cfg.get("sharpen") or 0.0)
+            _psp = float(up_cfg.get("pixel_sharpen") or 0.0)
+            _enc = str(up_cfg.get("encode") or "标准")
+            _sam = str(up_cfg.get("sampler") or "").strip()
+            _sch = str(up_cfg.get("scheduler") or "").strip()
             report.append(f"潜空间放大二采：{up_cfg['mode']} · {up_cfg['arch']} {up_cfg['scale']:g}× · "
-                          f"精化 {up_cfg['steps']} 步 @ σ≈{up_cfg['denoise']:g}"
+                          f"精化 {up_cfg['steps']} 步"
+                          + (f"×{_passes}轮" if _passes > 1 else "")
+                          + " @ σ≈" + "/".join(f"{s:g}" for s in _sig_list)
                           + (f" · 时间偏置 {_tb:g}" if _tb > 0 else "")
                           + (f" · 细节混合 {_mix:g}" if _mix > 0 else "")
                           + (" · 段自适应σ" if up_cfg.get("adaptive") is True else "")
                           + (f" · 二采shift {_sh:g}" if _sh > 0 else "")
+                          + (f" · STG引导 {_stg:g}(块{_stgb})" if _stg > 0 else "")
+                          + (f" · latent锐化 {_shp:g}" if _shp > 0 else "")
+                          + (f" · 像素锐化 {_psp:g}" if _psp > 0 else "")
+                          + (f" · {_enc}编码" if _enc != "标准" else "")
+                          + (f" · 独立采样 {_sam}/{_sch}".rstrip("/")
+                             if (_sam or _sch) else "")
+                          + (" · 增益重试" if up_cfg.get("retry") is True else "")
                           + "——每段采样定稿后立即渲染高清，分段视频与成片直接保存二采结果")
         elif _up_err:
             report.append(f"潜空间放大二采：面板已开启但本次跳过——{_up_err}")
