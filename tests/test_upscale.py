@@ -89,11 +89,12 @@ def test_parse_state_normalize():
     assert cfg["precision"] == "fp16"
     assert cfg["time_bias"] == 0.0
     assert cfg["mix"] == 0.0
+    assert cfg["adaptive"] is False and cfg["shift"] == 0.0
 
     full = upscale.parse_state({"upscale": {
         "schema": 2, "mode": "手动选择", "model": " up2d.pth ", "arch": "3d", "scale": "9",
         "denoise": "0.01", "steps": "0", "cfg": "-5", "precision": "x",
-        "time_bias": "9", "mix": "2",
+        "time_bias": "9", "mix": "2", "adaptive": "yes", "shift": "200",
         "include": [2, "1", 1.0, "bad", None]}})
     assert full["mode"] == "手动选择"
     assert full["model"] == "up2d.pth"          # strip 空白
@@ -105,6 +106,8 @@ def test_parse_state_normalize():
     assert full["precision"] == "fp16"          # 非法精度回落
     assert full["time_bias"] == 0.2             # 钳上限
     assert full["mix"] == 1.0                   # 钳上限
+    assert full["adaptive"] is False            # 非 JSON true 一律关
+    assert full["shift"] == 100.0               # 钳上限
     assert full["include"] == [1, 2]            # 去重排序，垃圾项剔除
 
     nan = upscale.parse_state({"upscale": {"mode": "跟随生成", "scale": float("nan"),
@@ -326,6 +329,89 @@ def test_params_hash_mix():
                                                "time_bias": 0.03}})
     assert upscale.params_hash(both) != upscale.params_hash(tb_only)
     assert upscale.params_hash(both) != h
+
+
+def test_latent_motion():
+    """latent 域相对运动量：静态=0、交替大幅=高、尺度不变、退化兜底、决定论。"""
+    f = upscale.latent_motion
+    frame = torch.randn(1, 8, 1, 8, 8)
+    static = frame.repeat(1, 1, 6, 1, 1)                      # 全同帧=零运动
+    assert f(static) == 0.0
+    a, b = torch.randn(1, 8, 1, 8, 8), torch.randn(1, 8, 1, 8, 8)
+    action = torch.cat([a, b, a, b, a, b], dim=2)             # 交替大幅=高运动
+    assert f(action) > 0.5
+    # 尺度不变：整体乘常数不改变相对变化率
+    assert abs(f(action * 10.0) - f(action)) < 1e-5
+    assert f(action) == f(action)                             # 决定论
+    # 退化兜底（None/非 5D/T<1 帧/全零）= 0.0（静态档，安全侧）
+    assert f(None) == 0.0
+    assert f(torch.randn(8, 6, 8, 8)) == 0.0
+    assert f(torch.randn(1, 8, 1, 8, 8)) == 0.0
+    assert f(torch.zeros(1, 8, 6, 8, 8)) == 0.0
+    # 与档位函数联动：静态量→静态档、高运动量→高运动档
+    assert upscale.motion_tier(f(static)) == "静态"
+    assert upscale.motion_tier(f(action)) == "高运动"
+
+
+def test_adaptive_sigma():
+    """档位映射与 σ 偏移：静态+0.05 / 中±0 / 高运动−0.075，钳 [0.05, 0.95]。"""
+    f = upscale.adaptive_sigma
+    s, tier = f(0.35, 0.01)
+    assert tier == "静态" and abs(s - 0.40) < 1e-9
+    s, tier = f(0.35, 0.15)
+    assert tier == "中" and s == 0.35                          # 中档 +0.0 精确不动
+    s, tier = f(0.35, 0.5)
+    assert tier == "高运动" and abs(s - 0.275) < 1e-9
+    # 阈值边界（严格不等）：恰在阈值上=中档
+    assert upscale.motion_tier(0.10) == "中"
+    assert upscale.motion_tier(0.22) == "中"
+    assert upscale.motion_tier(0.0999) == "静态"
+    assert upscale.motion_tier(0.2201) == "高运动"
+    # clamp 边界（min/max 返回常量侧，精确相等）
+    assert f(0.93, 0.01)[0] == 0.95                           # 静态顶到上限
+    assert f(0.06, 0.5)[0] == 0.05                            # 高运动落到下限
+    s, tier = f(0.90, 0.5)
+    assert tier == "高运动" and abs(s - 0.825) < 1e-9
+
+
+def test_resolve_refine_sigma():
+    """adaptive 关=原样σ（不算运动量）；开=决定论派生（与 latent_motion+adaptive_sigma 同值）。"""
+    z = torch.randn(1, 8, 6, 8, 8)
+    off = upscale.parse_state({"upscale": {"mode": "跟随生成"}})
+    assert upscale.resolve_refine_sigma(off, z) == (0.35, None, None)
+    on = upscale.parse_state({"upscale": {"mode": "跟随生成", "adaptive": True}})
+    sig, tier, motion = upscale.resolve_refine_sigma(on, z)
+    exp = upscale.latent_motion(z)
+    assert (sig, tier) == upscale.adaptive_sigma(0.35, exp)
+    assert motion == exp
+    # 布尔归一：仅 JSON true 视为开（手写 "true"/1 字符串数字一律关——防御默认关）
+    assert upscale.parse_state({"upscale": {"mode": "跟随生成",
+                                            "adaptive": "true"}})["adaptive"] is False
+    assert upscale.parse_state({"upscale": {"mode": "跟随生成",
+                                            "adaptive": 1}})["adaptive"] is False
+
+
+def test_params_hash_adaptive_shift():
+    """adaptive/shift 条件化指纹：默认不进（既有记录不失效），启用才进、互相独立。"""
+    base = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth"}})
+    h = upscale.params_hash(base)
+    assert base["adaptive"] is False and base["shift"] == 0.0
+    ad = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
+                                          "adaptive": True}})
+    sh = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
+                                          "shift": 6.0}})
+    assert h != upscale.params_hash(ad)
+    assert h != upscale.params_hash(sh)
+    assert upscale._hash_params(ad)["adaptive"] is True        # 记录口径同指纹
+    both = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
+                                            "adaptive": True, "shift": 6.0}})
+    assert upscale.params_hash(both) != upscale.params_hash(ad)
+    assert upscale.params_hash(both) != upscale.params_hash(sh)
+    # 解析归一：shift 默认 0 / 钳上限 100 / 垃圾回落 0
+    assert upscale.parse_state({"upscale": {"mode": "跟随生成",
+                                            "shift": 200}})["shift"] == 100.0
+    assert upscale.parse_state({"upscale": {"mode": "跟随生成",
+                                            "shift": "bad"}})["shift"] == 0.0
 
 
 def test_base_hash():

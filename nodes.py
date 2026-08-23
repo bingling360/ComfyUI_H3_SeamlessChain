@@ -891,10 +891,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if up_cfg:
             _tb = float(up_cfg.get("time_bias") or 0.0)
             _mix = float(up_cfg.get("mix") or 0.0)
+            _sh = float(up_cfg.get("shift") or 0.0)
             report.append(f"潜空间放大二采：{up_cfg['mode']} · {up_cfg['arch']} {up_cfg['scale']:g}× · "
                           f"精化 {up_cfg['steps']} 步 @ σ≈{up_cfg['denoise']:g}"
                           + (f" · 时间偏置 {_tb:g}" if _tb > 0 else "")
                           + (f" · 细节混合 {_mix:g}" if _mix > 0 else "")
+                          + (" · 段自适应σ" if up_cfg.get("adaptive") is True else "")
+                          + (f" · 二采shift {_sh:g}" if _sh > 0 else "")
                           + "——每段采样定稿后立即渲染高清，分段视频与成片直接保存二采结果")
         elif _up_err:
             report.append(f"潜空间放大二采：面板已开启但本次跳过——{_up_err}")

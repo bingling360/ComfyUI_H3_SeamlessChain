@@ -107,6 +107,8 @@ def parse_state(ds):
         "precision": precision,
         "time_bias": _num("time_bias", 0.0, 0.0, 0.2),
         "mix": _num("mix", 0.0, 0.0, 1.0),
+        "adaptive": up.get("adaptive") is True,
+        "shift": _num("shift", 0.0, 0.0, 100.0),
         "include": include,
     }
 
@@ -197,6 +199,69 @@ def freq_mix_latents(base_v, refined_v, ratio, chunk=8):
     return out
 
 
+# 段自适应 σ：latent 域相对运动量 -> 档位 -> σ 起点偏移（路线④）
+_MOTION_STATIC_MAX = 0.10   # < 此值=静态（对话/特写）→ 升 σ 抠脸
+_MOTION_ACTION_MIN = 0.22   # > 此值=高运动（打斗/运镜）→ 降 σ 防拖影鬼影
+# 两阈值为初始估计：报告行打印「运动量→档位→σ」，用真实项目的报告数据校准
+_SIGMA_OFFSETS = {"静态": 0.05, "中": 0.0, "高运动": -0.075}
+
+
+def latent_motion(video_t, max_pairs=12):
+    """latent 域相对运动量（尺度不变，纯 torch 可单测）。
+
+    均匀抽样 ≤max_pairs 个相邻帧对，motion = mean( ‖x[t+1]−x[t]‖_rms /
+    (‖x[t]‖_rms+ε) )——逐帧相对变化率，与 latent 幅值无关。比 metrics.py
+    的像素域 Farneback 光流（需解码帧）零成本：直接在【基础段 latent】上
+    CPU 计算，对 prompt/insert/prologue 段全适用；同 latent 同值（决定论，
+    重放不串档）。退化输入（None/非 5D/T<2）返回 0.0（=静态档，安全侧）。
+    """
+    if video_t is None or video_t.dim() != 5 or video_t.shape[2] < 2:
+        return 0.0
+    t = int(video_t.shape[2])
+    step = max(1, (t - 1) // max_pairs)
+    idx = torch.arange(0, t - 1, step)[:max_pairs]
+    x = video_t.detach().to("cpu", torch.float32)[0]         # [C,T,H,W]
+    diffs, bases = [], []
+    for i in idx.tolist():
+        diffs.append(x[:, i + 1] - x[:, i])
+        bases.append(x[:, i])
+    d = torch.stack(diffs).pow(2).mean().sqrt()
+    b = torch.stack(bases).pow(2).mean().sqrt()
+    if float(b) < 1e-8:
+        return 0.0                                            # 全零/常量段=无运动
+    return float(d / b)
+
+
+def motion_tier(motion):
+    """运动量 -> 档位标签（阈值常量见上，档位进报告行/记录供复盘校准）。"""
+    if motion < _MOTION_STATIC_MAX:
+        return "静态"
+    if motion > _MOTION_ACTION_MIN:
+        return "高运动"
+    return "中"
+
+
+def adaptive_sigma(sigma_start, motion):
+    """(σ起点, 运动量) -> (档内生效σ, 档位)：静态 +0.05 抠脸 / 高运动 −0.075
+    防拖影鬼影 / 中档不动；钳 [0.05, 0.95]（与 tail_refine_args 同界）。
+    默认 σ=0.35 时三档 ≈ 0.40 / 0.35 / 0.275（对齐路线：0.4 / 0.25-0.3）。"""
+    tier = motion_tier(motion)
+    s = min(max(float(sigma_start) + _SIGMA_OFFSETS[tier], 0.05), 0.95)
+    return s, tier
+
+
+def resolve_refine_sigma(cfg, video_t):
+    """cfg + 基础段 latent -> (生效σ起点, 档位|None, 运动量|None)：
+    adaptive 关=原样 σ 起点（不算运动量）；开=按段运动档位偏移。
+    render_latent（实际采样）/ render_segment（报告行）/ write_record
+    （manifest 复盘）同用本函数，三处永远同口径。"""
+    if cfg.get("adaptive") is not True:
+        return float(cfg["denoise"]), None, None
+    motion = latent_motion(video_t)
+    sigma, tier = adaptive_sigma(cfg["denoise"], motion)
+    return sigma, tier, motion
+
+
 def time_bias_sigma(sigma_v, sigma_start, bias, start_progress=0.70,
                     end_progress=1.0):
     """尾段时间偏置核心数学（Detail-Daemon 类，T8mars 机制移植，纯函数可单测）。
@@ -223,14 +288,20 @@ def _hash_params(cfg):
         keys["time_bias"] = cfg["time_bias"]
     if cfg.get("mix"):
         keys["mix"] = cfg["mix"]
+    if cfg.get("adaptive"):
+        keys["adaptive"] = True     # 只进策略位；档内生效σ由基础 latent 决定论派生
+    if cfg.get("shift"):
+        keys["shift"] = cfg["shift"]
     return keys
 
 
 def params_hash(cfg):
     """二采参数 -> 8 位指纹（mode/include 不进：不影响单段输出）。
 
-    time_bias / mix 仅在 >0（启用）时进指纹——默认关闭不改变哈希，既有二采
-    记录不因新增参数而失效重做。
+    time_bias / mix / shift 仅在 >0、adaptive 仅在开启时进指纹——默认全关
+    不改变哈希，既有二采记录不因新增参数而失效重做。adaptive 开启后每段
+    生效 σ 由该段基础 latent（经 base_hash 指纹）决定论派生，无需逐段进
+    指纹也不会串档。
     """
     return checkpoint.fingerprint(_hash_params(cfg))
 
@@ -529,6 +600,39 @@ def time_bias_guard(dit, sigma_start, bias):
     return lambda: setattr(dit, "forward", orig_forward)
 
 
+def _shifted_model(model, shift_video):
+    """二采专用 shift 模型（镜像官方 MiniMaxH3SigmaShift 节点，路线⑤）。
+
+    clone + add_object_patch 只喂给二采的 common_ksampler——主链模型对象
+    零改动、无需恢复（比原地 patch+回滚安全）。video shift 驱动采样器
+    sigma 网格（ModelSamplingAV），并同步写 transformer_options 的
+    minimax_h3_sigma_shift_video/audio（DiT 反演共享基网格要用，官方节点
+    同款契约）；audio_shift 原样透传主链现值（默认 3.0）。
+    T8 实证：高分辨率二采档 shift 12→6 调度更线性、细节合成更充分。
+    """
+    import comfy.model_sampling
+
+    m = model.clone()
+
+    class ModelSamplingAdvanced(comfy.model_sampling.ModelSamplingAV,
+                                comfy.model_sampling.CONST):
+        pass
+
+    original = m.get_model_object("model_sampling")
+    ms = ModelSamplingAdvanced(model.model.model_config)
+    audio_shift = getattr(original, "audio_shift", 3.0)
+    ms.set_parameters(shift=float(shift_video), audio_shift=audio_shift)
+    if hasattr(original, "noise_scale"):
+        ms.set_noise_scale(original.noise_scale)
+    m.add_object_patch("model_sampling", ms)
+    to = m.model_options["transformer_options"] = dict(
+        m.model_options.get("transformer_options", {}))
+    to["minimax_h3_sigma_shift_video"] = float(shift_video)
+    to["minimax_h3_sigma_shift_audio"] = float(audio_shift) \
+        if audio_shift is not None else 3.0
+    return m
+
+
 def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
                   pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
@@ -640,14 +744,19 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # ⚠ 显存不足直接报错停止（用户明确要求，不做静默降级）：二采在高清 latent 上
     # 采样需要额外显存，若 32GB 卡放不下 26GB UNET + 高清激活，当场抛出明确错误，
     # 前端/报告会终止整链而不是降级基础分辨率继续（避免产出不一致的混合清晰度）。
-    ks_steps, ks_denoise = tail_refine_args(cfg["denoise"], cfg["steps"])
+    # σ 起点先过段自适应（路线④：基础 latent 运动档位偏移，与 render_segment
+    # 报告行同口径）；shift>0 时采样器换二采专用 shift 克隆模型（路线⑤）。
+    sigma0, _tier, _motion = resolve_refine_sigma(cfg, video_t)
+    ks_steps, ks_denoise = tail_refine_args(sigma0, cfg["steps"])
     n_eff = int(ks_steps * ks_denoise)
     tb = float(cfg.get("time_bias") or 0.0)
     restore_tb = time_bias_guard(模型.model.diffusion_model, n_eff / ks_steps, tb) \
         if tb > 0.0 else None
+    sh = float(cfg.get("shift") or 0.0)
+    ks_model = _shifted_model(模型, sh) if sh > 0.0 else 模型
     try:
         sampled = comfy_nodes.common_ksampler(
-            模型, seed, ks_steps, cfg["cfg"], 采样器, 调度器,
+            ks_model, seed, ks_steps, cfg["cfg"], 采样器, 调度器,
             cond, negative, latent, denoise=ks_denoise)[0]
     except RuntimeError as e:
         if _is_oom(e):
@@ -717,35 +826,43 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     checkpoint.save_thumb(root, g, frames[0])
     files = checkpoint.upscale_files(g)
     _save_png(os.path.join(root, files["last"]), frames[-1])
-    up_state = write_record(root, g, cfg, up_seed, (tw, th), bh, hf_gain=hf_gain)
-    _n, _d = tail_refine_args(cfg["denoise"], cfg["steps"])
+    _sig, _tier, _mo = resolve_refine_sigma(cfg, video_t)
+    up_state = write_record(root, g, cfg, up_seed, (tw, th), bh,
+                            hf_gain=hf_gain, motion=_mo)
+    _n, _d = tail_refine_args(_sig, cfg["steps"])
     _n_eff = int(_n * _d)
     _tb = float(cfg.get("time_bias") or 0.0)
     _mix = float(cfg.get("mix") or 0.0)
+    _sh = float(cfg.get("shift") or 0.0)
     report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
                   f"精化 {_n_eff} 步 @ σ≈{_n_eff / _n:g} · 细节 {hf_gain:+.0%} · "
                   f"{time.perf_counter() - t0:.0f}s"
                   + (" · 桥锚" if bridged else "")
                   + (f" · 偏置{_tb:g}" if _tb > 0 else "")
-                  + (f" · 混合{_mix:g}" if _mix > 0 else ""))
+                  + (f" · 混合{_mix:g}" if _mix > 0 else "")
+                  + (f" · 自适应σ{_tier}({_mo:.2f})" if _tier else "")
+                  + (f" · shift{_sh:g}" if _sh > 0 else ""))
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
     torch.cuda.empty_cache()
     return frames[-1].detach().float().cpu(), up_state
 
 
-def write_record(root, g, cfg, seed, size, bh, hf_gain=None):
+def write_record(root, g, cfg, seed, size, bh, hf_gain=None, motion=None):
     """段 g 高清渲染记录原子写盘（重读 manifest 防竞态覆盖并发进度）。
 
     bh=该段基础身份指纹（调用方用本地 full_hashes/seeds 现算，不依赖磁盘
-    manifest 的写入时机）；hf_gain=细节增益小数（仅记录供 ab_report 复盘，
-    不参与重做判定）；返回最新 upscale dict（调用方回填 proj_upscale，
-    后续主循环的 manifest 快照写盘才不会把记录冲掉）。
+    manifest 的写入时机）；hf_gain=细节增益 / motion=段运动量（均仅记录供
+    ab_report 复盘与自适应阈值校准，不参与重做判定）；返回最新 upscale
+    dict（调用方回填 proj_upscale，后续主循环的 manifest 快照写盘才不会
+    把记录冲掉）。
     """
     ph = params_hash(cfg)
     rec = {"hash": ph, "base_hash": bh, "seed": seed, "done": True,
            "files": checkpoint.upscale_files(g), "size": list(size)}
     if hf_gain is not None:
         rec["hf_gain"] = round(float(hf_gain), 4)
+    if motion is not None:
+        rec["motion"] = round(float(motion), 4)
     fresh = checkpoint.load_manifest(root) or {}
     up_state = dict(fresh["upscale"]) if isinstance(fresh.get("upscale"), dict) else {}
     segs = list(up_state.get("segs") or [])

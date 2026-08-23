@@ -462,8 +462,9 @@ function defaultDs() {
 function defaultUpscale() {
     /* 潜空间放大二采：主循环内渲染通道（每段采样定稿后、段落盘前），参数不进基础链指纹。
        schema 2：steps=尾段精化步数（与 denoise=尾段起始σ 解耦），旧 JSON 由 getDs 迁移。
-       time_bias / mix 默认 0=关，仅启用时进后端指纹（不使既有记录失效） */
-    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16", time_bias: 0.0, mix: 0.0, include: [] };
+       time_bias / mix / shift 默认 0=关、adaptive 默认 false=关，仅启用时进后端指纹
+       （不使既有记录失效） */
+    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16", time_bias: 0.0, mix: 0.0, adaptive: false, shift: 0.0, include: [] };
 }
 
 function defaultSegment() {
@@ -556,6 +557,8 @@ function getDs(node) {
             precision: UP_PRECISIONS.includes(upRaw.precision) ? upRaw.precision : "fp16",
             time_bias: upNum(upRaw.time_bias, 0.0, 0.0, 0.2),
             mix: upNum(upRaw.mix, 0.0, 0.0, 1.0),
+            adaptive: upRaw.adaptive === true,
+            shift: upNum(upRaw.shift, 0.0, 0.0, 100.0),
             include: (Array.isArray(upRaw.include) ? upRaw.include : [])
                 .map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 0),
         };
@@ -3293,7 +3296,8 @@ function upscaleSig(data) {
     const up = data.ds?.upscale || {};
     return JSON.stringify([
         up.mode ?? "", up.model ?? "", up.arch ?? "", up.scale ?? 0, up.denoise ?? 0,
-        up.steps ?? 0, up.cfg ?? 0, up.precision ?? "", (up.include || []).join(","),
+        up.steps ?? 0, up.cfg ?? 0, up.precision ?? "", up.time_bias ?? 0, up.mix ?? 0,
+        up.adaptive === true, up.shift ?? 0, (up.include || []).join(","),
         (data.upscaleModels || []).join(","),
         data.mf?.upscale?.hash ?? "",
         (data.mf?.upscale?.segs || []).filter((r) => r && r.done).length,
@@ -3448,6 +3452,26 @@ function renderUpscaleZone(sec, data) {
             + "——对冲精化带花/内容漂移，段间接缝更稳：0=关（默认，完全用精化结果）；"
             + "0.3-0.6 常用；1=结构全锁放大 latent。仅在 >0 时进二采指纹",
             (v) => setUpscaleField(node, "mix", v)));
+
+        /* 段自适应σ（路线④）：勾选即启用——按段运动档位自动偏移精化 σ 起点 */
+        const adField = el("div", "h3d-param");
+        adField.append(el("label", "", "段自适应σ"));
+        const adRow = el("div", "h3d-seedrow");
+        const adCb = document.createElement("input");
+        adCb.type = "checkbox";
+        adCb.checked = up.adaptive === true;
+        adCb.title = "按段运动量（latent 域逐帧相对变化）自动调精化 σ 起点：静态对话/特写 +0.05 抠脸、"
+            + "高运动打斗 −0.075 防拖影鬼影、中档不动；报告行打印「自适应σ档位(运动量)」供阈值校准。"
+            + "开启即进二采指纹（该段重做）；生效 σ 由该段基础 latent 决定论派生，重放不串档";
+        adCb.onchange = () => setUpscaleField(node, "adaptive", adCb.checked);
+        adRow.append(adCb);
+        adField.append(adRow);
+        body.append(adField);
+        body.append(upNumField("调度偏移", up.shift, 0.0, 16.0, 0.5,
+            "二采档 flow shift（T8 实证 12→6：高分辨率下调度更线性、细节合成更充分；"
+            + "镜像官方 MiniMaxH3SigmaShift 的克隆补丁，主链模型零改动）：0=关（默认，沿用主链 "
+            + "H3 默认 12）；6=推荐档。仅在 >0 时进二采指纹",
+            (v) => setUpscaleField(node, "shift", v)));
 
         /* 目标画布徽章（latent 偶数对齐 = 像素 32 倍数，与后端 target_hw 同口径） */
         const target = upTargetCanvas(node, up.scale);
