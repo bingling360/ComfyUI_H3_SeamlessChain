@@ -299,6 +299,9 @@ const nodeR2 = { widgets: [{ name: "导演台状态", value: JSON.stringify({
 const rt2 = mod.parseMasterPrompt(mod.exportMasterPrompt(nodeR2));
 eq("回环 unlink/refs", [rt2.segs[0].unlink, rt2.segs[0].refs], [true, ["角色1", "风格板"]]);
 ok("导出带【完】", mod.exportMasterPrompt(nodeR2).includes("【完】"));
+/* 围栏容忍：跨 agent 输出常被 markdown 代码围栏包裹，围栏行不进解析也不报警 */
+const mpF = mod.parseMasterPrompt("```\n【段1】\n提示词：围栏内主体\n【完】\n建议\n```");
+eq("围栏容忍 段与主体", [mpF.segs.length, mpF.segs[0].main, mpF.notes.length], [1, "围栏内主体", 0]);
 
 /* ---- 实验性功能（扁平契约 + 主开关）：注入迷你 defs 无头校验 ---- */
 const MINI_DEFS = [

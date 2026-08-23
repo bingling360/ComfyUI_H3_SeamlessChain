@@ -839,6 +839,7 @@ function parseMasterPrompt(text) {
     const openSeg = () => { cur = newMasterSeg(); out.segs.push(cur); field = "main"; };
     for (const raw of lines) {
         const line = raw.trim();
+        if (!line || /^```/.test(line)) continue;      // 空行与 markdown 代码围栏不参与解析
         if (MP_END_RE.test(line)) break;               // 【完】：其后的建议/解说不参与解析
         const hm = line.match(MP_HEAD_RE);
         if (hm) {
@@ -849,7 +850,6 @@ function parseMasterPrompt(text) {
             }
             continue;
         }
-        if (!line) continue;
         const fm = line.match(MP_FIELD_RE);
         if (fm) {
             if (!cur) { stray.push(line); continue; }   // 字段行出现在任何段头之前

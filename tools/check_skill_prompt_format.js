@@ -20,6 +20,7 @@ if (p.notes.length) problems.push("notes: " + p.notes.join("；"));
 const s1 = p.segs[0];
 if (s1.scene !== "日系动画风格，黄昏的教室，暖橘色侧光斜照课桌，长影子") problems.push("段1场景错: " + s1.scene);
 if (s1.seconds !== 5) problems.push("段1时长错: " + s1.seconds);
+if (p.segs[2].seconds !== 6) problems.push("段3时长缺失或不为6: " + p.segs[2].seconds);
 if (!s1.main.includes("[0s-3s]") || !s1.main.includes("「今天也早点回去吧。」")) problems.push("段1时间线/对白错: " + s1.main);
 if (s1.refs.join(",") !== "角色1") problems.push("段1参考错: " + JSON.stringify(s1.refs));
 if (s2unlinkWrong()) problems.push("段2独立镜头应缺省: " + p.segs[1].unlink);
@@ -33,5 +34,11 @@ const syntax = fences.find((t) => t.includes("<风格"));
 const ps = mod.parseMasterPrompt(syntax);
 const syntaxNotes = ps.notes.filter((n) => !n.includes("不是有效秒数") && !n.includes("应为 是/否"));
 if (ps.segs.length !== 1 || syntaxNotes.length) problems.push("语法块解析异常: " + JSON.stringify(ps.notes));
+/* 围栏容忍：整篇被 markdown 代码围栏包裹时仍干净解析（跨 agent 输出兜底） */
+const fenced = "```\n【段1】\n提示词：x\n【完】\n建议文字\n```";
+const pf = mod.parseMasterPrompt(fenced);
+if (pf.segs.length !== 1 || pf.segs[0].main !== "x" || pf.notes.length) {
+    problems.push("围栏容忍失败: " + JSON.stringify(pf));
+}
 if (problems.length) { console.error("FAIL:\n" + problems.join("\n")); process.exit(1); }
 console.log("OK: skill 示例通过真实解析器（3 段、零警告、八标签全对位、【完】截断正确）");
