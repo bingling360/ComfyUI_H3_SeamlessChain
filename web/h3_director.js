@@ -316,15 +316,18 @@ function findSaver() {
 }
 
 function dirWidget(node) {
+    if (!node) return null;
     return (node.widgets || []).find((w) => W_DIR_NAMES.includes(w.name)) || null;
 }
 
 function getWidgetValue(node, name) {
+    if (!node) return null;
     const w = (node.widgets || []).find((w) => w.name === name);
     return w ? w.value : null;
 }
 
 function setWidgetValue(node, name, value) {
+    if (!node) return false;
     const w = (node.widgets || []).find((w) => w.name === name);
     if (!w) return false;
     w.value = value;
@@ -442,6 +445,7 @@ function migrateGraphWidgets(graphData) {
 
 /** 兜底：宽高比控件值非法（错位载入/手工改坏）时修正，避免后端换算报错 */
 function fixInvalidArWidget(node) {
+    if (!node) return;
     const w = (node.widgets || []).find((x) => x.name === W_AR);
     if (!w) return;
     const v = String(w.value ?? "");
@@ -583,6 +587,7 @@ function getDs(node) {
 }
 
 function setDs(node, ds) {
+    if (!node) return false;
     const w = (node.widgets || []).find((x) => x.name === W_DS);
     if (!w) return false;
     /* ref_images 兼容字段 = ref_assets 图片类文件序列（旧版前端/后端仍可读） */
@@ -3034,7 +3039,7 @@ function paramsSig(node) {
 
 /** 单个节点控件的表单域（combo→select，数值→number 输入；种子带🎲） */
 function renderWidgetField(node, name, labelOverride) {
-    const w = (node.widgets || []).find((x) => x.name === name);
+    const w = node ? (node.widgets || []).find((x) => x.name === name) : null;
     const field = el("div", "h3d-param");
     field.append(el("label", "", escapeHtml(labelOverride || name)));
     if (!w) {
