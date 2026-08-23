@@ -837,13 +837,36 @@ function removeLastFrame(node) {
  *   【完】          ← 结束标记（可选）：其后的所有内容（如 AI 的参考素材建议）不参与解析
  * 规则：段头后未带标签的正文行视为提示词内容；只认上述 8 个行首标签，其余文本原样进
  * 主体（官方字段标签 integrated_multimodal_description: 等不受影响）；某标签「写了即生效
- * （含写空=清空），没写不动该字段」。整个文本无任何段头时视为单段主体。 */
+ * （含写空=清空），没写不动该字段」。整个文本无任何段头时视为单段主体。
+ * 容错：markdown 渲染界面复制常把段内换行合并成空格（软换行丢失），整段糊成一行；
+ * 检测到段头不在行首独占即自动「重分行」（见 mpReflow）再按常规行解析。 */
 const MP_HEAD_RE = /^【\s*(?:第\s*)?(?:段(?:落)?\s*(\d+)?|(\d+)\s*段(?:落)?)\s*】\s*$/;
 const MP_END_RE = /^【\s*(?:完|END|end|结束)\s*】$/;
 const MP_FIELD_RE = /^(场景|角色|环境音|配乐|时长|独立镜头|参考|提示词)\s*[：:]\s*(.*)$/;
 const MP_FIELDS = { "场景": "scene", "角色": "character", "环境音": "soundscape", "配乐": "music", "时长": "seconds", "独立镜头": "unlink", "参考": "refs", "提示词": "main" };
 const MP_YES = ["是", "独立", "断链", "开", "true", "yes"];
 const MP_NO = ["否", "连续", "关", "false", "no"];
+const MP_HEAD_SUB_RE = /【\s*(?:第\s*)?(?:段(?:落)?\s*\d*|\d+\s*段(?:落)?)\s*】/;   // 段头子串版（无行锚，序号可省）
+
+/* 软换行丢失容错（mpReflow）：聊天界面按 markdown 渲染 AI 输出时，段内单个换行
+ * 复制后常变空格——段头正则要求独占一行，全文于是塌缩成「1 段」、八标签全部糊进
+ * 主体且无任何警告。行内出现段头（非独占行）是这种走样的铁证，此时整篇重分行：
+ * 段头与【完】前后插换行、行中标签前提行，再交回逐行解析。未走样的文本不改动
+ * （正文里写「参考：」等字样不受影响——重分行仅在检测到走样后才发生）。 */
+function mpReflow(text, notes) {
+    const lines = String(text).split(/\r\n|\r|\n/);
+    const degraded = lines.some((l) => { const t = l.trim(); return t && !MP_HEAD_RE.test(t) && MP_HEAD_SUB_RE.test(t); });
+    if (!degraded) return text;
+    notes.push("检测到段落结构被合并成单行（常见于从 markdown 渲染界面复制丢失换行），已自动重分行解析");
+    const fieldSub = new RegExp("(" + Object.keys(MP_FIELDS).join("|") + ")\\s*[：:]", "g");
+    const endSub = MP_END_RE.source.replace(/^\^|\$$/g, "");                 // 去行锚的【完】子串版
+    return lines.map((l) =>
+        l.replace(new RegExp(MP_HEAD_SUB_RE.source, "g"), "\n$&\n")          // 段头独占一行
+            .replace(new RegExp(endSub, "g"), "\n$&\n")                      // 行内【完】独占一行截断
+            .replace(fieldSub, (m, _p1, off, s) =>                            // 行中标签提到行首
+                off === 0 || s[off - 1] === "\n" ? m : "\n" + m)
+    ).join("\n");
+}
 
 function newMasterSeg() {
     return { main: undefined, scene: undefined, character: undefined, soundscape: undefined, music: undefined, seconds: undefined, unlink: undefined, refs: undefined };
@@ -853,7 +876,8 @@ function newMasterSeg() {
  *  notes:[提示字符串…] }；字段 undefined=该块未写（应用时不覆盖），空串=显式清空。 */
 function parseMasterPrompt(text) {
     const out = { segs: [], notes: [] };
-    const lines = String(text ?? "").split(/\r\n|\r|\n/);
+    const src = mpReflow(String(text ?? ""), out.notes);   // 软换行丢失容错（未走样原样返回）
+    const lines = src.split(/\r\n|\r|\n/);
     let cur = null;          // 当前段对象
     let field = null;        // 当前续行归属字段（"main" 等）
     const stray = [];        // 首个段头之前的游离行（无段头时整体作单段主体）

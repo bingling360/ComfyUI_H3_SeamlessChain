@@ -302,6 +302,18 @@ ok("导出带【完】", mod.exportMasterPrompt(nodeR2).includes("【完】"));
 /* 围栏容忍：跨 agent 输出常被 markdown 代码围栏包裹，围栏行不进解析也不报警 */
 const mpF = mod.parseMasterPrompt("```\n【段1】\n提示词：围栏内主体\n【完】\n建议\n```");
 eq("围栏容忍 段与主体", [mpF.segs.length, mpF.segs[0].main, mpF.notes.length], [1, "围栏内主体", 0]);
+/* 软换行丢失容错（mpReflow）：markdown 渲染界面复制把段内换行合并成空格，
+ * 段头/标签糊进同一行——检测行内段头后自动重分行，字段照常对位 */
+const mpM = mod.parseMasterPrompt("【段1】 场景：黄昏教室 角色：短发少女 时长：5 提示词：推近。\n\n【第2段】 环境音：蝉鸣 独立镜头：是 提示词：拉远。 【完】 备注：不应进入解析");
+eq("软换行丢失 段数", mpM.segs.length, 2);
+eq("软换行丢失 字段对位", [mpM.segs[0].scene, mpM.segs[0].character, mpM.segs[0].seconds], ["黄昏教室", "短发少女", 5]);
+eq("软换行丢失 主体", mpM.segs[0].main, "推近。");
+eq("软换行丢失 段2字段", [mpM.segs[1].soundscape, mpM.segs[1].unlink, mpM.segs[1].main], ["蝉鸣", true, "拉远。"]);
+ok("软换行丢失 重分行提示", mpM.notes.some((n) => n.includes("重分行")));
+eq("软换行丢失 【完】后截断", mpM.segs[1].main.includes("备注"), false);
+/* 未走样文本不触发重分行：主体里的行内标签字样原样保留 */
+const mpS = mod.parseMasterPrompt("【段1】\n提示词：他说「参考：无」");
+eq("未走样 行内标签不动", mpS.segs[0].main, "他说「参考：无」");
 
 /* ---- 实验性功能（扁平契约 + 主开关）：注入迷你 defs 无头校验 ---- */
 const MINI_DEFS = [
