@@ -461,8 +461,8 @@ function defaultDs() {
 function defaultUpscale() {
     /* 潜空间放大二采：主循环内渲染通道（每段采样定稿后、段落盘前），参数不进基础链指纹。
        schema 2：steps=尾段精化步数（与 denoise=尾段起始σ 解耦），旧 JSON 由 getDs 迁移。
-       time_bias 默认 0=关，仅启用时进后端指纹（不使既有记录失效） */
-    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16", time_bias: 0.0, include: [] };
+       time_bias / mix 默认 0=关，仅启用时进后端指纹（不使既有记录失效） */
+    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0, denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16", time_bias: 0.0, mix: 0.0, include: [] };
 }
 
 function defaultSegment() {
@@ -554,6 +554,7 @@ function getDs(node) {
             cfg: upNum(upRaw.cfg, 1.0, 0.0, 100.0),
             precision: UP_PRECISIONS.includes(upRaw.precision) ? upRaw.precision : "fp16",
             time_bias: upNum(upRaw.time_bias, 0.0, 0.0, 0.2),
+            mix: upNum(upRaw.mix, 0.0, 0.0, 1.0),
             include: (Array.isArray(upRaw.include) ? upRaw.include : [])
                 .map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 0),
         };
@@ -3405,6 +3406,11 @@ function renderUpscaleZone(sec, data) {
             "尾段精化窗口内把模型看到的时间向更干净方向偏置（Detail-Daemon/T8 机制，零额外前向）："
             + "0=关（默认）；0.025-0.05 常用，过大可能过锐/伪细节。仅在 >0 时进二采指纹",
             (v) => setUpscaleField(node, "time_bias", v)));
+        body.append(upNumField("细节混合", up.mix, 0.0, 1.0, 0.05,
+            "频域分层混合：把精化结果的低频（结构）换回纯放大 latent、只保留精化补出的高频细节"
+            + "——对冲精化带花/内容漂移，段间接缝更稳：0=关（默认，完全用精化结果）；"
+            + "0.3-0.6 常用；1=结构全锁放大 latent。仅在 >0 时进二采指纹",
+            (v) => setUpscaleField(node, "mix", v)));
 
         /* 目标画布徽章（latent 偶数对齐 = 像素 32 倍数，与后端 target_hw 同口径） */
         const target = upTargetCanvas(node, up.scale);

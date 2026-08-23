@@ -106,6 +106,7 @@ def parse_state(ds):
         "cfg": _num("cfg", 1.0, 0.0, 100.0),
         "precision": precision,
         "time_bias": _num("time_bias", 0.0, 0.0, 0.2),
+        "mix": _num("mix", 0.0, 0.0, 1.0),
         "include": include,
     }
 
@@ -158,6 +159,44 @@ def hf_gain_ratio(hf_before, hf_after):
     return (hf_after - hf_before) / hf_before
 
 
+def freq_mix_latents(base_v, refined_v, ratio, chunk=8):
+    """频域细节混合（拉普拉斯分层，纯 torch、CPU 分帧块可单测）。
+
+    out = 精化输出 + ratio·(低频(放大 latent) − 低频(精化输出))，低频 = 逐帧
+    3×3 均值池化、replicate 边界填充（与细节增益度量同核；填充不用零填充
+    ——零填充会把边界低频拉向 0，r=1 时角点偏差大、画面边缘出晕影，
+    replicate 下常量场严格守恒）：
+    - ratio=0 原样返回精化输出（关——现行为不变，且不克隆零开销）；
+    - ratio=1 = 低频全走放大 latent + 高频全走精化输出：结构/段间接缝锚在
+      与基础段同构的放大 latent 上（零漂移），只保留精化补回的细节增益——
+      天然对冲「精化带花/内容漂移」，多段链「段间一致性优先」的取向。
+    ratio 即「把低频换回放大 latent 的程度」，中间值线性过渡。
+    输入 [B,C,T,H,W]（池化逐帧独立，按 T 分块无边界效应）；CPU float32
+    计算（避开二采峰值期显存，同 latent_hf_energy 口径）。退化输入
+    （None / 形状不一致 / 空间 <3）原样返回 refined_v——混合不可定义时
+    保交付产物（精化输出），不报错阻断。
+    """
+    if base_v is None or refined_v is None or ratio <= 0.0:
+        return refined_v
+    if base_v.dim() != 5 or base_v.shape != refined_v.shape \
+            or base_v.shape[-2] < 3 or base_v.shape[-1] < 3:
+        return refined_v
+    r = min(max(float(ratio), 0.0), 1.0)
+    b = base_v.detach().to("cpu", torch.float32)
+    out = refined_v.detach().to("cpu", torch.float32)
+    if out.data_ptr() == refined_v.data_ptr():   # 无拷贝路径（detach/同设备 to 共享存储）→ 克隆防改入参
+        out = out.clone()
+
+    def _lp(x):
+        xp = torch.nn.functional.pad(x, (1, 1, 1, 1), mode="replicate")
+        return torch.nn.functional.avg_pool2d(xp, 3, stride=1)
+
+    for t0 in range(0, out.shape[2], chunk):
+        sl = slice(t0, t0 + chunk)
+        out[0, :, sl] += r * (_lp(b[0, :, sl]) - _lp(out[0, :, sl]))
+    return out
+
+
 def time_bias_sigma(sigma_v, sigma_start, bias, start_progress=0.70,
                     end_progress=1.0):
     """尾段时间偏置核心数学（Detail-Daemon 类，T8mars 机制移植，纯函数可单测）。
@@ -182,14 +221,16 @@ def _hash_params(cfg):
     keys = {k: cfg[k] for k in _PARAM_KEYS}
     if cfg.get("time_bias"):
         keys["time_bias"] = cfg["time_bias"]
+    if cfg.get("mix"):
+        keys["mix"] = cfg["mix"]
     return keys
 
 
 def params_hash(cfg):
     """二采参数 -> 8 位指纹（mode/include 不进：不影响单段输出）。
 
-    time_bias 仅在 >0（启用）时进指纹——默认关闭不改变哈希，既有二采记录
-    不因本次新增参数而失效重做。
+    time_bias / mix 仅在 >0（启用）时进指纹——默认关闭不改变哈希，既有二采
+    记录不因新增参数而失效重做。
     """
     return checkpoint.fingerprint(_hash_params(cfg))
 
@@ -499,6 +540,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     guide: 本段生成时用的上段尾帧桥（None=首段/断链/插入段）——视频 latent
     神经放大后注入重采样 cond（CondSync：锚住段首与上段高清尾的连续性）。
     tail_kf_latent: 尾帧身份锚定的基础 latent（与主循环同语义，同步放大注入）。
+    cfg.mix>0 时精化输出做频域细节混合（低频锚回纯放大 latent，见
+    freq_mix_latents）；细节增益在混合后的交付 latent 上度量。
     返回 (up_out_v 高清视频 latent, tw, th, 二采种子, 是否桥锚, 细节增益小数)。
     """
     import comfy.model_management
@@ -533,6 +576,10 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # hf_up = 纯放大（无精化）的高频能量基线——细节增益度量的「前」
     up_v = upscale_video(video_t, net, cfg["scale"], cfg["arch"])
     hf_up = latent_hf_energy(up_v)
+    # 频域细节混合启用时保留纯放大 latent 的 CPU 副本（避开采样期显存峰值，
+    # 精化后作低频锚；关闭时零开销不复制）
+    mix = float(cfg.get("mix") or 0.0)
+    up_v_base = up_v.detach().to("cpu", torch.float32) if mix > 0.0 else None
 
     # cond 构造：按【高清目标分辨率】（重采样画布），refs/首帧由官方节点编码到高清尺寸
     if kind == "prompt":
@@ -620,6 +667,12 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     up_out_v, _discarded_audio = sampled["samples"].unbind()
     del cond, latent, sampled
     torch.cuda.empty_cache()
+    if up_v_base is not None:
+        # 频域细节混合（CPU 分块）：低频锚回纯放大 latent、高频保留精化增益，
+        # 细节增益度量在【混合后的交付 latent】上取值（报告行如实反映）
+        up_out_v = freq_mix_latents(up_v_base, up_out_v, mix).to(
+            up_out_v.device, torch.float32)
+        del up_v_base
     hf_gain = hf_gain_ratio(hf_up, latent_hf_energy(up_out_v))
     return up_out_v, tw, th, seed, bridged, hf_gain
 
@@ -668,11 +721,13 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _n, _d = tail_refine_args(cfg["denoise"], cfg["steps"])
     _n_eff = int(_n * _d)
     _tb = float(cfg.get("time_bias") or 0.0)
+    _mix = float(cfg.get("mix") or 0.0)
     report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
                   f"精化 {_n_eff} 步 @ σ≈{_n_eff / _n:g} · 细节 {hf_gain:+.0%} · "
                   f"{time.perf_counter() - t0:.0f}s"
                   + (" · 桥锚" if bridged else "")
-                  + (f" · 偏置{_tb:g}" if _tb > 0 else ""))
+                  + (f" · 偏置{_tb:g}" if _tb > 0 else "")
+                  + (f" · 混合{_mix:g}" if _mix > 0 else ""))
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
     torch.cuda.empty_cache()
     return frames[-1].detach().float().cpu(), up_state

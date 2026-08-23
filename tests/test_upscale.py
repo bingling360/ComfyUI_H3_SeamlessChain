@@ -87,10 +87,13 @@ def test_parse_state_normalize():
     assert cfg["steps"] == 6                   # 未存过 steps=新默认精化步数
     assert cfg["cfg"] == 1.0
     assert cfg["precision"] == "fp16"
+    assert cfg["time_bias"] == 0.0
+    assert cfg["mix"] == 0.0
 
     full = upscale.parse_state({"upscale": {
         "schema": 2, "mode": "手动选择", "model": " up2d.pth ", "arch": "3d", "scale": "9",
         "denoise": "0.01", "steps": "0", "cfg": "-5", "precision": "x",
+        "time_bias": "9", "mix": "2",
         "include": [2, "1", 1.0, "bad", None]}})
     assert full["mode"] == "手动选择"
     assert full["model"] == "up2d.pth"          # strip 空白
@@ -100,6 +103,8 @@ def test_parse_state_normalize():
     assert full["steps"] == 1
     assert full["cfg"] == 0.0
     assert full["precision"] == "fp16"          # 非法精度回落
+    assert full["time_bias"] == 0.2             # 钳上限
+    assert full["mix"] == 1.0                   # 钳上限
     assert full["include"] == [1, 2]            # 去重排序，垃圾项剔除
 
     nan = upscale.parse_state({"upscale": {"mode": "跟随生成", "scale": float("nan"),
@@ -193,6 +198,50 @@ def test_hf_gain_ratio():
     assert abs(upscale.hf_gain_ratio(1.0, 0.8) + 0.2) < 1e-9
 
 
+def test_freq_mix_latents():
+    """频域细节混合：0=原样精化输出（关）、1=低频base+高频refined、线性、退化兜底。"""
+    f = upscale.freq_mix_latents
+
+    def _lp(x):
+        xp = torch.nn.functional.pad(x, (1, 1, 1, 1), mode="replicate")
+        return torch.nn.functional.avg_pool2d(xp, 3, stride=1)
+
+    torch.manual_seed(7)
+    base = torch.randn(1, 8, 9, 12, 10)
+    refined = base + torch.randn_like(base) * 0.2
+    keep_r, keep_b = refined.clone(), base.clone()   # 入参快照（任何调用前取——防共享存储隐式改写）
+
+    # 0=关：原样返回精化输出本身（不克隆、零开销——默认行为与指纹均不变）
+    assert f(base, refined, 0.0) is refined
+    assert f(base, refined, -1.0) is refined
+    assert f(None, refined, 1.0) is refined                # base 缺失兜底
+    # 1=全混合：低频走 base、高频走 refined（拉普拉斯分层恒等式）
+    full = f(base, refined, 1.0)
+    lp_b, lp_r = _lp(base[0]), _lp(refined[0])
+    assert torch.allclose(full[0], lp_b + (refined[0] - lp_r), atol=1e-5)
+    # 中间值线性：out = refined + r·(lp(base) − lp(refined))
+    half = f(base, refined, 0.5)
+    assert torch.allclose(half[0], refined[0] + 0.5 * (lp_b - lp_r), atol=1e-5)
+    assert torch.allclose(f(base, refined, 1.5)[0], full[0], atol=1e-5)   # 钳上限
+    # 反漂移语义：精化只做低频漂移（零高频）时，全混合后 = 纯放大 latent
+    cb = torch.full((1, 4, 5, 8, 8), 2.0)
+    cr = torch.full((1, 4, 5, 8, 8), -1.0)
+    assert torch.allclose(f(cb, cr, 1.0), cb, atol=1e-6)
+    # 纯函数性：不改入参（detach 共享存储陷阱——曾因跳过克隆把 refined 原地改写）、确定性、统一 float32
+    assert torch.equal(f(base, refined, 0.5), f(base, refined, 0.5))
+    assert torch.equal(refined, keep_r) and torch.equal(base, keep_b)
+    assert f(base.half(), refined.half(), 1.0).dtype == torch.float32
+    # 分块边界：chunk=1 与默认 chunk 逐位一致（池化逐帧独立，切块无边界效应）
+    assert torch.equal(f(base, refined, 0.7, chunk=1), f(base, refined, 0.7, chunk=8))
+    # 退化形状兜底：形状不一致 / 空间<3 / 非 5D → 原样 refined（保交付产物）
+    mis = refined[:, :, :5]
+    assert f(base, mis, 1.0) is mis
+    small_b, small_r = torch.zeros(1, 4, 3, 2, 2), torch.ones(1, 4, 3, 2, 2)
+    assert f(small_b, small_r, 1.0) is small_r
+    flat_b, flat_r = base.reshape(-1), refined.reshape(-1)
+    assert f(flat_b, flat_r, 1.0) is flat_r
+
+
 def test_time_bias_sigma():
     """尾窗 smoothstep 偏置：窗外不动、窗内渐入、clamp≥0、关闭态原样。"""
     f = upscale.time_bias_sigma
@@ -247,6 +296,36 @@ def test_params_hash_time_bias():
                                             "time_bias": 0.5}})["time_bias"] == 0.2
     assert upscale.parse_state({"upscale": {"mode": "跟随生成",
                                             "time_bias": "bad"}})["time_bias"] == 0.0
+
+
+def test_params_hash_mix():
+    """mix 条件化指纹：0=不进指纹（既有记录不失效），>0 改变指纹；与 time_bias 独立叠加。"""
+    base = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth"}})
+    off = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
+                                           "mix": 0}})
+    on = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
+                                          "mix": 0.5}})
+    h = upscale.params_hash(base)
+    assert h == upscale.params_hash(off)         # 默认关闭不改变哈希
+    assert h != upscale.params_hash(on)          # 启用才进指纹
+    # 记录口径同指纹（write_record.params 由 _hash_params 生成）
+    assert "mix" not in upscale._hash_params(off) and upscale._hash_params(on)["mix"] == 0.5
+    # 解析归一：默认 0 / 钳上限 1.0 / 负值回落下限 0 / 垃圾回落 0
+    assert base["mix"] == 0.0
+    assert upscale.parse_state({"upscale": {"mode": "跟随生成",
+                                            "mix": 2.0}})["mix"] == 1.0
+    assert upscale.parse_state({"upscale": {"mode": "跟随生成",
+                                            "mix": -0.5}})["mix"] == 0.0
+    assert upscale.parse_state({"upscale": {"mode": "跟随生成",
+                                            "mix": "bad"}})["mix"] == 0.0
+    # 双增强叠加：各自 >0 都进指纹，联合再变
+    both = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
+                                            "time_bias": 0.03, "mix": 0.5}})
+    assert upscale.params_hash(both) != upscale.params_hash(on)
+    tb_only = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
+                                               "time_bias": 0.03}})
+    assert upscale.params_hash(both) != upscale.params_hash(tb_only)
+    assert upscale.params_hash(both) != h
 
 
 def test_base_hash():
