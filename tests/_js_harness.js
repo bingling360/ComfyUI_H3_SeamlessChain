@@ -5,7 +5,7 @@ let src = fs.readFileSync(path.join(__dirname, "../web/h3_director.js"), "utf8")
 src = src
     .replace('import { app } from "/scripts/app.js";', "const app = { graph: null, registerExtension() {} };")
     .replace('import { api } from "/scripts/api.js";', "const api = { addEventListener() {}, fetchApi: async () => ({ ok: true }) };");
-const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapOldWidgetValuesToCurrent, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, toggleUpscaleInclude, upTargetCanvas, defaultExperiments, normalizeExperiments, expActiveList, expLocked };")(() => {}, () => true);
+const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapOldWidgetValuesToCurrent, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, toggleUpscaleInclude, upTargetCanvas, defaultExperiments, normalizeExperiments, expActiveList, expLocked, parseMasterPrompt, exportMasterPrompt, applyMasterPrompt };")(() => {}, () => true);
 let fails = 0;
 function eq(name, got, want) {
     const ok = JSON.stringify(got) === JSON.stringify(want);
@@ -217,6 +217,59 @@ const nodeZ = { widgets: [
     { name: "宽高比", value: "自定义" }, { name: "宽度", value: 864 }, { name: "高度", value: 480 },
 ] };
 eq("自定义仍读宽高控件", mod.upTargetCanvas(nodeZ, 2), "1728×960");
+
+/* ---- 总提示词（parseMasterPrompt / exportMasterPrompt / applyMasterPrompt） ---- */
+const mp1 = mod.parseMasterPrompt("【段1】\n场景：黄昏教室\n角色：短发少女\n提示词：推近。\n少女说「好」。\n\n【第2段】\n环境音：蝉鸣\n时长：6\n提示词：拉远。");
+eq("总提示词 段数", mp1.segs.length, 2);
+eq("总提示词 场景", mp1.segs[0].scene, "黄昏教室");
+eq("总提示词 角色", mp1.segs[0].character, "短发少女");
+eq("总提示词 主体+续行", mp1.segs[0].main, "推近。\n少女说「好」。");
+eq("总提示词 未写字段=undefined", mp1.segs[0].soundscape, undefined);
+eq("总提示词 环境音/时长", [mp1.segs[1].soundscape, mp1.segs[1].seconds], ["蝉鸣", 6]);
+eq("总提示词 空文本零段", mod.parseMasterPrompt("  \n ").segs.length, 0);
+eq("总提示词 无段头=单段", mod.parseMasterPrompt("整段都是主体文本").segs[0].main, "整段都是主体文本");
+const mp2 = mod.parseMasterPrompt("游离行\n【段落3】\n提示词：x");
+eq("段头变体+序号不一致提示", mp2.segs[0].main, "x");
+ok("序号不一致进 notes", mp2.notes.some((n) => n.includes("不一致")));
+ok("游离行进 notes", mp2.notes.some((n) => n.includes("游离") || n.includes("之前")));
+eq("CRLF 容忍", mod.parseMasterPrompt("【段1】\r\n提示词：a\r\n续行").segs[0].main, "a\n续行");
+eq("官方标签不受影响", mod.parseMasterPrompt("【段1】\n提示词：integrated_multimodal_description: [Shot 1] 测试").segs[0].main,
+    "integrated_multimodal_description: [Shot 1] 测试");
+eq("非法时长忽略", mod.parseMasterPrompt("【段1】\n时长：abc\n提示词：x").segs[0].seconds, undefined);
+eq("写空=显式清空标记", mod.parseMasterPrompt("【段1】\n场景：\n提示词：x").segs[0].scene, "");
+/* 应用：段数重排 + 未提及字段保留（refs/unlink）+ 显式清空生效 + inserts 不动 */
+const nodeM = { widgets: [{ name: "导演台状态", value: JSON.stringify({
+    mode: "文生视频",
+    prompts: ["旧1", "旧2", "旧3"],
+    inserts: [{ pos: 2, file: "keep.mp4" }],
+    segments: [
+        { scene_prompt: "旧场景", refs: ["图片1"], unlink: true },
+        {}, {},
+    ],
+    ref_assets: [{ file: "a.png", kind: "image", label: "图片1" }],
+}) }], setDirtyCanvas() {} };
+const mpApply = mod.applyMasterPrompt(nodeM, "【段1】\n场景：\n配乐：钢琴\n提示词：新主体\n\n【段2】\n提示词：第二段");
+const dsM = mod.getDs(nodeM);
+eq("应用后段数重排", dsM.prompts, ["新主体", "第二段"]);
+eq("应用后 segments 同步伸缩", dsM.segments.length, 2);
+eq("写空清空场景", dsM.segments[0].scene_prompt, "");
+eq("新字段写入", dsM.segments[0].music, "钢琴");
+eq("未提及字段保留（refs/unlink）", [dsM.segments[0].refs, dsM.segments[0].unlink], [["图片1"], true]);
+eq("inserts 不动", dsM.inserts, [{ pos: 2, file: "keep.mp4" }]);
+ok("应用返回解析结果", mpApply.segs.length === 2);
+/* 导出 → 解析回环：非空字段逐项一致 */
+const nodeE2 = { widgets: [{ name: "导演台状态", value: JSON.stringify({
+    mode: "文生视频", prompts: ["主体一", "主体二"],
+    segments: [
+        { scene_prompt: "夜景", character_prompt: "侦探", soundscape: "雨声", music: "爵士", seconds: 6.5 },
+        {},
+    ],
+}) }], setDirtyCanvas() {} };
+const rt = mod.parseMasterPrompt(mod.exportMasterPrompt(nodeE2));
+eq("回环 段数", rt.segs.length, 2);
+eq("回环 五字段+时长", [rt.segs[0].scene, rt.segs[0].character, rt.segs[0].soundscape, rt.segs[0].music, rt.segs[0].seconds],
+    ["夜景", "侦探", "雨声", "爵士", 6.5]);
+eq("回环 空段仅主体", [rt.segs[1].main, rt.segs[1].scene], ["主体二", undefined]);
 
 /* ---- 实验性功能（扁平契约 + 主开关）：注入迷你 defs 无头校验 ---- */
 const MINI_DEFS = [

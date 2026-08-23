@@ -802,6 +802,117 @@ function removeLastFrame(node) {
     setLastFrame(node, "");
 }
 
+/* ---- 总提示词（多段一次性导入 / 导出）----
+ * 格式（skill「h3 总提示词」同一规范，AI 按此生成的全文可直接粘贴分配）：
+ *   【段1】          ← 段头：【段1】/【第1段】/【段落1】等价；序号可省略，按出现顺序排段
+ *   场景：…         → seg.scene_prompt（风格+环境+光照）
+ *   角色：…         → seg.character_prompt（外观+服饰+位置）
+ *   环境音：…       → seg.soundscape（overall_soundscape）
+ *   配乐：…         → seg.music（non_diegetic_music）
+ *   时长：5         → seg.seconds（可选，秒；缺省=沿用全局「每段时长」）
+ *   提示词：…       → 段主体（ds.prompts[i]），可多行（续行不写标签）
+ * 规则：段头后未带标签的正文行视为提示词内容；只认上述 6 个行首标签，其余文本原样进
+ * 主体（官方字段标签 integrated_multimodal_description: 等不受影响）；某标签「写了即生效
+ * （含写空=清空），没写不动该字段」。整个文本无任何段头时视为单段主体。 */
+/* 段头：【段1】/【第2段】/【段落1】/【第 3 段落】/【段】等价；序号可省略 */
+const MP_HEAD_RE = /^【\s*(?:第\s*)?(?:段(?:落)?\s*(\d+)?|(\d+)\s*段(?:落)?)\s*】\s*$/;
+const MP_FIELD_RE = /^(场景|角色|环境音|配乐|时长|提示词)\s*[：:]\s*(.*)$/;
+const MP_FIELDS = { "场景": "scene", "角色": "character", "环境音": "soundscape", "配乐": "music", "时长": "seconds", "提示词": "main" };
+
+function newMasterSeg() {
+    return { main: undefined, scene: undefined, character: undefined, soundscape: undefined, music: undefined, seconds: undefined };
+}
+
+/** 解析总提示词文本。返回 { segs:[{main,scene,character,soundscape,music,seconds}…],
+ *  notes:[提示字符串…] }；字段 undefined=该块未写（应用时不覆盖），空串=显式清空。 */
+function parseMasterPrompt(text) {
+    const out = { segs: [], notes: [] };
+    const lines = String(text ?? "").split(/\r\n|\r|\n/);
+    let cur = null;          // 当前段对象
+    let field = null;        // 当前续行归属字段（"main" 等）
+    const stray = [];        // 首个段头之前的游离行（无段头时整体作单段主体）
+    const openSeg = () => { cur = newMasterSeg(); out.segs.push(cur); field = "main"; };
+    for (const raw of lines) {
+        const line = raw.trim();
+        const hm = line.match(MP_HEAD_RE);
+        if (hm) {
+            openSeg();
+            const n = hm[1] !== undefined || hm[2] !== undefined ? Number(hm[1] ?? hm[2]) : 0;
+            if (n && n !== out.segs.length) {
+                out.notes.push(`段头序号 ${n} 与出现顺序（第 ${out.segs.length} 段）不一致，已按出现顺序排列`);
+            }
+            continue;
+        }
+        if (!line) continue;
+        const fm = line.match(MP_FIELD_RE);
+        if (fm) {
+            if (!cur) { stray.push(line); continue; }   // 字段行出现在任何段头之前
+            const key = MP_FIELDS[fm[1]];
+            if (key === "seconds") {
+                const v = Number(fm[2]);
+                cur.seconds = isFinite(v) && v > 0 ? v : undefined;
+                if (!isFinite(v) || v <= 0) out.notes.push(`「时长：${fm[2]}」不是有效秒数，已忽略`);
+            } else {
+                cur[key] = cur[key] === undefined ? fm[2].trim() : `${cur[key]}\n${fm[2].trim()}`;
+            }
+            field = key;
+            continue;
+        }
+        if (!cur) { stray.push(line); continue; }       // 段头前的普通正文
+        cur[field || "main"] = cur[field || "main"] === undefined
+            ? line : `${cur[field || "main"]}\n${line}`;
+    }
+    if (!out.segs.length && stray.length) {             // 无段头=单段（正文原样作主体）
+        openSeg();
+        cur.main = stray.join("\n");
+    } else if (stray.length) {
+        out.notes.push(`忽略了 ${stray.length} 行出现在首个段头之前的内容`);
+    }
+    return out;
+}
+
+/** 把当前链的提示词导出为总提示词文本（只写非空字段，可回贴/喂给 AI 续改）。 */
+function exportMasterPrompt(node) {
+    const ds = getDs(node);
+    const prompts = ds.prompts || [];
+    const segs = ds.segments || [];
+    const blocks = [];
+    for (let i = 0; i < prompts.length; i++) {
+        const seg = (i < segs.length && segs[i] && typeof segs[i] === "object") ? segs[i] : {};
+        const rows = [`【段${i + 1}】`];
+        if (seg.scene_prompt) rows.push(`场景：${seg.scene_prompt}`);
+        if (seg.character_prompt) rows.push(`角色：${seg.character_prompt}`);
+        if (seg.soundscape) rows.push(`环境音：${seg.soundscape}`);
+        if (seg.music) rows.push(`配乐：${seg.music}`);
+        if (Number.isFinite(Number(seg.seconds)) && Number(seg.seconds) > 0) rows.push(`时长：${seg.seconds}`);
+        const main = String(prompts[i] ?? "").trim();
+        rows.push(main ? `提示词：${main}` : "提示词：");
+        blocks.push(rows.join("\n"));
+    }
+    return blocks.join("\n\n");
+}
+
+/** 解析并分配到当前链：prompts 重排为 N 段，segments 同步伸缩（既有段保留 refs/unlink
+ *  等未提及字段），插入视频段（inserts）不动。返回 parse 结果供界面提示。 */
+function applyMasterPrompt(node, text) {
+    const p = parseMasterPrompt(text);
+    if (!p.segs.length) return p;
+    const ds = getDs(node);
+    const old = Array.isArray(ds.segments) ? ds.segments : [];
+    ds.prompts = p.segs.map((s) => (s.main === undefined ? "" : s.main));
+    ds.segments = p.segs.map((s, i) => {
+        const base = (i < old.length && old[i] && typeof old[i] === "object") ? { ...old[i] } : defaultSegment();
+        if (s.scene !== undefined) base.scene_prompt = s.scene;
+        if (s.character !== undefined) base.character_prompt = s.character;
+        if (s.soundscape !== undefined) base.soundscape = s.soundscape;
+        if (s.music !== undefined) base.music = s.music;
+        if (s.seconds !== undefined) base.seconds = s.seconds;
+        return base;
+    });
+    setDs(node, ds);
+    return p;
+}
+
 /* ---- 潜空间放大二采：状态读写（ds.upscale，主循环内逐段渲染：采样定稿后、段落盘前） ---- */
 
 const UP_MODES = ["关闭", "跟随生成", "手动选择"];
@@ -1815,6 +1926,13 @@ function injectStyles() {
     .h3d-check{display:flex;gap:8px;align-items:center;color:var(--h3d-muted);font-size:12px;margin-bottom:14px;cursor:pointer}
     .h3d-dialog-row{display:flex;gap:8px;justify-content:flex-end}
 
+    /* ---- 总提示词模态（宽版 + 等宽多行编辑 + 实时识别预览） ---- */
+    .h3d-dialog-wide{width:min(760px,calc(100vw - 40px))}
+    .h3d-mpta{width:100%;height:min(46vh,420px);resize:vertical;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:10px 12px;font:12.5px/1.7 ui-monospace,Consolas,monospace;outline:none;margin-bottom:8px}
+    .h3d-mpta:focus{border-color:#a8d8bd}
+    .h3d-mpinfo{color:var(--h3d-muted);font-size:12px;min-height:18px;margin-bottom:4px}
+    .h3d-mpbtn{display:block;margin:8px 0 0}
+
     .h3d-fab{position:fixed;right:16px;top:120px;z-index:80;width:44px;height:44px;border-radius:50%;border:1px solid #46604f;background:#1f2a23;color:#c2e0cd;cursor:pointer;font-size:17px}
     .h3d-fab:hover{filter:brightness(1.2)}
 
@@ -1907,8 +2025,13 @@ function openDesk() {
     const lAssets = el("section", "h3d-lsec h3d-asec");
     colL.append(lProj, lAssets);
     const colC = el("section", "h3d-col center");
-    colC.append(el("div", "h3d-sechead",
-        "<strong>段落流水线</strong><small>卡片 = 生成顺序（1–64 段不限，「＋ 添加一段」即可加段；「提示词·1..3」只是画布镜像）；✏ 改词 · 🎲 重摇 · 📎 插视频 · 🎬 分段处理（场景/角色）</small>"));
+    const cHead = el("div", "h3d-sechead",
+        "<strong>段落流水线</strong><small>卡片 = 生成顺序（1–64 段不限，「＋ 添加一段」即可加段；「提示词·1..3」只是画布镜像）；✏ 改词 · 🎲 重摇 · 📎 插视频 · 🎬 分段处理（场景/角色）</small>");
+    const mpBtn = el("button", "h3d-btn h3d-mpbtn", "📋 总提示词");
+    mpBtn.title = "多段提示词一次性粘贴分配（段头+场景/角色/环境音/配乐/时长/提示词 六标签格式，可让 AI 按 skill 生成后直接贴入）";
+    mpBtn.onclick = openMasterPromptModal;
+    cHead.append(mpBtn);
+    colC.append(cHead);
     const colR = el("aside", "h3d-col right");
     const rParams = el("section", "h3d-rsec h3d-psec");
     const rExp = el("section", "h3d-rsec h3d-expsec");
@@ -3615,6 +3738,80 @@ function openNewProjectModal() {
     };
     ok.onclick = submit;
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+}
+
+/* ---- 总提示词模态：多段一次性粘贴分配（格式与 skill「h3 总提示词」同规范） ---- */
+
+const MP_PLACEHOLDER = `【段1】
+场景：风格+环境+光照，如：日系动画风，黄昏教室，暖橘侧光
+角色：外观+服饰+位置，如：蓝白校服的短发少女，坐在窗边倒数第二排
+环境音：翻书声，远处操场喧闹
+配乐：钢琴独奏，慢板
+提示词：镜头缓慢推近。少女抬头望向窗外，轻声说「放学后见。」
+
+【段2】
+场景：同上（保持世界观一致）
+提示词：校门口逆光剪影，两人并肩走出，镜头拉远。`;
+
+function openMasterPromptModal() {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点（只读模式）"); return; }
+    if (document.querySelector(".h3d-overlay")) return;
+
+    const ds = getDs(node);
+    const existing = (ds.prompts || []).some((x) => String(x ?? "").trim());
+    const overlay = el("div", "h3d-overlay");
+    const dialog = el("div", "h3d-dialog h3d-dialog-wide");
+    dialog.innerHTML = `
+        <h3>📋 总提示词 · 多段一次性分配</h3>
+        <p class="h3d-lead">按「段头 + 六标签」格式粘贴全文（可用 AI 按 skill「h3 总提示词」生成），
+        一次分给所有段：<b>场景 / 角色 / 环境音 / 配乐 / 时长 / 提示词</b>。
+        标签<b>写了即生效（写空=清空），没写的字段不动</b>；段数按段头数量重排，
+        插入视频段与各段的素材勾选/断链标记保留。下方可先把现有段落导出改写再贴回。</p>`;
+    const ta = document.createElement("textarea");
+    ta.className = "h3d-mpta";
+    ta.spellcheck = false;
+    ta.placeholder = MP_PLACEHOLDER;
+    if (existing) ta.value = exportMasterPrompt(node);
+    const info = el("div", "h3d-mpinfo", "");
+    const err = el("div", "h3d-err", "");
+    const row = el("div", "h3d-dialog-row");
+    const exp = el("button", "h3d-btn", "从当前段落导出");
+    const cancel = el("button", "h3d-btn", "取消");
+    const ok = el("button", "h3d-btn h3d-btn-cta", "解析并分配");
+    row.append(exp, cancel, ok);
+    dialog.append(ta, info, err, row);
+    overlay.append(dialog);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
+    document.body.append(overlay);
+    ta.focus();
+
+    const preview = () => {
+        err.textContent = "";
+        const p = parseMasterPrompt(ta.value);
+        if (!ta.value.trim()) { info.textContent = ""; return; }
+        const cnt = (k) => p.segs.filter((s) => s[k] !== undefined && s[k] !== "").length;
+        const bits = [`识别 <b>${p.segs.length}</b> 段`,
+            `场景 ${cnt("scene")} · 角色 ${cnt("character")} · 环境音 ${cnt("soundscape")}`,
+            `配乐 ${cnt("music")} · 时长 ${p.segs.filter((s) => s.seconds !== undefined).length} · 主体 ${cnt("main")}`];
+        info.innerHTML = bits.join("　");
+        if (p.notes.length) err.textContent = "⚠ " + p.notes.join("；");
+    };
+    ta.addEventListener("input", preview);
+    preview();
+
+    exp.onclick = () => { ta.value = exportMasterPrompt(node); preview(); };
+    const submit = () => {
+        if (!ta.value.trim()) { err.textContent = "内容为空"; return; }
+        const p = applyMasterPrompt(node, ta.value);
+        if (!p.segs.length) { err.textContent = "未识别到任何段落"; return; }
+        flushPrompts(node);                       // 同步项目 manifest 底稿
+        setLed("idle", `总提示词已分配到 ${p.segs.length} 段`);
+        overlay.remove();
+        scheduleRefresh(60);
+    };
+    ok.onclick = submit;
 }
 
 /* ---------- 刷新 ---------- */
