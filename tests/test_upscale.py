@@ -135,33 +135,27 @@ def test_parse_state_schema_migration():
 
 
 def test_tail_refine_args():
-    """(尾段起始σ, 精化步数 n) -> common_ksampler(steps=N, denoise)：int(N·denoise) 恒为 n。"""
-    N, d = upscale.tail_refine_args(0.35, 6)               # 新默认档
-    assert N == 17 and int(N * d) == 6 and abs(d - 6.5 / 17) < 1e-9
-    N, d = upscale.tail_refine_args(0.45, 6)               # v1 旧默认迁移档
-    assert N == 13 and int(N * d) == 6
+    """(尾段起始σ, 精化步数 n) -> common_ksampler(steps=n, denoise=σ)：
+    ComfyUI ≥0.3x 的 steps 恒为实际执行步数，denoise 直接就是 σ 起点。"""
+    assert upscale.tail_refine_args(0.35, 6) == (6, 0.35)     # 新默认档
+    assert upscale.tail_refine_args(0.275, 6) == (6, 0.275)   # 高运动自适应档
+    assert upscale.tail_refine_args(0.45, 6) == (6, 0.45)     # v1 旧默认迁移档
     # σ≥0.95 = 全量重采（明确请求：丢弃放大 latent 从纯噪声起步）
     assert upscale.tail_refine_args(1.0, 6) == (6, 1.0)
     assert upscale.tail_refine_args(0.95, 4) == (4, 1.0)
-    N, d = upscale.tail_refine_args(0.94, 6)
-    assert N == 7 and d == 6.5 / 7            # 0.94 仍是部分精化（不撞 denoise=1）
-    # 高σ小步数角落：整数网格无法同时满足「σ₀≈s 且 n 步」，退到 n/(n+1) 且绝不撞全量重采
-    N, d = upscale.tail_refine_args(0.9, 2)
-    assert N == 3 and 0.05 < d < 1.0 and int(N * d) == 2   # 2 步 @ σ≈0.667
-    N, d = upscale.tail_refine_args(0.9, 4)
-    assert N == 5 and 0.05 < d < 1.0 and int(N * d) == 4   # 4 步 @ σ≈0.8
+    # 高σ角落：σ₀>n/(n+1) 时 int(n/σ)≤n 会取满调度（σ 起点=σ_max=意外全量重采），
+    # 钳到 n/(n+1) 保证至少截一刀且永不撞 denoise=1
+    assert upscale.tail_refine_args(0.94, 6) == (6, 6 / 7)
+    assert upscale.tail_refine_args(0.9, 2) == (2, 2 / 3)     # 2 步 @ σ≈0.667
+    assert upscale.tail_refine_args(0.9, 4) == (4, 4 / 5)     # 4 步 @ σ≈0.8
     # 输入钳制：步数 ≥1、σ ≥0.05
-    assert upscale.tail_refine_args(0.5, 0) == (2, 0.75)
-    N, d = upscale.tail_refine_args(0.01, 6)               # σ 钳到 0.05
-    assert N == 100 and int(N * d) == 5
-    # 常用区（σ≤0.6、步数≥3）不变量：步数精确、永不撞全量重采、σ₀ 贴请求值
+    assert upscale.tail_refine_args(0.5, 0) == (1, 0.5)
+    assert upscale.tail_refine_args(0.01, 6) == (6, 0.05)     # σ 钳到 0.05
+    # 常用区（σ≤0.6、步数≥3）不变量：步数原样、denoise 贴 σ₀、永不撞全量重采
     for s in (0.05, 0.12, 0.25, 0.35, 0.45, 0.6):
         for n in (3, 5, 6, 8, 12, 25, 50, 100):
             N, d = upscale.tail_refine_args(s, n)
-            n_eff = int(N * d)
-            assert 1 <= N <= 100 and 0.05 < d < 1.0
-            assert n_eff == n or (N == 100 and n_eff < n)  # 只允许 100 格上限压步数
-            assert abs(n_eff / N - s) < 0.07                # 网格量化误差上限
+            assert N == n and 0.05 <= d < 1.0 and abs(d - s) < 1e-9
 
 
 def test_params_hash():

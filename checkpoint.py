@@ -148,9 +148,22 @@ def _atomic_write(path: str, data: bytes):
             os.remove(tmp)
 
 
+def _json_fallback(obj):
+    """manifest 兜底：意外混入的 torch/numpy 0 维标量转 Python 数值再序列化，
+    防一次类型疏漏炸掉整条链的存档写入；多元素张量仍报错——存档里不该有整块张量。"""
+    item = getattr(obj, "item", None)
+    if item is not None:
+        try:
+            return item()
+        except (ValueError, RuntimeError, TypeError):
+            pass
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def save_manifest(root: str, manifest: dict):
     _atomic_write(os.path.join(root, "manifest.json"),
-                  json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"))
+                  json.dumps(manifest, ensure_ascii=False, indent=1,
+                             default=_json_fallback).encode("utf-8"))
 
 
 def load_manifest(root: str):

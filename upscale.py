@@ -114,25 +114,23 @@ def parse_state(ds):
 
 
 def tail_refine_args(sigma_start, tail_steps):
-    """(尾段起始σ, 精化步数 n) -> common_ksampler 的 (steps=N, denoise)。
+    """(尾段起始σ, 精化步数 n) -> common_ksampler 的 (steps=n, denoise=σ)。
 
-    common_ksampler 对 denoise<1 的内部行为 = N 步调度序列取尾 int(N·denoise) 步，
-    flow-matching 下初始加噪 (1-σ₀)x0+σ₀ε 落在截断后的 σ₀——本就是 sigma 尾段精化；
-    本函数把「σ 起点 × 精化步数」两个直接语义换算回该公开 API：
-    - N=round(n/σ)：simple 线性调度下截断点 σ₀≈n/N 即请求值（非 simple/带 shift
-      调度为网格近似，报告行打印实际生效值兜底）；
-    - N≥n+1 且 denoise=(n+0.5)/N<1：部分精化档永不撞全量重采（denoise=1 会完全
-      丢弃放大后的 latent），σ≥0.95 视为明确请求全量重采才返回 denoise=1.0；
-    - +0.5 抵御 int(N·denoise) 的浮点截断少 1 步。
+    ComfyUI ≥0.3x 的 KSampler.set_steps 对 denoise<1 的内部行为 = 先生成
+    int(steps/denoise) 步完整调度、再取尾 steps 步——steps 恒为实际执行步数，
+    denoise 只定 σ 起点（simple 线性调度下 σ₀≈denoise；非 simple/带 shift 调度
+    为网格近似，报告行打印实际生效值兜底）。两个直接语义一一映射即可：
+    - flow-matching 下初始加噪 (1-σ₀)x0+σ₀ε 落在截断后的 σ₀——本就是
+      sigma 尾段精化；
+    - σ 钳到 n/(n+1)：σ₀ 贴近 1 时 int(n/σ)≤n 会取满整个调度（σ 起点=σ_max
+      =意外全量重采，denoise=1 会完全丢弃放大后的 latent），钳后调度至少截
+      一刀、部分精化档永不撞全量；σ≥0.95 视为明确请求全量重采才返回 1.0。
     """
     n = min(max(int(tail_steps), 1), 100)
     s = min(max(float(sigma_start), 0.05), 1.0)
     if s >= 0.95:
         return n, 1.0
-    big_n = min(max(int(round(n / s)), n + 1), 100)
-    if big_n == 100:
-        n = min(n, max(1, int(big_n * s)))   # σ 过小受 100 格上限，反向钳步数
-    return big_n, min(1.0, (n + 0.5) / big_n)
+    return n, min(s, n / (n + 1))
 
 
 def latent_hf_energy(video_t, max_frames=12):
@@ -730,7 +728,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 参数即「sigma 尾段精化」直接语义：denoise=尾段起始 σ（默认 0.35 低噪声区间）、
     # steps=精化步数（默认 6，建议 3-8；参考工作流即「放大后 3-5 步低噪声 refine」）。
     # 提分辨率靠放大网络、二采只补细节，显存开销小；tail_refine_args 把两个
-    # 直接语义换算回 common_ksampler(denoise) 的尾段截断口径。
+    # 直接语义映射回 common_ksampler(steps=n, denoise=σ₀)——ComfyUI ≥0.3x 的
+    # steps 即实际执行步数、denoise 定 σ 起点。
     seed = (int(cur_seed) + 1) % 0xffffffffffffffff if cur_seed is not None else 1
     latent["samples"] = comfy.nested_tensor.NestedTensor(
         (up_v.to(dev, torch.float32), audio_t.to(dev, torch.float32)))
@@ -747,10 +746,9 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # σ 起点先过段自适应（路线④：基础 latent 运动档位偏移，与 render_segment
     # 报告行同口径）；shift>0 时采样器换二采专用 shift 克隆模型（路线⑤）。
     sigma0, _tier, _motion = resolve_refine_sigma(cfg, video_t)
-    ks_steps, ks_denoise = tail_refine_args(sigma0, cfg["steps"])
-    n_eff = int(ks_steps * ks_denoise)
+    ks_steps, ks_denoise = tail_refine_args(sigma0, cfg["steps"])   # (n, σ₀)
     tb = float(cfg.get("time_bias") or 0.0)
-    restore_tb = time_bias_guard(模型.model.diffusion_model, n_eff / ks_steps, tb) \
+    restore_tb = time_bias_guard(模型.model.diffusion_model, ks_denoise, tb) \
         if tb > 0.0 else None
     sh = float(cfg.get("shift") or 0.0)
     ks_model = _shifted_model(模型, sh) if sh > 0.0 else 模型
@@ -763,7 +761,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样在超出当前显存 {1:g}GB）："
                    "请降低放大倍率、把精化步数调低/起始σ调小，或增大显存。"
                    "当前精化 {2} 步 @ σ≈{3:g}。本段尚未落盘二采产物，可先行释放其他模型后重试。".format(
-                       cfg["scale"], _vram_gb(), n_eff, n_eff / ks_steps))
+                       cfg["scale"], _vram_gb(), ks_steps, ks_denoise))
             if report is not None:
                 report.append(msg)
             raise UpscaleAbortError(msg) from e
@@ -829,13 +827,12 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _sig, _tier, _mo = resolve_refine_sigma(cfg, video_t)
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh,
                             hf_gain=hf_gain, motion=_mo)
-    _n, _d = tail_refine_args(_sig, cfg["steps"])
-    _n_eff = int(_n * _d)
+    _n, _d = tail_refine_args(_sig, cfg["steps"])   # _n=执行步数，_d=σ 起点
     _tb = float(cfg.get("time_bias") or 0.0)
     _mix = float(cfg.get("mix") or 0.0)
     _sh = float(cfg.get("shift") or 0.0)
     report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
-                  f"精化 {_n_eff} 步 @ σ≈{_n_eff / _n:g} · 细节 {hf_gain:+.0%} · "
+                  f"精化 {_n} 步 @ σ≈{_d:g} · 细节 {hf_gain:+.0%} · "
                   f"{time.perf_counter() - t0:.0f}s"
                   + (" · 桥锚" if bridged else "")
                   + (f" · 偏置{_tb:g}" if _tb > 0 else "")

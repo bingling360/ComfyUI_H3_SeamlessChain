@@ -1136,7 +1136,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if not upscale.record_stale(manifest, root, up_cfg, g, bh):
                 return True, False
             try:
-                proj_upscale = upscale.render_segment(
+                # 返回 (高清尾帧 CPU tensor, 最新存档状态)：尾帧暂无消费方
+                # （跨段连续性仍走基础 latent 桥），只回填存档状态进 manifest
+                _, proj_upscale = upscale.render_segment(
                     模型, clip, video_vae, audio_vae, negative, up_cfg, up_net,
                     root, g, video_t, audio_t, kind, idx,
                     seg_prompts, seg_label_orders, pool_tensors, refs,
@@ -1671,8 +1673,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if use_ckpt:
                 # 二采在段视频落盘前接管：成功/记录沿用则段视频即高清结果（同名覆盖），
                 # 失败才回退基础分辨率保存（fresh 强制重编码，覆盖可能写坏的 mp4）
+                # 尾锚与基础链 _tail_kf 同规则：末段=尾帧图片（剧情终点优先、同位置
+                # 唯一锚不叠加），其余段=每段尾帧锚定——回放段也可能补渲染，就地重算
+                _up_tail_kf = end_frame_latent \
+                    if (i == len(seg_prompts) - 1 and end_frame_latent is not None) \
+                    else tail_anchor_latent
                 hi_ready, hi_tried = _up_hi(g, video_t, audio_t, "prompt", i,
-                                            None if seg_unlink[i] else guide, tail_anchor_latent,
+                                            None if seg_unlink[i] else guide, _up_tail_kf,
                                             cur_seed, skip_f, frames.shape[0],
                                             wav, sample_rate)
                 if not hi_ready:
