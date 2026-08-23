@@ -817,6 +817,7 @@ function setUpscaleField(node, field, value) {
     }
     setDs(node, ds);
     scheduleRefresh(60);
+    repaintUpscale();          // 编辑即刷新：徽章/参数区当场更新（见 repaintUpscale 注释）
 }
 
 /** 手动选择模式：勾/取消某段（slot=0-based 全局槽位，含序章/插入段） */
@@ -828,12 +829,22 @@ function toggleUpscaleInclude(node, slot) {
     ds.upscale.include = [...inc].sort((a, b) => a - b);
     setDs(node, ds);
     scheduleRefresh(60);
+    repaintUpscale();          // 段落卡勾选后二采区计数当场更新
 }
 
-/** 目标画布估算（与后端 target_hw 同口径：latent 偶数对齐=像素 32 倍数） */
+/** 目标画布估算（与后端 target_hw 同口径：latent 偶数对齐=像素 32 倍数）。
+ *  画幅来源与后端 _resolve_canvas / 链参数换算徽章同源：非「自定义」按 宽高比×百万像素
+ *  换算——宽/高控件此时只是旧残留，直接读会算出与主徽章打架的错数；「自定义」才读宽高。 */
 function upTargetCanvas(node, scale) {
-    const w = Number(getWidgetValue(node, W_WIDTH));
-    const h = Number(getWidgetValue(node, W_HEIGHT));
+    const ar = String(getWidgetValue(node, W_AR) ?? "");
+    let w = 0, h = 0;
+    if (AR_RATIO[ar]) {
+        const c = resolveCanvas(ar, String(getWidgetValue(node, W_MP) ?? "0.5"));
+        if (c) [w, h] = c;
+    } else {
+        w = Number(getWidgetValue(node, W_WIDTH));
+        h = Number(getWidgetValue(node, W_HEIGHT));
+    }
     if (!isFinite(w) || !isFinite(h) || !w || !h) return "";
     const even = (x) => { const v = Math.max(2, Math.round(x)); return v + v % 2; };
     return `${even(w / 16 * scale) * 16}×${even(h / 16 * scale) * 16}`;
@@ -1863,6 +1874,10 @@ function openDesk() {
     if (desk) return;
     const page = el("section", "h3d-page");
     page.tabIndex = -1;
+    /* 免疫浏览器整页自动翻译：本面板中英混排（2D/latent/simple…），被机翻改写会全面错乱
+     * （2D→二维、simple→简单的、整句被重写）。translate 属性随 DOM 继承，标在根上即可。 */
+    page.setAttribute("translate", "no");
+    page.classList.add("notranslate");
 
     /* 顶栏 */
     const topbar = el("header", "h3d-topbar");
@@ -1963,6 +1978,7 @@ function updateDesk(data) {
     if (!desk) return;
     const { node, state, mf, plan, drafts, history, prefix } = data;
     const z = desk.zones;
+    desk.lastData = data;      // 供 repaintUpscale 局部重渲沿用 mf/state/模型列表缓存
 
     /* 顶栏项目名 + LED */
     const dirName = state?.dir || (node ? getDirValue(node) : "") || "无当前链";
@@ -2806,7 +2822,7 @@ function renderWidgetField(node, name, labelOverride) {
             if (String(v) === String(w.value)) o.selected = true;
             sel.append(o);
         }
-        sel.onchange = () => setWidgetValue(node, name, sel.value);
+        sel.onchange = () => { setWidgetValue(node, name, sel.value); repaintAfterWidget(name); };
         field.append(sel);
     } else {
         const row = el("div", "h3d-seedrow");
@@ -2817,7 +2833,7 @@ function renderWidgetField(node, name, labelOverride) {
         inp.step = step || (name === W_MP || name === "CFG" || name === W_DUR ? 0.1 : 1);
         if (w.options && Number.isFinite(w.options.min)) inp.min = w.options.min;
         if (w.options && Number.isFinite(w.options.max)) inp.max = w.options.max;
-        inp.onchange = () => setWidgetValue(node, name, Number(inp.value));
+        inp.onchange = () => { setWidgetValue(node, name, Number(inp.value)); repaintAfterWidget(name); };
         inp.addEventListener("wheel", (e) => e.preventDefault(), { passive: false });   // 滚轮滚动面板时不改数值
         row.append(inp);
         if (name === W_MP) {
@@ -2834,6 +2850,7 @@ function renderWidgetField(node, name, labelOverride) {
                 const v = Math.floor(Math.random() * 2 ** 48);
                 setWidgetValue(node, name, v);
                 inp.value = v;
+                repaintAfterWidget(name);
             };
             row.append(dice);
         }
@@ -2940,6 +2957,44 @@ function repaintExperiments() {
     } catch (e) {
         console.warn("[h3-director] repaintExperiments failed:", e);
     }
+}
+
+/* 二采/链参数面板局部重渲：与 repaintExperiments 同款机制，修「编辑后界面不动」。
+ * 病根：数值/下拉的 onchange 以回车提交时焦点仍在区内控件上，updateDesk 的焦点守卫
+ * 会跳过重渲，且此后没有事件再触发刷新——目标画布徽章、换算徽章、「已开启」角标
+ * 就一直停留旧值。此处改为提交型编辑当场重建：直读画布控件零网络往返；
+ * mf/state/模型列表沿用最近一次全局刷新的缓存（desk.lastData），只关乎本地参数显示。
+ * 同步刷新 dataset.sig（与 updateDesk 同公式），防止紧随的全局 refresh 重复重建。 */
+function repaintUpscale() {
+    if (!desk || !desk.zones || !desk.zones.rUpscale) return;
+    try {
+        const data = Object.assign({}, desk.lastData, { node: findNode() });
+        data.ds = data.node ? getDs(data.node) : (data.ds || {});
+        if (!data.ds.upscale) return;
+        desk.zones.rUpscale.dataset.sig = upscaleSig(data);
+        renderUpscaleZone(desk.zones.rUpscale, data);
+    } catch (e) {
+        console.warn("[h3-director] repaintUpscale failed:", e);
+    }
+}
+
+function repaintParams() {
+    if (!desk || !desk.zones || !desk.zones.rParams) return;
+    try {
+        const node = findNode();
+        desk.zones.rParams.dataset.sig = paramsSig(node);
+        renderParamsZone(desk.zones.rParams, { node });
+    } catch (e) {
+        console.warn("[h3-director] repaintParams failed:", e);
+    }
+}
+
+/** 链参数编辑后的跨区联动：画幅四件（宽高比/百万像素/宽/高）变更重建本区
+ *  （换算徽章、自定义模式宽高输入切换）与二采区（目标画布）；其余参数无跨区显示不动。 */
+function repaintAfterWidget(name) {
+    if (name !== W_AR && name !== W_MP && name !== W_WIDTH && name !== W_HEIGHT) return;
+    repaintParams();
+    repaintUpscale();
 }
 
 function renderExperimentsZone(sec, data) {
@@ -3580,12 +3635,14 @@ const FAB_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" wi
 
 function mountSidebar(target) {
     miniBox = target;
+    target.setAttribute("translate", "no");   // 迷你卡同样免疫浏览器机翻（容器为本扩展专属）
     refresh();
 }
 
 function mountFallbackFab() {
     const btn = document.createElement("button");
     btn.className = "h3d-fab";
+    btn.setAttribute("translate", "no");
     btn.title = "长片导演台（H3 Seamless Chain）";
     btn.innerHTML = FAB_ICON;
     btn.onclick = openDesk;

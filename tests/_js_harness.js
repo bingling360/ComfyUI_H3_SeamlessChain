@@ -205,6 +205,18 @@ eq("目标画布 2x", mod.upTargetCanvas(nodeC, 2), "2688×1536");
 eq("目标画布 1.5x", mod.upTargetCanvas(nodeC, 1.5), "2016×1152");
 eq("目标画布 2.6x 取偶", mod.upTargetCanvas(nodeC, 2.6), "3488×2016");
 eq("目标画布缺控件", mod.upTargetCanvas({}, 2), "");
+/* 非自定义画幅：按 宽高比×百万像素 换算（与链参数徽章/后端 _resolve_canvas 同源），
+ * 宽/高控件旧残留不作数——否则二采徽章会与主徽章打架 */
+const nodeA = { widgets: [
+    { name: "宽高比", value: "16:9" }, { name: "百万像素", value: 0.98 },
+    { name: "宽度", value: 864 }, { name: "高度", value: 480 },   // 过期残留
+] };
+eq("非自定义按AR×MP换算", mod.upTargetCanvas(nodeA, 2), "2688×1536");
+eq("非自定义 1x 即原生画布", mod.upTargetCanvas(nodeA, 1), "1344×768");
+const nodeZ = { widgets: [
+    { name: "宽高比", value: "自定义" }, { name: "宽度", value: 864 }, { name: "高度", value: 480 },
+] };
+eq("自定义仍读宽高控件", mod.upTargetCanvas(nodeZ, 2), "1728×960");
 
 /* ---- 实验性功能（扁平契约 + 主开关）：注入迷你 defs 无头校验 ---- */
 const MINI_DEFS = [
