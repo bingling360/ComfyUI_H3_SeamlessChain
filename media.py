@@ -124,6 +124,19 @@ def decode_av(path):
     return video, wav, sample_rate
 
 
+def probe_video_size(path):
+    """mp4 实测 (宽, 高)；无视频轨/打开失败返回 None（调用方自行兜底）。"""
+    try:
+        import av
+        with av.open(path) as c:
+            vs = next((s for s in c.streams if s.type == "video"), None)
+            if vs is not None and vs.codec_context.width and vs.codec_context.height:
+                return int(vs.codec_context.width), int(vs.codec_context.height)
+    except Exception:
+        pass
+    return None
+
+
 def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, threads=4):
     """多个 mp4 按序流式拼接为一个（H.264 + AAC），成功返回 True。
 
@@ -227,6 +240,8 @@ def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, th
     except Exception as e:
         last_error = f"{type(e).__name__}: {e}"
         print(f"[concat_av_mp4] 合并异常：{last_error}")
+        import traceback
+        traceback.print_exc()   # EINVAL 之类环境错误需要完整栈才能定位抛出点
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)

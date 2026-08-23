@@ -348,23 +348,30 @@ def test_latent_motion():
 
 
 def test_adaptive_sigma():
-    """档位映射与 σ 偏移：静态+0.05 / 中±0 / 高运动−0.075，钳 [0.05, 0.95]。"""
+    """档位映射与 σ 偏移：静态+0.05 / 中±0 / 高运动−0.075，钳 [0.05, 0.95]。
+
+    阈值 v2 已按 latent token 间距重标定（0.34/0.75 = 原逐帧口径 0.10/0.22 ×
+    17/5——真实项目 latent 相邻 token 运动量普遍 0.47–0.60，旧阈值全饱和误判）。
+    """
     f = upscale.adaptive_sigma
-    s, tier = f(0.35, 0.01)
+    s, tier = f(0.35, 0.2)
     assert tier == "静态" and abs(s - 0.40) < 1e-9
-    s, tier = f(0.35, 0.15)
-    assert tier == "中" and s == 0.35                          # 中档 +0.0 精确不动
     s, tier = f(0.35, 0.5)
+    assert tier == "中" and s == 0.35                          # 中档 +0.0 精确不动
+    s, tier = f(0.35, 0.9)
     assert tier == "高运动" and abs(s - 0.275) < 1e-9
     # 阈值边界（严格不等）：恰在阈值上=中档
-    assert upscale.motion_tier(0.10) == "中"
-    assert upscale.motion_tier(0.22) == "中"
-    assert upscale.motion_tier(0.0999) == "静态"
-    assert upscale.motion_tier(0.2201) == "高运动"
+    assert upscale.motion_tier(0.34) == "中"
+    assert upscale.motion_tier(0.75) == "中"
+    assert upscale.motion_tier(0.3399) == "静态"
+    assert upscale.motion_tier(0.7501) == "高运动"
+    # 真实项目校准样本：普通运动影片 0.47–0.60 全落中档（不再被统一压 σ）
+    assert upscale.motion_tier(0.47) == "中"
+    assert upscale.motion_tier(0.60) == "中"
     # clamp 边界（min/max 返回常量侧，精确相等）
-    assert f(0.93, 0.01)[0] == 0.95                           # 静态顶到上限
-    assert f(0.06, 0.5)[0] == 0.05                            # 高运动落到下限
-    s, tier = f(0.90, 0.5)
+    assert f(0.93, 0.2)[0] == 0.95                           # 静态顶到上限
+    assert f(0.06, 0.9)[0] == 0.05                           # 高运动落到下限
+    s, tier = f(0.90, 0.9)
     assert tier == "高运动" and abs(s - 0.825) < 1e-9
 
 
@@ -396,7 +403,7 @@ def test_params_hash_adaptive_shift():
                                           "shift": 6.0}})
     assert h != upscale.params_hash(ad)
     assert h != upscale.params_hash(sh)
-    assert upscale._hash_params(ad)["adaptive"] is True        # 记录口径同指纹
+    assert upscale._hash_params(ad)["adaptive"] == upscale._ADAPTIVE_VERSION  # 记录口径同指纹（含阈值版本）
     both = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth",
                                             "adaptive": True, "shift": 6.0}})
     assert upscale.params_hash(both) != upscale.params_hash(ad)
@@ -471,6 +478,19 @@ def test_target_hw():
     assert upscale.target_hw(24, 40, 1.0) == (24, 40)    # 偶尺寸恒等
     assert upscale.target_hw(25, 41, 1.0) == (26, 42)    # 奇 latent 补偶
     assert upscale.target_hw(1, 1, 1.5) == (2, 2)        # 最小 2
+
+
+def test_target_pixels():
+    """像素目标 (宽, 高) 与官方节点 width/height 同向——tw/th 对调修复的回归钉。
+
+    官方 _empty_av_latent(width, height) 生成 [24,T,height//16,width//16]；
+    render_latent/preflight 一律经本函数取像素宽高，横画布必须宽在前。
+    """
+    assert upscale.target_pixels(40, 72, 1.5) == (1728, 960)   # 16:9 横画布（真实案例）
+    assert upscale.target_pixels(72, 40, 1.5) == (960, 1728)   # 竖画布
+    assert upscale.target_pixels(25, 41, 2.0) == (1312, 800)   # 取偶对齐随 target_hw
+    assert upscale.target_pixels(24, 40, 1.0) == (640, 384)    # 恒等
+    assert upscale.target_pixels(1, 1, 1.0) == (32, 32)        # 最小 latent
 
 
 def test_resize_latent_bilinear():

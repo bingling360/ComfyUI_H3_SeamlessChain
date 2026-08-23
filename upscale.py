@@ -198,9 +198,14 @@ def freq_mix_latents(base_v, refined_v, ratio, chunk=8):
 
 
 # 段自适应 σ：latent 域相对运动量 -> 档位 -> σ 起点偏移（路线④）
-_MOTION_STATIC_MAX = 0.10   # < 此值=静态（对话/特写）→ 升 σ 抠脸
-_MOTION_ACTION_MIN = 0.22   # > 此值=高运动（打斗/运镜）→ 降 σ 防拖影鬼影
-# 两阈值为初始估计：报告行打印「运动量→档位→σ」，用真实项目的报告数据校准
+# 阈值口径 = 原始逐帧意图 × 17/5：latent 相邻 token 隔约 3.4 个像素帧（H3 的
+# 17k+5 帧 ↔ 5k+2 token 压缩），合成张量标的 0.10/0.22 在真实 latent 上全饱和
+# ——首个真实项目 8 段全部 0.47–0.60 被误判「高运动」统一压 σ。×3.4 重标定后
+# 该样本全落中档（σ 不动），真静态/真高运动仍可分；报告行照打「运动量→档位」，
+# 后续真实项目数据可继续校准这两个常数。
+_ADAPTIVE_VERSION = "v2"     # 阈值口径版本：进指纹，重标定后 adaptive 旧记录按新档重做
+_MOTION_STATIC_MAX = 0.34   # < 此值=静态（对话/特写）→ 升 σ 抠脸
+_MOTION_ACTION_MIN = 0.75   # > 此值=高运动（打斗/运镜）→ 降 σ 防拖影鬼影
 _SIGMA_OFFSETS = {"静态": 0.05, "中": 0.0, "高运动": -0.075}
 
 
@@ -287,7 +292,7 @@ def _hash_params(cfg):
     if cfg.get("mix"):
         keys["mix"] = cfg["mix"]
     if cfg.get("adaptive"):
-        keys["adaptive"] = True     # 只进策略位；档内生效σ由基础 latent 决定论派生
+        keys["adaptive"] = _ADAPTIVE_VERSION   # 策略位含阈值口径版本；重标定即升版重做
     if cfg.get("shift"):
         keys["shift"] = cfg["shift"]
     return keys
@@ -362,6 +367,18 @@ def target_hw(h, w, scale):
     h2 = max(2, int(round(h * float(scale))))
     w2 = max(2, int(round(w * float(scale))))
     return h2 + h2 % 2, w2 + w2 % 2
+
+
+def target_pixels(h, w, scale):
+    """latent (H, W) -> 像素 (宽, 高)：与官方节点 width/height 语义同向（宽在前）。
+
+    历史 bug：render_latent 曾按 target_hw(...)[0]/[1] 直接命名 tw/th——[0] 是
+    latent 高、[1] 是宽，导致 cond 构造 width/height 对调（非方画幅时官方节点把
+    空画布/首帧 keyframe 编成转置构图）、manifest size 与成片拼接目标也跟着反
+    （拼接被喂 960×1728 这类竖参，Linux 实测 EINVAL 22）。统一走本函数杜绝复发。
+    """
+    h2, w2 = target_hw(h, w, scale)
+    return w2 * 16, h2 * 16
 
 
 def upscale_video(video_t, net, scale, arch="2D"):
@@ -540,7 +557,7 @@ def preflight(模型, cfg, net, video_t, audio_t, report=None):
     h, w = video_t.shape[-2], video_t.shape[-1]
     scale = float(cfg.get("scale", 2.0) or 2.0)
     h2, w2 = target_hw(h, w, scale)
-    tw, th = h2 * 16, w2 * 16
+    tw, th = w2 * 16, h2 * 16
     mp = tw * th / 1e6
     lines.append(f"… 画布：基础 {w * 16}×{h * 16} → 二采 {tw}×{th}"
                  f"（{mp:.1f}MP，×{scale:g}）")
@@ -667,7 +684,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 只回载 UNET 到 GPU——CLIP/VAE 不再占显存，26GB UNET + 高清激活即可放下。
     # 未触发 OOM 则原样跑；一级降级=全卸只回 UNET；二级降级=LOW_VRAM 分块兜底。
     h, w = video_t.shape[-2], video_t.shape[-1]
-    tw, th = target_hw(h, w, cfg["scale"])[0] * 16, target_hw(h, w, cfg["scale"])[1] * 16
+    tw, th = target_pixels(h, w, cfg["scale"])
     length = grid.latent_t_to_frames(video_t.shape[2])
 
     # 前置健康预检：在放大/分配高清内存【之前】把显存不足、画布越界、模型缺失
@@ -946,8 +963,11 @@ def try_final(root, cfg, report):
         from . import media
     except ImportError:
         import media
-    if media.concat_av_mp4(sources, os.path.join(root, out_name),
-                           width=size0[0], height=size0[1]):
+    # 画幅/报告行取首个分段【实测】尺寸：记录 size 修复前存的是转置 [高, 宽]
+    # （tw/th 对调遗留），实测口径对旧/新记录都正确；一致性门控仍用记录值
+    # （旧记录整批同向转置，互相比较不受影响）。concat 缺省即按首源实测画幅。
+    sz = media.probe_video_size(sources[0]) or tuple(size0)
+    if media.concat_av_mp4(sources, os.path.join(root, out_name)):
         fresh = checkpoint.load_manifest(root) or dict(mf)
         fresh.setdefault("finals", []).append(out_name)
         up_state = dict(fresh.get("upscale") or {})
@@ -956,7 +976,7 @@ def try_final(root, cfg, report):
         fresh["updated_at"] = time.time()
         checkpoint.save_manifest(root, fresh)
         report.append(f"二采成片：{total} 段高清流式拼接 → {out_name}"
-                      f"（{size0[0]}×{size0[1]}，音轨沿用原声）")
+                      f"（{sz[0]}×{sz[1]}，音轨沿用原声）")
         return True
     report.append(f"二采成片编码失败（{media.last_error}）——回退编码基础分辨率成片，"
                   "分段高清不受影响")

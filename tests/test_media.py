@@ -36,6 +36,17 @@ class TestSaveAvMp4(unittest.TestCase):
                 n = sum(1 for _ in c.decode(video=0))
             self.assertEqual(n, 24)
 
+    def test_probe_video_size(self):
+        """实测 (宽, 高) 且宽在前——try_final 拼接画幅改走探测口径的回归钉。"""
+        from media import probe_video_size, save_av_mp4
+        frames = torch.rand(6, 48, 80, 3)   # 高 48 × 宽 80 的横帧
+        wav = torch.randn(1, 44100) * 0.1
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.mp4")
+            self.assertTrue(save_av_mp4(path, frames, wav, 44100))
+            self.assertEqual(probe_video_size(path), (80, 48))
+            self.assertIsNone(probe_video_size(os.path.join(d, "nope.mp4")))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
