@@ -368,7 +368,7 @@ if (wf) {
         ok(`link${lid} 槽位回指`, so.link === lid && di.link === lid);
     }
     /* 主节点输入槽顺序与后端 schema 一致（autogrow 全组 0 起编号，含提示词组） */
-    const expect = ["模型", "文本编码器", "视频VAE", "音频VAE", "首帧图片", "尾帧锚定", "起始视频", "起始视频音轨",
+    const expect = ["模型", "文本编码器", "视频VAE", "音频VAE", "首帧图片", "尾帧图片", "每段尾帧锚定", "起始视频", "起始视频音轨",
         "提示词组.提示词_0", "提示词组.提示词_1", "提示词组.提示词_2",
         ...Array.from({ length: 9 }, (_v, i) => `参考图片组.参考图片_${i}`),
         ...Array.from({ length: 3 }, (_v, i) => `参考视频组.参考视频_${i}`),
@@ -376,13 +376,21 @@ if (wf) {
         ...Array.from({ length: 3 }, (_v, i) => `参考音频组.参考音频_${i}`)];
     eq("主节点槽位顺序", h3n.inputs.map((i) => i.name), expect);
     /* 提示词组 3 槽都已连线（运行兜底） */
-    ok("提示词槽已连线", h3n.inputs.slice(8, 11).every((i) => i.link != null));
-    /* 尾帧锚定：槽位 5 预连线到隐藏「尾帧图」LoadImage（任意模式可点亮） */
+    ok("提示词槽已连线", h3n.inputs.slice(9, 12).every((i) => i.link != null));
+    /* 尾帧图片：槽位 5 预连线到隐藏「目标尾帧图」LoadImage（FL2VA 剧情终点，仅首帧模式） */
+    const ef = [...byId.values()].find((n) => n.title === "目标尾帧图");
+    ok("目标尾帧图节点存在", !!ef);
+    if (ef) {
+        eq("目标尾帧图节点隐藏", ef.mode, 2);
+        eq("目标尾帧图→槽位5 尾帧图片", [10, 5],
+            [wf.links.find((l) => l[0] === ef.outputs[0].link)[3], wf.links.find((l) => l[0] === ef.outputs[0].link)[4]]);
+    }
+    /* 每段尾帧锚定：槽位 6 预连线到隐藏「尾帧图」LoadImage（任意模式可点亮） */
     const lf = [...byId.values()].find((n) => n.title === "尾帧图");
     ok("尾帧图节点存在", !!lf);
     if (lf) {
         eq("尾帧图节点隐藏", lf.mode, 2);
-        eq("尾帧图→槽位5 尾帧锚定", [10, 5],
+        eq("尾帧图→槽位6 每段尾帧锚定", [10, 6],
             [wf.links.find((l) => l[0] === lf.outputs[0].link)[3], wf.links.find((l) => l[0] === lf.outputs[0].link)[4]]);
     }
     /* 分段视频不再单独打包：改由主节点「自动保存」存进项目文件夹（导演台段卡片预览） */

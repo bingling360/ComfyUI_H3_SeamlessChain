@@ -9,6 +9,7 @@
  *   { mode:"文生视频"|"首帧视频"|"多参视频",
  *     prompts:["段1文本","段2文本",...],
  *     first_frame:"input目录下的文件名",
+ *     end_frame:"input目录下的文件名（FL2VA 剧情终点，仅首帧模式）",
  *     ref_assets:[ { file:"文件名", kind:"image"|"video"|"audio", label:"角色1" }, ... ],
  *                                // 标签素材池（真源，三类混排；官方单段上限 图9/视3/音3）
  *     ref_images:["文件名1",...], // 兼容保留 = ref_assets 中图片类文件的序列
@@ -70,7 +71,7 @@ const REF_TEMPLATES = [
 ];
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
-    ["首帧视频", "首帧", "首帧图片起手，fl2va UNET"],
+    ["首帧视频", "首帧", "首帧起手（可选尾帧图片=FL2VA 首尾帧），fl2va UNET"],
     ["多参视频", "多参", "参考图/视频/音频，ref2va UNET，[[标签]] 引用"],
 ];
 const MODE_DEFAULT = "文生视频";
@@ -455,7 +456,7 @@ function fixInvalidArWidget(node) {
 /* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
 
 function defaultDs() {
-    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], upscale: defaultUpscale(), experiments: defaultExperiments() };
+    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", end_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], upscale: defaultUpscale(), experiments: defaultExperiments() };
 }
 
 function defaultUpscale() {
@@ -562,6 +563,7 @@ function getDs(node) {
             mode: MODES.some(([m]) => m === raw.mode) ? raw.mode : MODE_DEFAULT,
             prompts,
             first_frame: typeof raw.first_frame === "string" ? raw.first_frame : "",
+            end_frame: typeof raw.end_frame === "string" ? raw.end_frame : "",
             last_frame: typeof raw.last_frame === "string" ? raw.last_frame : "",
             ref_images: refAssets.filter((a) => a.kind === "image").map((a) => a.file),
             ref_assets: refAssets,
@@ -604,11 +606,13 @@ function syncModeWidget(node, mode) {
 function applyModeDs(ds, mode) {
     if (mode === "文生视频") {
         ds.first_frame = "";
+        ds.end_frame = "";
         ds.ref_assets = [];
     } else if (mode === "首帧视频") {
         ds.ref_assets = [];
     } else if (mode === "多参视频") {
         ds.first_frame = "";
+        ds.end_frame = "";
     }
     ds.mode = mode;
 }
@@ -790,7 +794,20 @@ function removeFirstFrame(node) {
     scheduleRefresh(120);
 }
 
-/* 尾帧锚定（身份锚点，任意模式可用）：与首帧同机制，但不随模式切换清空 */
+/* 尾帧图片（FL2VA 剧情终点，仅首帧模式）：整链最后一段的末帧 keyframe，与首帧图片组成官方首尾帧 */
+function setEndFrame(node, filename) {
+    const ds = getDs(node);
+    ds.end_frame = filename || "";
+    setDs(node, ds);
+    syncMirrors(node, ds);
+    scheduleRefresh(120);
+}
+
+function removeEndFrame(node) {
+    setEndFrame(node, "");
+}
+
+/* 每段尾帧锚定（身份锚点，任意模式可用）：与首帧同机制，但不随模式切换清空 */
 function setLastFrame(node, filename) {
     const ds = getDs(node);
     ds.last_frame = filename || "";
@@ -1052,7 +1069,8 @@ function syncMirrors(node, ds) {
     if (!node || !ds) return;
     const byKind = (k) => (Array.isArray(ds.ref_assets) ? ds.ref_assets.filter((a) => a.kind === k) : []);
     setMirrorNode("首帧图", ds.mode === "首帧视频" ? (ds.first_frame || "") : "", ["image"]);
-    setMirrorNode("尾帧图", ds.last_frame || "", ["image"]);   // 尾帧锚定：任意模式可用
+    setMirrorNode("目标尾帧图", ds.mode === "首帧视频" ? (ds.end_frame || "") : "", ["image"]);   // 尾帧图片（FL2VA）：仅首帧模式
+    setMirrorNode("尾帧图", ds.last_frame || "", ["image"]);   // 每段尾帧锚定：任意模式可用
     const multi = ds.mode === "多参视频";
     const imgs = multi ? byKind("image") : [];
     for (let i = 0; i < 9; i++) {
@@ -1099,14 +1117,14 @@ async function loadDefaultWorkflow() {
     scheduleRefresh(300);
 }
 
-/** 文件选择 + 上传：target="first"=首帧图；target="last"=尾帧锚定；kind=image/video/audio=入素材池。
+/** 文件选择 + 上传：target="first"=首帧图；target="end"=尾帧图片（FL2VA）；target="last"=每段尾帧锚定；kind=入素材池。
  *  上传统一走 /upload/image（服务端按原样字节写入 input 目录，不限图片）。 */
 async function pickAsset(target, kind) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = (target === "first" || target === "last") ? "image/*" : KIND_ACCEPT[kind] || "image/*";
+    input.accept = (target === "first" || target === "end" || target === "last") ? "image/*" : KIND_ACCEPT[kind] || "image/*";
     input.onchange = async () => {
         const f = input.files && input.files[0];
         if (!f) return;
@@ -1114,6 +1132,8 @@ async function pickAsset(target, kind) {
             const name = await uploadToInput(f);
             if (target === "first") {
                 setFirstFrame(node, name);
+            } else if (target === "end") {
+                setEndFrame(node, name);
             } else if (target === "last") {
                 setLastFrame(node, name);
             } else {
@@ -2662,7 +2682,7 @@ function buildCards(data) {
                 unlinkRow.append(unlinkCb, document.createTextNode("🔗 独立镜头（与上段断链）"));
                 unlinkRow.title = "本段与上一段完全断开衔接：不注入上段尾帧引导桥、不裁头、"
                     + "不做接缝精修/像素混合/接缝测量/响度对齐，上段也不做桥帧门控回退——段间硬切转场。"
-                    + "适用于与上一镜头毫无关联的独立画面。本段尾帧锚定与素材引用不受影响；"
+                    + "适用于与上一镜头毫无关联的独立画面。本段每段尾帧锚定与素材引用不受影响；"
                     + "切换此开关会使该段起重跑（指纹语义正确）";
                 unlinkCb.onchange = () => {
                     setSegmentField(node, it.idx, "unlink", unlinkCb.checked);
@@ -2886,6 +2906,20 @@ function renderAssetsZone(sec, data) {
         acts.insertBefore(up, acts.firstChild);
         if (!card.querySelector(".h3d-asset-acts")) card.append(acts);
         box.append(card);
+        /* 尾帧图片（FL2VA 官方首尾帧）：整链最后一段的末帧 keyframe = 剧情终点 */
+        const ef = ds.end_frame;
+        const ecard = assetCard("尾帧图片", ef,
+            ef ? () => { removeEndFrame(node); } : null);
+        ecard.querySelector("small").textContent = ef || "未设置（可选，整链终点的到达画面）";
+        const eacts = ecard.querySelector(".h3d-asset-acts") || el("div", "h3d-asset-acts");
+        const eup = el("button", "h3d-btn h3d-btn-cyan", ef ? "替换" : "上传");
+        eup.title = "FL2VA 官方首尾帧：整链最后一段的末帧锚（剧情终点画面）。"
+            + "末段提示词写「如何走到这个画面」，不复述图内静态内容；设了它末段不再叠加每段尾帧锚定。"
+            + "画布「目标尾帧图」节点同步点亮";
+        eup.onclick = () => pickAsset("end");
+        eacts.insertBefore(eup, eacts.firstChild);
+        if (!ecard.querySelector(".h3d-asset-acts")) ecard.append(eacts);
+        box.append(ecard);
     } else {
         /* 多参：标签素材池（图/视/音三类，状态驱动 + 画布镜像） */
         ds.ref_assets.forEach((_a, i) => {
@@ -2907,15 +2941,18 @@ function renderAssetsZone(sec, data) {
         box.append(upRow);
     }
 
-    /* 尾帧锚定（身份锚点，任意模式可用）：每段末尾注入参考帧，与段首引导桥形成双锚约束防漂移 */
+    /* 每段尾帧锚定（身份锚点，任意模式可用）：每段末尾注入参考帧，与段首引导桥形成双锚约束防漂移
+     * （与「尾帧图片」不同：那是 FL2VA 剧情终点，只落最后一段；这是全链恒定的身份锚） */
     {
         const lf = ds.last_frame;
-        const card = assetCard("尾帧锚定", lf, lf ? () => { removeLastFrame(node); } : null);
+        const card = assetCard("每段尾帧锚定", lf, lf ? () => { removeLastFrame(node); } : null);
         card.querySelector("small").textContent = lf || "未设置（可选，建议角色正面清晰帧）";
         const acts = card.querySelector(".h3d-asset-acts") || el("div", "h3d-asset-acts");
         const up = el("button", "h3d-btn h3d-btn-cyan", lf ? "替换" : "上传");
-        up.title = "尾帧锚定（任意模式可用）：注入每段末尾作为人物/场景参考，"
-            + "与段首引导桥形成「隧道」双锚约束，防止过了桥窗口后主体漂移。画布「尾帧图」节点同步点亮";
+        up.title = "每段尾帧锚定（任意模式可用）：同一张身份锚点图注入每段末尾（人物/场景参考），"
+            + "与段首引导桥形成「隧道」双锚约束，防止过了桥窗口后主体漂移。"
+            + "注意与「尾帧图片」不同：那是首帧模式下的 FL2VA 剧情终点（只落最后一段）。"
+            + "画布「尾帧图」节点同步点亮";
         up.onclick = () => pickAsset("last");
         acts.insertBefore(up, acts.firstChild);
         if (!card.querySelector(".h3d-asset-acts")) card.append(acts);

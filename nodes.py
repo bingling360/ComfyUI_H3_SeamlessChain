@@ -539,7 +539,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.String.Input("导演台状态", multiline=True, default="", socketless=True, advanced=True,
                                tooltip="导演台前端写入的 JSON 状态（模式/提示词/素材文件名/分段处理）。"
                                        "有值时优先于画布接线：提示词从 JSON 读取，图片从 input 目录加载。"
-                                       "first_frame=首帧图片、last_frame=尾帧锚定（身份锚点，任意模式可用）；"
+                                       "first_frame=首帧图片、end_frame=尾帧图片（FL2VA 剧情终点，仅首帧模式）、"
+                                       "last_frame=每段尾帧锚定（身份锚点，任意模式可用）；"
                                        "ref_assets 为标签素材池 [{file,label}]；segments 数组为每段提供 "
                                        "scene_prompt / character_prompt / soundscape（环境音）/"
                                        "music（配乐，均留空省略）/ seconds（本段秒数）/"
@@ -549,7 +550,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "只存相对输入文件名，不存媒体内容、密钥或绝对路径。"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
-                io.Image.Input("尾帧锚定", optional=True,
+                io.Image.Input("尾帧图片", optional=True,
+                               tooltip="FL2VA 官方首尾帧：整链最后一段的末帧 keyframe（剧情终点画面）。"
+                                       "仅「首帧视频」模式；末段提示词写「如何走到这个画面」的过程，"
+                                       "不复述图内静态内容；设了它，末段不再叠加每段尾帧锚定"),
+                io.Image.Input("每段尾帧锚定", optional=True,
                                tooltip="身份锚定帧（last_frame keyframe）：注入每段末尾位置作为人物/场景参考，"
                                        "与段首引导桥形成「隧道」——模型去噪全程被首尾双锚点约束，过了桥窗口"
                                        "（约2秒）也不会漂移。建议用角色正面清晰帧（导演台素材池可上传，"
@@ -599,7 +604,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
     @classmethod
     def execute(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽高比, 百万像素, 宽度, 高度, 每段时长, 引导帧数,
-                种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 尾帧锚定=None, 起始视频=None, 起始视频音轨=None,
+                种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 尾帧图片=None, 每段尾帧锚定=None, 起始视频=None, 起始视频音轨=None,
                 提示词组=None,
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
                 自动存档="关闭", 存档目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
@@ -785,9 +790,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if ds.get("first_frame"):
             首帧图片 = _load_input_image(ds["first_frame"])
 
-        # 尾帧锚定（身份锚点，任意模式可用）：导演台 JSON 优先，空则用画布连接
+        # 尾帧图片（FL2VA 剧情终点，仅首帧模式）：导演台 JSON 优先，空则用画布连接
+        if ds.get("end_frame"):
+            尾帧图片 = _load_input_image(ds["end_frame"])
+
+        # 每段尾帧锚定（身份锚点，任意模式可用）：导演台 JSON 优先，空则用画布连接
         if ds.get("last_frame"):
-            尾帧锚定 = _load_input_image(ds["last_frame"])
+            每段尾帧锚定 = _load_input_image(ds["last_frame"])
 
         # i2v 首段官方指令行（官方 I2VA 固定格式：声明首帧 = <Picture 1> 锚）；
         # 已是官方格式的段不注入（用户自管的完整结构里可能自带指令行）
@@ -833,18 +842,33 @@ class H3SeamlessChainSampler(io.ComfyNode):
             raise ValueError("「首帧视频」模式下不能接参考素材（首帧与多参互斥）：请切到「多参视频」模式用参考图")
         if _mode == "多参视频" and 首帧图片 is not None:
             raise ValueError("「多参视频」模式下不能接首帧图片（多参与首帧互斥）：请切到「首帧视频」模式用首帧")
+        if 尾帧图片 is not None and _mode != "首帧视频":
+            raise ValueError("尾帧图片（FL2VA 官方首尾帧）只在「首帧视频」模式可用：请在导演台切到首帧模式")
 
         if str(宽高比) != "自定义":
             宽度, 高度 = _resolve_canvas(宽高比, 百万像素)
         width, height, seed = int(宽度), int(高度), int(种子)
         length = _snap_seconds(每段时长)
         seg_lengths = [length if s is None else s for s in seg_secs]
+        # FL2VA 末段官方指令行（镜像 I2VA 首段行的官方句式：声明末帧 = <Picture k> 锚，
+        # 时间点=末段时长；首尾都接时尾帧是 <Picture 2>，只接尾帧时为 <Picture 1>）；
+        # 已是官方格式的段不注入
+        if 尾帧图片 is not None and seg_prompts \
+                and not _OFFICIAL_FIELD_RE.search(seg_prompts[-1]):
+            _pic = 2 if 首帧图片 is not None else 1
+            _end_s = seg_lengths[-1] / 24.0
+            seg_prompts[-1] = (f"For the target video, at {_end_s:.2f} seconds into the target video, "
+                               f"<Picture {_pic}> (from [Shot 1]) is fully referenced.\n" + seg_prompts[-1])
         ctx = int(引导帧数)
         gate_limit = max(0, int(回退上限) // 17 * 17)
         from . import qc  # 桥帧打分 + 接缝测量共用（延迟导入：无 ComfyUI 环境下结构单测不触达）
         clip, video_vae, audio_vae = 文本编码器, 视频VAE, 音频VAE
         if has_refs:
             chain = "r2v（ref2va UNET）"
+        elif 首帧图片 is not None and 尾帧图片 is not None:
+            chain = "FL2VA 首尾帧（首帧开场 → 尾帧终点，fl2va UNET）"
+        elif 尾帧图片 is not None:
+            chain = "L2VA 尾帧终点（fl2va UNET）"
         elif 首帧图片 is not None:
             chain = "i2v 首段 + t2v 续段（fl2va UNET）"
         else:
@@ -925,9 +949,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           + (f"（起点=锚定加噪 {aug:.2f}）" if aug > 0 else "（硬锚定起点）"))
 
         tail_anchor_latent = None
-        if 尾帧锚定 is not None:
-            tail_anchor_latent = video_vae.encode(_center_cover(尾帧锚定[:1], width, height))
-            report.append(f"尾帧锚定：身份锚点注入末帧 keyframe（{'视觉保真 ' + format(1.0 - aug, '.2f') if aug > 0 else '硬锚定'}）")
+        if 每段尾帧锚定 is not None:
+            tail_anchor_latent = video_vae.encode(_center_cover(每段尾帧锚定[:1], width, height))
+            report.append(f"每段尾帧锚定：身份锚点注入末帧 keyframe（{'视觉保真 ' + format(1.0 - aug, '.2f') if aug > 0 else '硬锚定'}）")
+
+        # 尾帧图片（FL2VA 剧情终点）：编码后注入最后一段的末帧 keyframe；设了它，
+        # 末段不再叠加每段尾帧锚定（同一位置只有一个锚，剧情终点优先）
+        end_frame_latent = None
+        if 尾帧图片 is not None:
+            end_frame_latent = video_vae.encode(_center_cover(尾帧图片[:1], width, height))
+            _last_gi = sum(1 for it in exec_items if it[0] == "prompt")
+            report.append(f"尾帧图片：FL2VA 剧情终点 → 段{_last_gi} 末帧 keyframe"
+                          + ("（末段不叠加每段尾帧锚定）" if tail_anchor_latent is not None else ""))
 
         # 存档指纹只覆盖共享参数（不含提示词、不含种子）：改某段提示词仍指向同一条链，
         # 重跑起点由逐段提示词哈希比对定位；种子控件开着 control_after_generate 每次运行
@@ -1394,10 +1427,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         first_frame=首帧图片 if i == 0 else None)
 
                 cond, latent = out[0], out[1]
-                # 独立镜头段：上段桥不注入（guide 屏蔽为 None）；尾帧锚定是用户主动
+                # 独立镜头段：上段桥不注入（guide 屏蔽为 None）；每段尾帧锚定是用户主动
                 # 设定的本段结尾身份锚点，与段间衔接无关，不受断链影响
                 eff_guide = None if seg_unlink[i] else guide
-                if eff_guide is not None or tail_anchor_latent is not None:
+                # 尾帧图片（FL2VA 剧情终点）：只落在最后一个提示词段的末帧；
+                # 该段不再叠加每段尾帧锚定（同位置唯一锚，剧情终点优先）
+                _is_last_prompt = (i == len(seg_prompts) - 1)
+                _tail_kf = end_frame_latent if (_is_last_prompt and end_frame_latent is not None) \
+                    else tail_anchor_latent
+                if eff_guide is not None or _tail_kf is not None:
                     # 实验 E1：强化引导桥——把单桥展开为滑窗/重叠 keyframe 序列。
                     # 全关时 e1_kfs=None，_apply_guide 走现状单桥路径（零影响）。
                     e1_kfs = None
@@ -1425,7 +1463,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             ]
                     cond = cls._apply_guide(
                         cond, eff_guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]),
-                        tail_kf_latent=tail_anchor_latent, e1_windows=e1_kfs, memory_kfs=memory_kfs)
+                        tail_kf_latent=_tail_kf, e1_windows=e1_kfs, memory_kfs=memory_kfs)
                     # 锚定加噪（SkyReels-V2 addnoise_condition 思路）：H3 模型 payload
                     # 原生支持 cond 噪声增强（extra_conds 从 cond dict 任意键取参），
                     # aug=1.0 即不加噪；值越小锚定越「软」，缓解段首刹车/内容重演

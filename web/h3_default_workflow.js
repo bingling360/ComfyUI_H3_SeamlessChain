@@ -6,7 +6,8 @@
  *   画布节点作为镜像/兜底——没有导演台状态也能直接跑（导演台段数 1–64 不限）
  * - 每段视频由主节点「自动保存=分段」存进项目文件夹 output/h3_projects/<项目名>/，
  *   manifest 记录后在导演台段卡片直接预览（不再单独落盘 output/h3_segments/）
- * - 「素材池 · 自动管理」节点组：首帧图 + 尾帧图（尾帧锚定）+ 参考图×9 + 参考视频×3 + 参考音频×3
+ * - 「素材池 · 自动管理」节点组：首帧图 + 目标尾帧图（尾帧图片·FL2VA）+ 尾帧图（每段尾帧锚定）
+ *   + 参考图×9 + 参考视频×3 + 参考音频×3
  *   全部预连线到主节点对应输入槽；不用时 mode=2(Never)+折叠 = 隐藏但连线常驻，
  *   导演台上传/删除素材时点亮/隐藏对应节点（连线与配置保留，不动态建线）
  *
@@ -82,17 +83,18 @@
   nodes.push(unet, clip, vaeV, vaeA);
 
   // ---- 主节点：全部输入槽按 schema 顺序预声明（连线常驻） ----
-  // 槽位：0 模型 1 文本编码器 2 视频VAE 3 音频VAE 4 首帧图片 5 尾帧锚定
-  //       6 起始视频 7 起始视频音轨
-  //       8..10 提示词_0..2（autogrow 全组 0 起编号）  11..19 参考图片_0..8
-  //       20..22 参考视频_0..2  23..25 参考视频音轨_0..2  26..28 参考音频_0..2
+  // 槽位：0 模型 1 文本编码器 2 视频VAE 3 音频VAE 4 首帧图片 5 尾帧图片 6 每段尾帧锚定
+  //       7 起始视频 8 起始视频音轨
+  //       9..11 提示词_0..2（autogrow 全组 0 起编号）  12..20 参考图片_0..8
+  //       21..23 参考视频_0..2  24..26 参考视频音轨_0..2  27..29 参考音频_0..2
   const h3Inputs = [
     inp("模型", "MODEL", L(1, 0, 10, 0, "MODEL")),
     inp("文本编码器", "CLIP", L(2, 0, 10, 1, "CLIP")),
     inp("视频VAE", "VAE", L(3, 0, 10, 2, "VAE")),
     inp("音频VAE", "VAE", L(4, 0, 10, 3, "VAE")),
     inp("首帧图片", "IMAGE", null),
-    inp("尾帧锚定", "IMAGE", null),
+    inp("尾帧图片", "IMAGE", null),
+    inp("每段尾帧锚定", "IMAGE", null),
     inp("起始视频", "IMAGE", null),
     inp("起始视频音轨", "AUDIO", null),
   ];
@@ -143,10 +145,10 @@
     inp("MASK", "MASK", null),
   ];
 
-  // 提示词×3（槽位 8..10，autogrow 槽名 0 起编号：提示词_0..2）：导演台 JSON 优先，画布为镜像/兜底
+  // 提示词×3（槽位 9..11，autogrow 槽名 0 起编号：提示词_0..2）：导演台 JSON 优先，画布为镜像/兜底
   for (let i = 0; i < 3; i++) {
     const id = 50 + i;
-    const lid = L(id, 0, 10, 8 + i, "STRING");
+    const lid = L(id, 0, 10, 9 + i, "STRING");
     nodes.push(hiddenNode(id, "PrimitiveStringMultiline", `提示词·${i + 1}`,
       [40 + i * 330, 1330], [i === 0 ? "示例段落：黄昏的海边小镇，海浪轻拍礁石，镜头缓缓推近灯塔" : ""],
       [inp("STRING", "STRING", lid)]));
@@ -159,27 +161,33 @@
   nodes.push(hiddenNode(20, "LoadImage", "首帧图", [40, 1660], ["", "image"],
     imgOut(ffLid)));
 
-  // 尾帧锚定图（槽位 5，任意模式可用：导演台上传尾帧时点亮）
-  const lfLid = L(5, 0, 10, 5, "IMAGE");
-  h3Inputs[5].link = lfLid;
+  // 目标尾帧图（槽位 5，FL2VA 剧情终点，仅首帧模式：导演台上传尾帧图片时点亮）
+  const efLid = L(6, 0, 10, 5, "IMAGE");
+  h3Inputs[5].link = efLid;
+  nodes.push(hiddenNode(6, "LoadImage", "目标尾帧图", [40, 2000], ["", "image"],
+    imgOut(efLid)));
+
+  // 每段尾帧锚定图（槽位 6，任意模式可用：导演台上传锚定图时点亮）
+  const lfLid = L(5, 0, 10, 6, "IMAGE");
+  h3Inputs[6].link = lfLid;
   nodes.push(hiddenNode(5, "LoadImage", "尾帧图", [380, 1660], ["", "image"],
     imgOut(lfLid)));
 
-  // 参考图·1..9（槽位 11..19）
+  // 参考图·1..9（槽位 12..20）
   for (let i = 0; i < 9; i++) {
     const id = 21 + i;
     const col = i % 3, row = Math.floor(i / 3);
-    const lid = L(id, 0, 10, 11 + i, "IMAGE");
+    const lid = L(id, 0, 10, 12 + i, "IMAGE");
     nodes.push(hiddenNode(id, "LoadImage", `参考图·${i + 1}`,
       [720 + col * 320, 1660 + row * 340], ["", "image"], imgOut(lid)));
     h3Inputs.push(refSlot("参考图片组", `参考图片_${i}`, "IMAGE", lid));
   }
 
-  // 参考视频×3 + 配套 GetVideoComponents（槽位 20..22 图像 / 23..25 音轨，先视频组后音轨组）
+  // 参考视频×3 + 配套 GetVideoComponents（槽位 21..23 图像 / 24..26 音轨，先视频组后音轨组）
   for (let k = 0; k < 3; k++) {
     const lvId = 30 + k, gvcId = 33 + k;
-    const imgLid = L(gvcId, 0, 10, 20 + k, "IMAGE");
-    const audLid = L(gvcId, 1, 10, 23 + k, "AUDIO");
+    const imgLid = L(gvcId, 0, 10, 21 + k, "IMAGE");
+    const audLid = L(gvcId, 1, 10, 24 + k, "AUDIO");
     const lvLid = L(lvId, 0, gvcId, 0, "VIDEO");
     nodes.push(hiddenNode(lvId, "LoadVideo", `参考视频·${k + 1}`,
       [1380, 1660 + k * 240], [""],
@@ -209,10 +217,10 @@
       links.find((l) => l[1] === gvcId && l[2] === 1 && l[3] === 10)[0]));
   }
 
-  // 参考音频×3（槽位 26..28）
+  // 参考音频×3（槽位 27..29）
   for (let k = 0; k < 3; k++) {
     const id = 36 + k;
-    const lid = L(id, 0, 10, 26 + k, "AUDIO");
+    const lid = L(id, 0, 10, 27 + k, "AUDIO");
     nodes.push(hiddenNode(id, "LoadAudio", `参考音频·${k + 1}`,
       [2040, 1660 + k * 240], [""], [inp("audio", "AUDIO", lid), inp("name", "STRING", null)]));
     h3Inputs.push(refSlot("参考音频组", `参考音频_${k}`, "AUDIO", lid));
@@ -228,7 +236,7 @@
       "- 提示词走导演台状态（JSON 优先），**1–64 段不限**：「＋ 添加一段」加段，" +
       "「提示词·1..3」隐藏节点只是画布镜像兼兜底，超过 3 段全在导演台管理\n" +
       "- 「素材池 · 自动管理」组的节点由导演台自动点亮/隐藏：**连线常驻，不用时只是隐藏**，请勿删除；" +
-      "「尾帧图」= 尾帧锚定（任意模式可用，防主体漂移）\n" +
+      "「目标尾帧图」= 尾帧图片（FL2VA 首尾帧剧情终点，仅首帧模式）；「尾帧图」= 每段尾帧锚定（任意模式可用，防主体漂移）\n" +
       "- 每段结果自动存进项目文件夹 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图 + 成片），" +
       "导演台段卡片直接预览播放；需要另行导出可手动连「分段图像/分段音频」输出\n" +
       "- 默认 ref2va UNET（多参模式）；纯文生/首帧模式请在导演台切换，或把 UNETLoader 换成 fl2va 权重\n" +
