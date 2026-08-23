@@ -3802,6 +3802,7 @@ function openMasterPromptModal() {
     preview();
 
     exp.onclick = () => { ta.value = exportMasterPrompt(node); preview(); };
+    cancel.onclick = () => overlay.remove();
     const submit = () => {
         if (!ta.value.trim()) { err.textContent = "内容为空"; return; }
         const p = applyMasterPrompt(node, ta.value);
