@@ -46,7 +46,7 @@ const W_DS = "导演台状态";
 const W_AR = "宽高比";
 const W_MP = "百万像素";
 /* 版本标记：浏览器控制台过滤 [h3-director] 可确认加载的是新 JS 还是缓存旧版 */
-const H3D_VER = "0b860b8+entry-guard";
+const H3D_VER = "4606579+null-node-safe";
 const W_DUR = "每段时长";
 const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
