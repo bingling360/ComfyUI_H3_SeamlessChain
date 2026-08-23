@@ -45,6 +45,8 @@ const W_MODE = "生成模式";
 const W_DS = "导演台状态";
 const W_AR = "宽高比";
 const W_MP = "百万像素";
+/* 版本标记：浏览器控制台过滤 [h3-director] 可确认加载的是新 JS 还是缓存旧版 */
+const H3D_VER = "0b860b8+entry-guard";
 const W_DUR = "每段时长";
 const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
@@ -2056,6 +2058,22 @@ function renderMini(data) {
     card.append(head, rail, cards, foot);
     miniBox.append(card);
     paintLeds();
+    removeFab();   // 侧栏标签已能渲染内容，撤下保底悬浮球
+}
+
+/* 刷新失败的保底迷你卡：报错信息 + 入口按钮，侧栏标签永不空白 */
+function renderMiniFallback(e) {
+    if (!miniBox) return;
+    miniBox.innerHTML = "";
+    const card = el("div", "h3d-mini");
+    card.append(el("div", "h3d-mini-brand", "长片导演台"));
+    card.append(el("div", "h3d-mini-card",
+        "刷新失败：" + escapeHtml(String((e && e.message) || e))
+        + "<br>接口异常不影响入口，可先打开导演台查看顶部诊断横幅"));
+    const open = el("button", "h3d-btn h3d-btn-cta h3d-mini-open", "打开长片导演台");
+    open.onclick = openDesk;
+    card.append(open);
+    miniBox.append(card);
 }
 
 /* ---------- 全屏导演台 ---------- */
@@ -3942,6 +3960,7 @@ async function refresh() {
         if (desk) updateDesk(data);
     } catch (e) {
         console.warn("[h3-director] refresh failed:", e);
+        renderMiniFallback(e);   // 出错也保住入口按钮，不留空白标签
     }
 }
 
@@ -3952,10 +3971,15 @@ const FAB_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" wi
 function mountSidebar(target) {
     miniBox = target;
     target.setAttribute("translate", "no");   // 迷你卡同样免疫浏览器机翻（容器为本扩展专属）
+    /* 先渲染占位卡再刷新：刷新未返回或失败时标签点开也不空白 */
+    renderMini({ state: {}, mf: null, plan: null, node: null });
     refresh();
 }
 
+let fabEl = null;
+
 function mountFallbackFab() {
+    if (fabEl) return;
     const btn = document.createElement("button");
     btn.className = "h3d-fab";
     btn.setAttribute("translate", "no");
@@ -3963,11 +3987,18 @@ function mountFallbackFab() {
     btn.innerHTML = FAB_ICON;
     btn.onclick = openDesk;
     document.body.append(btn);
+    fabEl = btn;
+}
+
+/* 侧栏标签内容首次成功渲染后撤下悬浮球（标签不可用时悬浮球常驻保底入口） */
+function removeFab() {
+    if (fabEl) { fabEl.remove(); fabEl = null; }
 }
 
 app.registerExtension({
     name: "H3SeamlessChain.DirectorDesk",
     setup() {
+        console.log("[h3-director] loaded", H3D_VER);
         injectStyles();
 
         /* 旧工作流迁移：widget 参数官方化后按位错位，载入画布前重排 widgets_values */
@@ -3988,9 +4019,11 @@ app.registerExtension({
                 type: "custom",
                 render: (elTarget) => mountSidebar(elTarget),
             });
-        } else {
-            mountFallbackFab();
         }
+        /* 悬浮球常驻保底：新版前端存在「标签注册成功但从不调用 render」的情况
+         * （AutoDL ComfyUI 0.33.0 / 前端 1.49.6 实测，标签点开空白）——悬浮球
+         * 不依赖侧栏机制，任何前端都有入口；标签内容首次渲染成功后自动撤下。 */
+        mountFallbackFab();
 
         api.addEventListener("executing", ({ detail }) => {
             if (detail === null) { scheduleRefresh(); return; } // 队列清空
