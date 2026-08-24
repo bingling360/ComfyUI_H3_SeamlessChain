@@ -1020,6 +1020,11 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
 
     # 放大网络工作完毕，卸回 CPU 释放显存给高清重采样
     net.cpu()
+    # 抢占式显存腾挪（README 既定设计，be43db8 重构时随三级降级一起被误删，
+    # 2026-08-25 1.4× 精化实测 OOM 后恢复）：cond 已建好，TE/videoVAE/audioVAE
+    # 精化阶段均用不到——全卸到 CPU（含 UNET），common_ksampler 原生机制只回载
+    # UNET；否则 32GB 卡上 TE 驻留 + UNET + 高清激活三头挤兑，精化必 OOM
+    comfy.model_management.unload_all_models()
     torch.cuda.empty_cache()
     _tmark("cond", _t)
     # CachedClipProxy 在位时标注本段高清条件构建的 TE 是否命中缓存
@@ -1088,21 +1093,36 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                 # 弱分支同样过 time_bias patch 的 dit.forward——两边同偏置，
                 # 差分语义保持
                 ks_model = _stg_model(ks_model, ks_denoise, stg, stg_block)
-            try:
+
+            def _ksample():
                 return comfy_nodes.common_ksampler(
                     ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
                     ks_scheduler, cond, negative, cur_latent,
                     denoise=ks_denoise)[0]
+
+            try:
+                return _ksample()
             except RuntimeError as e:
-                if _is_oom(e):
-                    msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样在超出当前显存 {1:g}GB）："
-                           "请降低放大倍率、把精化步数调低/起始σ调小，或增大显存。"
-                           "当前精化 {2} 步 @ σ≈{3:g}。本段尚未落盘二采产物，可先行释放其他模型后重试。".format(
-                               cfg["scale"], _vram_gb(), ks_steps, ks_denoise))
-                    if report is not None:
-                        report.append(msg)
-                    raise UpscaleAbortError(msg) from e
-                raise
+                if not _is_oom(e):
+                    raise
+                # 一级自救（fee12e1 机制回归）：全卸驻留模型 + 清缓存后【原参】重试
+                # 一次——参数零改动、产物零降级；仍 OOM 才按既定语义硬停整链
+                comfy.model_management.unload_all_models()
+                torch.cuda.empty_cache()
+                try:
+                    return _ksample()
+                except RuntimeError as e2:
+                    if not _is_oom(e2):
+                        raise
+                    e = e2
+                msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样超出当前可回收显存 "
+                       "{1:g}GB，已自动卸载驻留模型原参重试仍失败）："
+                       "请降低放大倍率、把精化步数调低/起始σ调小，或增大显存。"
+                       "当前精化 {2} 步 @ σ≈{3:g}。本段尚未落盘二采产物。".format(
+                           cfg["scale"], _vram_gb(), ks_steps, ks_denoise))
+                if report is not None:
+                    report.append(msg)
+                raise UpscaleAbortError(msg) from e
         finally:
             if restore_tb is not None:
                 restore_tb()
