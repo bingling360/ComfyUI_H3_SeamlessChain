@@ -6,6 +6,7 @@ PyAV 是 ComfyUI 新视频栈（CreateVideo/SaveVideo）的既有依赖，无新
 """
 
 import os
+from fractions import Fraction
 
 last_error = None
 
@@ -38,6 +39,21 @@ def dither_quantize(arr_f):
     tile = np.tile(off, ((h + 3) // 4, (w + 3) // 4))[:h, :w]
     q = np.floor(x * 255.0 + tile[..., None]).clip(0.0, 255.0)
     return q.astype("uint8")
+
+
+def _av_trace_tail(tb_text):
+    """traceback 文本 -> av 内部调用点摘要（去重保序，报错自定位用）。
+
+    av 17 容器级错误（ArgumentError/EINVAL 22 等）的 last_error 只有异常一行，
+    无法区分 write_header / mux / trailer 三个抛出点；把 av/container、av/codec
+    的栈帧并入 last_error，报告行即可直接定位，无需翻 ComfyUI 控制台。
+    """
+    parts = []
+    for ln in tb_text.splitlines():
+        s = ln.strip()
+        if s.startswith(('File "av/', "File 'av/")) and s not in parts:
+            parts.append(s)
+    return " @".join(parts)
 
 
 def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4,
@@ -89,6 +105,7 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4,
                 options["aq-mode"] = str(int(aq_mode))
             vstream.options = options
             astream = container.add_stream("aac", rate=int(sample_rate), layout=layout)
+            v_pts = a_pts = 0   # 显式时间戳计数：视频帧号 / 音频样点数（编码器时基）
 
             for start in range(0, n, 32):
                 raw = (frames[start:start + 32].detach().float().clamp(0.0, 1.0)
@@ -98,6 +115,8 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4,
                         else (raw[i] * 255.0).astype("uint8")
                     frame = av.VideoFrame.from_ndarray(
                         numpy.ascontiguousarray(arr), format="rgb24")
+                    frame.pts = v_pts   # pts=None 依赖编码器/封装器兜底已被 FFmpeg 标记废弃
+                    v_pts += 1
                     for packet in vstream.encode(frame):
                         container.mux(packet)
             if ch > 2:
@@ -106,6 +125,8 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4,
                 aframe = av.AudioFrame.from_ndarray(
                     pcm[:, start:start + 1024], format="fltp", layout=layout)
                 aframe.sample_rate = int(sample_rate)
+                aframe.pts = a_pts
+                a_pts += aframe.samples
                 for packet in astream.encode(aframe):
                     container.mux(packet)
             for packet in vstream.encode():
@@ -120,6 +141,12 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4,
     except Exception as e:
         last_error = f"{type(e).__name__}: {e}"
         print(f"[save_av_mp4] 编码异常：{last_error}")
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        tail = _av_trace_tail(tb)
+        if tail:
+            last_error += " @" + tail
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -244,39 +271,55 @@ def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, th
                 options["aq-mode"] = str(int(aq_mode))
             vstream.options = options
             astream = container.add_stream("aac", rate=base_rate, layout=base_layout)
+            v_pts = a_pts = 0   # 全局单调时间戳：视频帧号 / 音频样点数（跨段连续）
+            frame_tb = Fraction(1) / Fraction(fps)   # 兼容 int/float 帧率
+            audio_parts = []    # 全段音频 PCM 统一在视频轨写完后编码（时长以视频为准）
             for p in sources:
                 with av.open(p) as src:
                     vs = next((s for s in src.streams if s.type == "video"), None)
                     as_in = next((s for s in src.streams if s.type == "audio"), None)
                     n_frames = 0
-                    for vf in src.decode(vs):
-                        if vf.width != w or vf.height != h or str(vf.format.name) != "yuv420p":
-                            vf = vf.reformat(width=w, height=h, format="yuv420p")
-                        vf.pts = None   # 丢弃源时间戳：按输出 fps 线性重定时
-                        n_frames += 1
-                        for packet in vstream.encode(vf):
-                            container.mux(packet)
-                    pcm = None
-                    if as_in is not None:
-                        rs = av.AudioResampler(format="fltp", layout=base_layout, rate=base_rate)
-                        parts = []
-                        for af in src.decode(as_in):
-                            rf = rs.resample(af)
+                    got_audio = False
+                    rs = (av.AudioResampler(format="fltp", layout=base_layout,
+                                            rate=base_rate) if as_in is not None else None)
+                    # 单趟多流解码：先解完视频再解音频会把容器内全部包耗尽，
+                    # 音频轨解出 0 帧（PyAV demux 包按序消费，不回退）
+                    for frame in src.decode(*([vs, as_in] if as_in is not None else [vs])):
+                        if isinstance(frame, av.AudioFrame):
+                            got_audio = True
+                            rf = rs.resample(frame)
                             for f in (rf if isinstance(rf, list) else [rf]):
                                 arr = f.to_ndarray()   # fltp -> [C, T] float32
                                 if arr.ndim == 2 and arr.shape[0]:
-                                    parts.append(arr[:out_ch])
-                        if parts:
-                            pcm = numpy.concatenate(parts, axis=1)
-                    if pcm is None:
-                        silent_n = int(round(n_frames / fps * base_rate))
-                        pcm = numpy.zeros((out_ch, max(0, silent_n)), dtype="float32")
-                    for start in range(0, pcm.shape[1], 1024):
-                        chunk = numpy.ascontiguousarray(pcm[:, start:start + 1024])
-                        af_out = av.AudioFrame.from_ndarray(chunk, format="fltp", layout=base_layout)
-                        af_out.sample_rate = base_rate
-                        for packet in astream.encode(af_out):
+                                    audio_parts.append(arr[:out_ch])
+                            continue
+                        vf = frame
+                        if vf.width != w or vf.height != h or str(vf.format.name) != "yuv420p":
+                            vf = vf.reformat(width=w, height=h, format="yuv420p")
+                        # 显式线性重定时(帧号 + 1/fps 时基)。解码帧自带源时基
+                        # (x264 段常见 1/12288)：只写 pts 不写 time_base 会被
+                        # 重缩放到编码器时基，帧号除以倍率后大量塌缩成同一
+                        # 时间戳，~260 帧起 dts 冲突被 mp4 mux 拒收(EINVAL 22)
+                        vf.pts = v_pts
+                        vf.time_base = frame_tb
+                        v_pts += 1
+                        n_frames += 1
+                        for packet in vstream.encode(vf):
                             container.mux(packet)
+                    if not got_audio:   # 无音轨源按其视频时长补静音
+                        silent_n = int(round(n_frames / fps * base_rate))
+                        audio_parts.append(
+                            numpy.zeros((out_ch, max(0, silent_n)), dtype="float32"))
+            pcm = (numpy.concatenate(audio_parts, axis=1) if audio_parts
+                   else numpy.zeros((out_ch, 0), dtype="float32"))
+            for start in range(0, pcm.shape[1], 1024):
+                chunk = numpy.ascontiguousarray(pcm[:, start:start + 1024])
+                af_out = av.AudioFrame.from_ndarray(chunk, format="fltp", layout=base_layout)
+                af_out.sample_rate = base_rate
+                af_out.pts = a_pts
+                a_pts += chunk.shape[1]
+                for packet in astream.encode(af_out):
+                    container.mux(packet)
             for packet in vstream.encode():
                 container.mux(packet)
             for packet in astream.encode():
@@ -290,7 +333,11 @@ def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, th
         last_error = f"{type(e).__name__}: {e}"
         print(f"[concat_av_mp4] 合并异常：{last_error}")
         import traceback
-        traceback.print_exc()   # EINVAL 之类环境错误需要完整栈才能定位抛出点
+        tb = traceback.format_exc()
+        print(tb)   # EINVAL 之类环境错误需要完整栈才能定位抛出点
+        tail = _av_trace_tail(tb)
+        if tail:
+            last_error += " @" + tail
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
