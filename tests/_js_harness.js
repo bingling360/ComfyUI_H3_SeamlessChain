@@ -45,7 +45,7 @@ eq("迁移尾部保留", remapped.slice(8), [25, 1.0, "res_multistep", "simple"]
 const remapped2 = mod.remapOldWidgetValues([1344, 768, 124, "22", 9, "randomize", 30, 2.0]);
 eq("迁移命中组合", remapped2.slice(0, 7), ["16:9", 0.98, 1344, 768, 5.2, "22", 9]);
 
-/* 旧布局（35 值陈旧 / 25 值导演台时代，两者 0..22 位一致）→ 当前 28 值 schema：
+/* 旧布局（35 值陈旧 / 25 值导演台时代，两者 0..22 位一致）→ 当前 29 值 schema：
  * 头部 0..16 不变，中段按当前控件取位（V25 缺失的接缝四件取默认），
  * 生成模式(idx25)/自动成片(idx26 恒"开启")/导演台状态(idx27) 落尾 */
 const v35old = ["16:9", 0.5, 864, 480, 5.0, "22", 0, "fixed", 25, 1.0,
@@ -53,15 +53,15 @@ const v35old = ["16:9", 0.5, 864, 480, 5.0, "22", 0, "fixed", 25, 1.0,
     "标准", 6, 0.0, "关闭", "分段", 0, 0.45, "39", "自动", 0.06, 1,
     "关闭", "关闭", 17, 48, "开启", "多参视频", "{\"prompts\":[\"x\"]}"];
 const mig35 = mod.remapOldWidgetValuesToCurrent(v35old);
-eq("v35→v28 长度", mig35.length, 28);
-eq("v35→v28 头部不变", mig35.slice(0, 17), v35old.slice(0, 17));
-eq("v35→v28 中段取位", mig35.slice(17, 25), [0.0, "关闭", "分段", 0, "自动", 0.06, 1, "关闭"]);
-eq("v35→v28 尾部", mig35.slice(25), ["多参视频", "开启", "{\"prompts\":[\"x\"]}"]);
+eq("v35→v29 长度", mig35.length, 29);
+eq("v35→v29 头部不变", mig35.slice(0, 17), v35old.slice(0, 17));
+eq("v35→v29 中段取位", mig35.slice(17, 25), [0.0, "关闭", "分段", 0, "自动", 0.06, 1, "关闭"]);
+eq("v35→v29 尾部", mig35.slice(25), ["多参视频", "开启", "{\"prompts\":[\"x\"]}", "标准"]);
 const v25old = v35old.slice(0, 23).concat(["文生视频", ""]);   // 25 值：尾部为生成模式/导演台状态
 const mig25 = mod.remapOldWidgetValuesToCurrent(v25old);
-eq("v25→v28 长度", mig25.length, 28);
-eq("v25→v28 中段取位+默认", mig25.slice(17, 25), [0.0, "关闭", "分段", 0, "自动", 0.06, 1, "关闭"]);
-eq("v25→v28 尾部", mig25.slice(25), ["文生视频", "开启", ""]);
+eq("v25→v29 长度", mig25.length, 29);
+eq("v25→v29 中段取位+默认", mig25.slice(17, 25), [0.0, "关闭", "分段", 0, "自动", 0.06, 1, "关闭"]);
+eq("v25→v29 尾部", mig25.slice(25), ["文生视频", "开启", "", "标准"]);
 
 /* v1 状态迁移 + v2 读写回环 */
 const node = { widgets: [{ name: "导演台状态", value: JSON.stringify({ mode: "多参视频", prompts: ["画面"], ref_images: ["a.png", "b.png"] }) }], setDirtyCanvas() {} };
@@ -407,12 +407,12 @@ if (wf) {
     }
     /* 分段视频不再单独打包：改由主节点「自动保存」存进项目文件夹（导演台段卡片预览） */
     ok("无遗留分段打包链", ![...byId.values()].some((n) => n.type === "CreateVideo" || n.type === "SaveVideo"));
-    /* widgets_values 顺序与后端 schema 控件数一致（28 项 = 27 控件 + 种子 control 占 1 位） */
-    eq("主节点 widgets 数量", h3n.widgets_values.length, 28);
+    /* widgets_values 顺序与后端 schema 控件数一致（29 项 = 28 控件 + 种子 control 占 1 位） */
+    eq("主节点 widgets 数量", h3n.widgets_values.length, 29);
     eq("百万像素浮点默认 0.5", h3n.widgets_values[1], 0.5);
     eq("主节点锚定加噪默认值", h3n.widgets_values[17], 0.0);
     eq("主节点自动保存默认值", h3n.widgets_values[19], "分段");
-    eq("主节点尾部 生成模式/自动成片/导演台状态", h3n.widgets_values.slice(25), ["文生视频", "开启", ""]);
+    eq("主节点尾部 生成模式/自动成片/导演台状态/一采编码", h3n.widgets_values.slice(25), ["文生视频", "开启", "", "标准"]);
     /* last_link_id / last_node_id 覆盖全部 */
     eq("last_node_id", wf.last_node_id, Math.max(...wf.nodes.map((n) => n.id)));
     eq("last_link_id", wf.last_link_id, Math.max(...wf.links.map((l) => l[0])));

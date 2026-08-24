@@ -210,7 +210,8 @@ def _center_cover(frames, width, height):
     return x.movedim(1, -1)
 
 
-def _autosave_final(root, frames, wav, sample_rate, fps=24):
+def _autosave_final(root, frames, wav, sample_rate, fps=24, crf=20, preset="veryfast",
+                    aq_mode=None, dither=False):
     """完整链（或审片已确认部分）PyAV 编码成片到项目文件夹，成功返回路径。
 
     失败时返回 (None, error_msg) 供调用方写入报告；成功返回 (path, None)。
@@ -220,7 +221,8 @@ def _autosave_final(root, frames, wav, sample_rate, fps=24):
         path = os.path.join(root, f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
         print(f"[H3自动保存] 编码完整成片：{int(frames.shape[0])} 帧 → {path}（编码期间 CPU 升高属正常）")
         t0 = time.time()
-        ok = media.save_av_mp4(path, frames, wav, sample_rate, fps)
+        ok = media.save_av_mp4(path, frames, wav, sample_rate, fps,
+                               crf=crf, preset=preset, aq_mode=aq_mode, dither=dither)
         print(f"[H3自动保存] 成片编码{'完成' if ok else '失败'}：{time.time() - t0:.0f}s")
         return (path, None) if ok else (None, media.last_error)
     except Exception as e:
@@ -548,6 +550,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "后端按官方 h3-prompt-writing 三字段结构组装（含对白「」→<d> 自动转换）。"
                                        "空值或旧工作流走原有画布输入（同样获得官方结构组装，向后兼容）。"
                                        "只存相对输入文件名，不存媒体内容、密钥或绝对路径。"),
+                io.Combo.Input("一采编码", options=["标准", "高清", "极致"], default="标准",
+                               tooltip="基础链（≈一采）分段视频与成片的 mp4 编码质量——二采关闭时直接决定正片清晰度："
+                                       "标准=crf20 veryfast（现状兼容）；高清=crf16 medium + 暗部自适应量化 + Bayer 抖动；"
+                                       "极致=crf13 slow + 同上（编码明显变慢）。二采开启时其高清产物同名覆盖，此档自动失效"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Image.Input("尾帧图片", optional=True,
@@ -611,7 +617,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
-                递减锚定="关闭", 生成模式="文生视频", 导演台状态=""):
+                递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准"):
         # 运行期路由兜底：导入期注册因时序失败时，首次执行后前端删除/列表即可用
         try:
             from .routes import ensure_registered
@@ -753,6 +759,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
             except ValueError as e:
                 _up_err = str(e)
                 up_cfg = None
+
+        # 一采编码档位：基础链分段/成片的编码质量（二采开启时其高清产物同名覆盖，本档自然失效）
+        _benc = str(一采编码 or "").strip()
+        if _benc not in upscale.ENCODE_PROFILES:
+            _benc = "标准"
+        _bcrf, _bpreset, _baq, _bdith = upscale._ENCODE_SETTINGS.get(
+            _benc, upscale._ENCODE_SETTINGS["标准"])
 
         # 插入视频段（导演台状态 inserts）：按链位混排进执行序列——画面+原声进成片，
         # 尾帧 latent 桥接指导下一段生成（序章机制的任意段间推广）。
@@ -920,6 +933,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           + "——每段采样定稿后立即渲染高清，分段视频与成片直接保存二采结果")
         elif _up_err:
             report.append(f"潜空间放大二采：面板已开启但本次跳过——{_up_err}")
+        if _benc != "标准":
+            report.append(f"一采编码：{_benc}(crf{_bcrf}/{_bpreset})——二采未覆盖的段与基础成片按此档落盘")
         if str(宽高比) != "自定义":
             report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（官方换算，1MP=1024×1024，32 倍数对齐）")
         else:
@@ -1231,7 +1246,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if not _hi_ready:
                 thumbs.append(checkpoint.save_thumb(root, 0, pframes[0]) if use_ckpt else "")
                 videos.append(checkpoint.save_segment_mp4(root, 0, pframes, pwav, sample_rate,
-                                                          fresh=prologue_fresh or _hi_tried) if use_ckpt else "")
+                                                          fresh=prologue_fresh or _hi_tried,
+                                                          crf=_bcrf, preset=_bpreset, aq_mode=_baq,
+                                                          dither=_bdith) if use_ckpt else "")
             else:
                 _u_files = checkpoint.upscale_files(0)
                 thumbs.append(_u_files["thumb"])
@@ -1342,7 +1359,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if not _hi_ready:
                     thumbs.append(checkpoint.save_thumb(root, g, pframes[0]) if use_ckpt else "")
                     videos.append(checkpoint.save_segment_mp4(root, g, pframes, pwav, sample_rate,
-                                                              fresh=not ins_replay or _hi_tried) if use_ckpt else "")
+                                                              fresh=not ins_replay or _hi_tried,
+                                                              crf=_bcrf, preset=_bpreset, aq_mode=_baq,
+                                                              dither=_bdith) if use_ckpt else "")
                 else:
                     _u_files = checkpoint.upscale_files(g)
                     thumbs.append(_u_files["thumb"])
@@ -1704,7 +1723,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if not hi_ready:
                     thumbs.append(checkpoint.save_thumb(root, g, frames[0]))
                     videos.append(checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate,
-                                                              fresh=not replay or hi_tried))
+                                                              fresh=not replay or hi_tried,
+                                                              crf=_bcrf, preset=_bpreset, aq_mode=_baq,
+                                                              dither=_bdith))
                 else:
                     _u_files = checkpoint.upscale_files(g)
                     thumbs.append(_u_files["thumb"])
@@ -1791,7 +1812,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 由「自动成片」独立开关控制（与「自动保存」解耦）：关闭则完全不成片
         if autosave_final:
             if not (up_cfg and upscale.try_final(root, up_cfg, report)):
-                final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate)
+                final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate,
+                                               crf=_bcrf, preset=_bpreset, aq_mode=_baq,
+                                               dither=_bdith)
                 if final_name:
                     proj_finals.append(os.path.basename(final_name))
                     mf = checkpoint.load_manifest(root) or {}
