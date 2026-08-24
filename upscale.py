@@ -917,7 +917,7 @@ def _stg_model(model, sigma_start, scale, block, lo=0.15, hi=0.85):
 def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
                   pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
-                  采样器, 调度器, report=None):
+                  采样器, 调度器, report=None, _timing=None):
     """基础段 AV latent -> 高清视频 latent（放大 + 低强度重采样）。
 
     kind: "prompt"（提示词段，cond 带本段提示词/参考素材/首帧）
@@ -939,6 +939,11 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo
 
     from . import nodes as plugin_nodes
+
+    def _tmark(key, t0):
+        # 耗时账（render_segment 的 ⏱ 分解行数据源）；_timing=None 时零开销
+        if _timing is not None:
+            _timing[key] = _timing.get(key, 0.0) + (time.perf_counter() - t0)
 
     dev = next(net.parameters()).device
     if dev.type == 'cpu':
@@ -963,14 +968,21 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
 
     # 放大网络放大视频 latent 到 scale×（常驻 GPU，放大完卸回 CPU 腾给高清重采样）；
     # hf_up = 纯放大（无精化）的高频能量基线——细节增益度量的「前」
+    _t = time.perf_counter()
     up_v = upscale_video(video_t, net, cfg["scale"], cfg["arch"])
     hf_up = latent_hf_energy(up_v)
     # 频域细节混合启用时保留纯放大 latent 的 CPU 副本（避开采样期显存峰值，
     # 精化后作低频锚；关闭时零开销不复制）
     mix = float(cfg.get("mix") or 0.0)
     up_v_base = up_v.detach().to("cpu", torch.float32) if mix > 0.0 else None
+    _tmark("up", _t)
 
     # cond 构造：按【高清目标分辨率】（重采样画布），refs/首帧由官方节点编码到高清尺寸
+    _t = time.perf_counter()
+    if _timing is not None:
+        _timing["te_hit"] = None
+        if hasattr(clip, "last_encode_hit"):
+            clip.last_encode_hit = None   # 清残留：官方节点未走拦截路径时保持「未知」而非误报命中
     if kind == "prompt":
         has_refs = any(pool_tensors.values()) or any(refs.values())
         if has_refs:
@@ -1009,6 +1021,10 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 放大网络工作完毕，卸回 CPU 释放显存给高清重采样
     net.cpu()
     torch.cuda.empty_cache()
+    _tmark("cond", _t)
+    # CachedClipProxy 在位时标注本段高清条件构建的 TE 是否命中缓存
+    if _timing is not None:
+        _timing["te_hit"] = getattr(clip, "last_encode_hit", None)
 
     # 低强度重采样（高清 latent）：初始 = 放大后的视频 latent + 原音频 latent；
     # 采样输出的音频丢弃，分段/成片音轨 = 原轨（零音频回归）。
@@ -1108,6 +1124,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # restore_rows 的 finally 覆盖整条精化链（任一轮异常都恢复守卫再上抛）
     sigmas = cascade_sigmas(sigma0, passes, decay)
     up_out_v, hf_gain, retried = None, 0.0, False
+    _t = time.perf_counter()
     try:
         cur = latent
         for k, sk in enumerate(sigmas):
@@ -1137,6 +1154,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                               f"（{'采纳' if retried else '保留原轮'}）")
     finally:
         restore_rows()
+    _tmark("refine", _t)
     del cond, latent
     torch.cuda.empty_cache()
     del up_v_base
@@ -1166,20 +1184,24 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     t0 = time.perf_counter()
     purge_legacy(root, g)
 
+    _timing = {}
     up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
-        采样器, 调度器, report=report)
+        采样器, 调度器, report=report, _timing=_timing)
     # 解码高清 latent -> 高清帧（官方 VAE.decode 自带 OOM→tiled 降级，无需干预）
+    _t = time.perf_counter()
     frames = video_vae.decode(up_v)
     del up_v
     torch.cuda.empty_cache()
     if len(frames.shape) == 5:
         frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
     frames = frames[skip_f:skip_f + vis_len]
+    _timing["decode"] = time.perf_counter() - _t
     # 像素域锐化（抗糊 N4）：解码后、编码前——连 VAE 解码的软化一起补偿；
     # CPU 分块零显存，amount=0 原对象直通
+    _t = time.perf_counter()
     _psp = float(cfg.get("pixel_sharpen") or 0.0)
     if _psp > 0.0:
         frames = pixel_sharpen_frames(frames, _psp)
@@ -1196,6 +1218,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     checkpoint.save_thumb(root, g, frames[0])
     files = checkpoint.upscale_files(g)
     _save_png(os.path.join(root, files["last"]), frames[-1])
+    _timing["store"] = time.perf_counter() - _t
     _sig, _tier, _mo = resolve_refine_sigma(cfg, video_t)
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh,
                             hf_gain=hf_gain, motion=_mo, sharp=sharp)
@@ -1228,6 +1251,13 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   + ((f" · {(_sam + '/' + _sch).rstrip('/')}")
                      if (_sam or _sch) else "")
                   + (" · 重试取优" if retried else ""))
+    _te = _timing.get("te_hit")
+    _te_txt = "" if _te is None else ("（TE命中）" if _te else "（TE未命中）")
+    report.append(f"⏱ 段{g + 1} 二采分解：神经放大 {_timing.get('up', 0.0):.0f}s · "
+                  f"高清条件 {_timing.get('cond', 0.0):.0f}s{_te_txt} · "
+                  f"精化重采 {_timing.get('refine', 0.0):.0f}s · "
+                  f"高清解码 {_timing.get('decode', 0.0):.0f}s · "
+                  f"编码落盘 {_timing.get('store', 0.0):.0f}s")
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
     torch.cuda.empty_cache()
     return frames[-1].detach().float().cpu(), up_state

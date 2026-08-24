@@ -887,6 +887,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
         else:
             chain = "t2v（fl2va UNET）"
 
+        # cond 文本编码缓存代理：一采/二采/重摇/E4 全链共用同一实例——TE 的
+        # tokenize+encode 只依赖提示词文本，同一段提示词（含二采高清条件重建、
+        # negative 空串）只前向一次；参考图/视频的 VAE 编码与画布其他节点不受影响
+        from .cond_cache import CachedClipProxy
+        clip = CachedClipProxy(clip)
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
         report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}，模式 {_mode}，上下文 {ctx} 帧"]
@@ -1268,6 +1273,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                    full_bridge=full_bridge)
             report.append(f"段1/{total}：{prologue_origin} 序章 留{pframes.shape[0]}帧 · 种子 — | guide=无（序章）")
 
+        # 每段耗时账（⏱ 报告行数据源）：cond=一采条件构建（TE/参考编码）、
+        # sample=一采采样（重摇各次尝试累计）、decode=基础解码裁剪（含重摇重复解码）
+        _seg_t = {"cond": 0.0, "sample": 0.0, "decode": 0.0}
+
         def _decode_crop(i, video_t, audio_t, skip_f, gi, next_bridge):
             """解码 → 桥帧门控 → 尾切 token 对齐 → 裁剪到保留区（重摇与正常路径共用）。
 
@@ -1278,6 +1287,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             报告行只取最终采用的尝试（重摇的中间尝试整组丢弃）。
             """
             lines = []
+            _t = time.perf_counter()
             sampled_fc = latent_t_to_frames(video_t.shape[2])
             vis_len = seg_lengths[i]
             frames = video_vae.decode(video_t)
@@ -1312,6 +1322,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             skip_s = round(wav_total * skip_f / sampled_fc)
             take_s = round(wav_total * vis_len / sampled_fc)
             wav = wav[..., skip_s:skip_s + take_s]
+            _seg_t["decode"] += time.perf_counter() - _t
             return frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, lines
 
         def _next_wants_bridge(item_i):
@@ -1417,6 +1428,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             replay = use_ckpt and g < done
             next_wants_bridge = _next_wants_bridge(item_i)
             skip_f = 0 if (item_i == 0 and off == 0) or seg_unlink[i] else ctx
+            _seg_t.update(cond=0.0, sample=0.0, decode=0.0)
             if replay:
                 video_t, audio_t = checkpoint.load_segment(root, g)
                 video_t = video_t.to(video_vae.device)
@@ -1459,15 +1471,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         seg_refs["ref_video_audios"][f"ref_video_audio_{_n['video'] + j}"] = v
                     for j, v in enumerate(refs["ref_audios"].values()):
                         seg_refs["ref_audios"][f"ref_audio_{_n['audio'] + j}"] = v
+                    _t = time.perf_counter()
                     out = MiniMaxH3ReferenceToVideo.execute(
                         clip=clip, vae=video_vae, audio_vae=audio_vae,
                         prompt=prompt, width=width, height=height, length=seg_len,
                         ref_image_size="match", **seg_refs)
                 else:
+                    _t = time.perf_counter()
                     out = MiniMaxH3ImageToVideo.execute(
                         clip=clip, vae=video_vae, prompt=prompt,
                         width=width, height=height, length=seg_len,
                         first_frame=首帧图片 if i == 0 else None)
+                _seg_t["cond"] += time.perf_counter() - _t
 
                 cond, latent = out[0], out[1]
                 # 独立镜头段：上段桥不注入（guide 屏蔽为 None）；每段尾帧锚定是用户主动
@@ -1559,6 +1574,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         if restore_step_aug:
                             restore_step_aug()
                     dt = time.perf_counter() - t0
+                    _seg_t["sample"] += dt
                     video_t, audio_t = sampled["samples"].unbind()
                     frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, gate_lines = \
                         _decode_crop(i, video_t, audio_t, skip_f, gi=g, next_bridge=next_wants_bridge)
@@ -1744,8 +1760,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             origin = "存档载入" if replay else f"采样{latent_t_to_frames(video_t.shape[2])}帧"
             seed_txt = cur_seed if cur_seed is not None else "—"
             report.append(f"段{g + 1}/{total}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧({frames.shape[0] / 24:.1f}s)"
-                          f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {dt:.0f}s") + f" | {note}"
+                          f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {_seg_t['sample']:.0f}s") + f" | {note}"
                           + (" · 独立镜头（断链）" if seg_unlink[i] else ""))
+            report.append(f"⏱ 段{g + 1}：条件 {_seg_t['cond']:.0f}s · 一采 {_seg_t['sample']:.0f}s"
+                          f" · 基础解码 {_seg_t['decode']:.0f}s"
+                          + (f" · TE缓存 命中{clip.hits}/未中{clip.misses}" if clip.hits or clip.misses else ""))
 
             if next_wants_bridge:
                 # end_tokens=kept 末端：锚定末端与输出末端重合（回退量已含在 vis_len 里）
