@@ -1261,8 +1261,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seams.append(None)
             bridge_scores.append(None)
             seam_metrics_rows.append(None)
-            all_frames.append(pframes.cpu())
-            seg_frames.append(pframes.cpu())
+            # 双列表共享同一份 CPU 帧（全程只读），长链累积内存减半
+            _cf = pframes.cpu()
+            all_frames.append(_cf)
+            seg_frames.append(_cf)
             seg_wavs.append({"waveform": pwav.cpu(), "sample_rate": sample_rate})
             all_wav = pwav.cpu()
             prev_tail_frame = pframes[-1].cpu()
@@ -1386,8 +1388,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 else:
                     seeds.append(0)
                 trims.append(0)
-                all_frames.append(pframes.cpu())
-                seg_frames.append(pframes.cpu())
+                _cf = pframes.cpu()
+                all_frames.append(_cf)
+                seg_frames.append(_cf)
                 seg_wavs.append({"waveform": pwav.cpu(), "sample_rate": sample_rate})
                 all_wav = pwav.cpu() if all_wav is None else torch.cat([all_wav, pwav.cpu()], dim=-1)
                 prev_tail_frame = pframes[-1].cpu()
@@ -1703,8 +1706,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     z_row = None
             seam_metrics_rows.append(z_row if ((item_i > 0 or off) and not seg_unlink[i]) else None)
 
-            all_frames.append(frames.cpu())
-            seg_frames.append(frames.cpu())
+            _cf = frames.cpu()
+            all_frames.append(_cf)
+            seg_frames.append(_cf)
             seg_wav = wav.cpu()
             seg_wavs.append({"waveform": seg_wav, "sample_rate": sample_rate})
             all_wav = seg_wav if all_wav is None else torch.cat([all_wav, seg_wav], dim=-1)
