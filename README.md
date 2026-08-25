@@ -81,6 +81,7 @@ non_diegetic_music: {背景配乐：乐器 + 节奏 + 动态，1-3 句}
 - **对白自动转换**：主提示词里的中文对白「……」自动转官方格式 `<d>[中文] ……</d>`；已手写 `<d>` 标签时不再自动转换。**说话人请标稳定 ID**：`短发女主 (S1) 轻声说：「……」`，同一角色跨段用同一编号，不出声的角色不编号。
 - **官方直通**：主提示词里只要含 `integrated_multimodal_description:` / `overall_soundscape:` / `detailed_description:` 任一标签，整段按你写的内容原样发送（贴官方完整格式的提示词不会被二次包装；r2v 用户可手写官方六段结构 `subject_definitions` / `summary` / `retention_analysis` / `detailed_description` / `overall_soundscape` / `non_diegetic_music`）。
 - **i2v 首段**：接了「首帧图片」时，首段提示词自动前置官方 I2VA 指令行 `For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.`，续段不加。
+- **段级首尾帧图引用**：首帧视频模式下，段卡片「首尾帧图」行可逐段勾选是否参考首帧图/尾帧图（`segments[i].frame_refs`，缺省=首段参考首帧、末段参考尾帧）。中段勾首帧图=头部身份锚（keyframe 注入抑制长链漂移）；任意段勾尾帧图=该段末帧锚（优先于每段尾帧锚定）。改动进该段哈希，重跑自动从该段起重做；详见《更新说明_段级首尾帧图引用》。
 - **r2v 参考定义**：多参模式下，段内提示词没显式写 `<Picture k>` 时自动前置官方风格参考定义块 `subject_definitions:`（每资源一行，声明该参考的锚定职责）。
 
 **官方写法要点**（想手写完整官方格式时照这个来）：

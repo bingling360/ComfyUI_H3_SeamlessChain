@@ -27,6 +27,7 @@ common_ksampler。多 token 桥与 keyframe 音频需要 ComfyUI 含 PR #15439
 行数，钉多 token 桥会形状错位，运行时自动探测并降级为单帧桥（报告说明）。
 """
 
+import gc
 import os
 import re
 import time
@@ -208,6 +209,46 @@ def _center_cover(frames, width, height):
     x = frames[..., :3].movedim(-1, 1).float()
     x = comfy.utils.common_upscale(x, width, height, "lanczos", "center")
     return x.movedim(1, -1)
+
+
+_FRAME_REF_KINDS = ("首帧图", "尾帧图")
+
+
+def _default_frame_refs(i, n, has_first, has_end):
+    """段级首尾帧图引用的缺省值（旧档行为）：首段参考首帧图、末段参考尾帧图。"""
+    refs = []
+    if has_first and i == 0:
+        refs.append("首帧图")
+    if has_end and i == n - 1:
+        refs.append("尾帧图")
+    return refs
+
+
+def _parse_frame_refs(segments, n, has_first, has_end):
+    """解析段级首尾帧图引用（segments[i].frame_refs，仅首帧模式有意义）。
+
+    返回 (picked, explicit)：
+    picked[i] = 该段有效引用列表（未知标签忽略、去重、保序）；
+    explicit[i] = 该段 JSON 是否显式写了 frame_refs 数组——缺省段沿用默认行为，
+    哈希与旧存档完全兼容；显式勾选可给中段注入首帧图头部身份锚 / 任意段注入
+    尾帧图尾部锚，也可对首末段关闭默认参考（改动进逐段哈希，从该段起重做）。
+    """
+    picked, explicit = [], []
+    for i in range(n):
+        seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
+        raw = seg.get("frame_refs")
+        if isinstance(raw, list):
+            explicit.append(True)
+            sel = []
+            for x in raw:
+                k = str(x).strip()
+                if k in _FRAME_REF_KINDS and k not in sel:
+                    sel.append(k)
+            picked.append(sel)
+        else:
+            explicit.append(False)
+            picked.append(_default_frame_refs(i, n, has_first, has_end))
+    return picked, explicit
 
 
 def _autosave_final(root, frames, wav, sample_rate, fps=24, crf=20, preset="veryfast",
@@ -546,7 +587,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "ref_assets 为标签素材池 [{file,label}]；segments 数组为每段提供 "
                                        "scene_prompt / character_prompt / soundscape（环境音）/"
                                        "music（配乐，均留空省略）/ seconds（本段秒数）/"
-                                       "refs（本段引用的素材标签，缺省=全部），提示词用 [[标签]] 引用素材，"
+                                       "refs（本段引用的素材标签，缺省=全部）/ frame_refs（段级首尾帧图引用："
+                                       "首帧图/尾帧图，缺省=首段参考首帧、末段参考尾帧；中段勾首帧图=头部身份锚，"
+                                       "任意段勾尾帧图=该段尾锚），提示词用 [[标签]] 引用素材，"
                                        "后端按官方 h3-prompt-writing 三字段结构组装（含对白「」→<d> 自动转换）。"
                                        "空值或旧工作流走原有画布输入（同样获得官方结构组装，向后兼容）。"
                                        "只存相对输入文件名，不存媒体内容、密钥或绝对路径。"),
@@ -811,9 +854,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if ds.get("last_frame"):
             每段尾帧锚定 = _load_input_image(ds["last_frame"])
 
+        # 段级首尾帧图引用（类似多参段级素材勾选）：决定每段是否参考首帧/尾帧图片。
+        # 缺省=旧行为（首段 i2v 参考首帧图、末段参考尾帧图终点锚）；显式勾选可为
+        # 中段注入首帧图头部身份锚 / 任意段注入尾帧图尾部锚，也可关闭首末段默认参考
+        seg_frame_refs, seg_fr_explicit = _parse_frame_refs(
+            segments, len(seg_prompts), 首帧图片 is not None, 尾帧图片 is not None)
+        seg_first_on = ["首帧图" in fr for fr in seg_frame_refs]
+        seg_end_on = ["尾帧图" in fr for fr in seg_frame_refs]
+
         # i2v 首段官方指令行（官方 I2VA 固定格式：声明首帧 = <Picture 1> 锚）；
         # 已是官方格式的段不注入（用户自管的完整结构里可能自带指令行）
-        if 首帧图片 is not None and seg_prompts and not _OFFICIAL_FIELD_RE.search(seg_prompts[0]):
+        if 首帧图片 is not None and seg_first_on[0] and seg_prompts \
+                and not _OFFICIAL_FIELD_RE.search(seg_prompts[0]):
             seg_prompts[0] = ("For the target video, at 0.00 seconds into the target video, "
                               "<Picture 1> (from [Shot 1]) is fully referenced.\n" + seg_prompts[0])
 
@@ -865,10 +917,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
         seg_lengths = [length if s is None else s for s in seg_secs]
         # FL2VA 末段官方指令行（镜像 I2VA 首段行的官方句式：声明末帧 = <Picture k> 锚，
         # 时间点=末段时长；首尾都接时尾帧是 <Picture 2>，只接尾帧时为 <Picture 1>）；
-        # 已是官方格式的段不注入
-        if 尾帧图片 is not None and seg_prompts \
+        # 已是官方格式的段不注入。段级勾选关掉末段尾帧图时不注入；
+        # 首段关掉首帧图时 <Picture> 编号前移
+        if 尾帧图片 is not None and seg_end_on[-1] and seg_prompts \
                 and not _OFFICIAL_FIELD_RE.search(seg_prompts[-1]):
-            _pic = 2 if 首帧图片 is not None else 1
+            _pic = 2 if (首帧图片 is not None and seg_first_on[0]) else 1
             _end_s = seg_lengths[-1] / 24.0
             seg_prompts[-1] = (f"For the target video, at {_end_s:.2f} seconds into the target video, "
                                f"<Picture {_pic}> (from [Shot 1]) is fully referenced.\n" + seg_prompts[-1])
@@ -995,14 +1048,33 @@ class H3SeamlessChainSampler(io.ComfyNode):
             tail_anchor_latent = video_vae.encode(_center_cover(每段尾帧锚定[:1], width, height))
             report.append(f"每段尾帧锚定：身份锚点注入末帧 keyframe（{'视觉保真 ' + format(1.0 - aug, '.2f') if aug > 0 else '硬锚定'}）")
 
-        # 尾帧图片（FL2VA 剧情终点）：编码后注入最后一段的末帧 keyframe；设了它，
-        # 末段不再叠加每段尾帧锚定（同一位置只有一个锚，剧情终点优先）
+        # 尾帧图片（FL2VA 剧情终点）：编码后注入勾选了尾帧图的段末帧 keyframe；
+        # 勾了尾帧图的段不再叠加每段尾帧锚定（同一位置只有一个锚，剧情终点优先）
         end_frame_latent = None
         if 尾帧图片 is not None:
             end_frame_latent = video_vae.encode(_center_cover(尾帧图片[:1], width, height))
-            _last_gi = sum(1 for it in exec_items if it[0] == "prompt")
-            report.append(f"尾帧图片：FL2VA 剧情终点 → 段{_last_gi} 末帧 keyframe"
-                          + ("（末段不叠加每段尾帧锚定）" if tail_anchor_latent is not None else ""))
+            _end_segs = [str(i + 1) for i in range(len(seg_prompts)) if seg_end_on[i]]
+            report.append(f"尾帧图片：FL2VA 剧情终点 → 段{'、'.join(_end_segs)} 末帧 keyframe"
+                          + ("（这些段不叠加每段尾帧锚定）" if tail_anchor_latent is not None else ""))
+
+        # 首帧图片（中段段级引用）：任一中段勾了首帧图时编码为头锚 latent——
+        # 注入段头 keyframe 作为身份锚（同 E2 记忆锚段首注入模式），抑制长链漂移
+        head_frame_latent = None
+        if 首帧图片 is not None and any(seg_first_on[i] and i > 0
+                                         for i in range(len(seg_prompts))):
+            head_frame_latent = video_vae.encode(_center_cover(首帧图片[:1], width, height))
+
+        if any(seg_fr_explicit):
+            _fr_txt = []
+            if 首帧图片 is not None and any(seg_first_on):
+                _fr_txt.append("首帧图→段" + "、".join(
+                    str(i + 1) for i in range(len(seg_prompts)) if seg_first_on[i])
+                    + "（首段=i2v 起手，中段=头部身份锚）")
+            if 尾帧图片 is not None and any(seg_end_on):
+                _fr_txt.append("尾帧图→段" + "、".join(
+                    str(i + 1) for i in range(len(seg_prompts)) if seg_end_on[i]))
+            report.append("首尾帧图段级引用：" + " · ".join(_fr_txt)
+                          + "；未勾段尾部锚回落到每段尾帧锚定")
 
         # 存档指纹只覆盖共享参数（不含提示词、不含种子）：改某段提示词仍指向同一条链，
         # 重跑起点由逐段提示词哈希比对定位；种子控件开着 control_after_generate 每次运行
@@ -1058,6 +1130,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 tag = f"{','.join(lbl for _k, lbl in seg_label_orders[i])}|{tag}"
             if seg_unlink[i]:
                 tag = f"unlink|{tag}"
+            # 段级首尾帧图引用：显式设置且与默认值不同才进哈希（显式但等于默认=行为
+            # 不变不重做；未设置段哈希不变，旧存档续跑零影响）
+            if seg_fr_explicit[i] and seg_frame_refs[i] != _default_frame_refs(
+                    i, len(seg_prompts), 首帧图片 is not None, 尾帧图片 is not None):
+                tag = f"fr:{','.join(seg_frame_refs[i])}|{tag}"
             seg_hashes.append(checkpoint.prompt_hash(tag))
 
         # 插入段哈希 = 文件指纹（mtime+size）：换文件/同名覆盖上传 → 从该段起重跑
@@ -1153,7 +1230,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         seam_metrics_rows = []   # 每缝五维 z-score（与 seams 列表对齐；无缝/指标不可用为 None）
         memory_anchor_rec = None   # 实验 E2：首段落盘的全局记忆锚记录串，回写 manifest memory_anchor 键
 
-        def _up_hi(g, video_t, audio_t, kind, idx, guide_kf, tail_kf, cur_seed,
+        def _up_hi(g, video_t, audio_t, kind, idx, guide_kf, tail_kf, head_kf, cur_seed,
                    skip_f, vis_len, wav, rate):
             """二采渲染段 g 并落盘高清产物（序章/插入段/生成段统一入口）。
 
@@ -1181,7 +1258,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     模型, clip, video_vae, audio_vae, negative, up_cfg, up_net,
                     root, g, video_t, audio_t, kind, idx,
                     seg_prompts, seg_label_orders, pool_tensors, refs,
-                    首帧图片, guide_kf, tail_kf, cur_seed,
+                    首帧图片 if (kind == "prompt" and idx == 0 and seg_first_on[0]) else None,
+                    guide_kf, tail_kf, head_kf, cur_seed,
                     skip_f, vis_len,
                     wav, rate, bh, report, 采样器, 调度器)
                 return True, False
@@ -1191,13 +1269,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 oom = "out of memory" in str(e).lower()
                 report.append(f"段{g + 1} 二采失败：{type(e).__name__}: {e}"
                               "——本段按基础分辨率保存（基础链产物不受影响）"
-                              + ("；显存不够：可把放大倍率降到 1.5× 或把精化步数调低/起始σ调小"
+                              + ("；显存不够：可把放大倍率调低或缩短该段帧数"
+                                 "（精化步数/σ不影响峰值显存）"
                                  "（本段会自动补渲染，基础链不重做）" if oom else ""))
                 # 释放二采残留（放大 latent / 解码帧 / 推理缓存）给后续基础采样腾空间；
                 # 放大网络可能已在 CPU（render_latent 内 net.cpu()），下段二采自愈装回 GPU
                 try:
                     import comfy.model_management
                     comfy.model_management.soft_empty_cache()
+                    gc.collect()
                     torch.cuda.empty_cache()
                 except Exception:
                     pass
@@ -1246,7 +1326,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if len(pframes.shape) == 5:
                 pframes = pframes.reshape(-1, pframes.shape[-3], pframes.shape[-2], pframes.shape[-1])
             pwav, sample_rate = _decode_audio(audio_vae, pa)
-            _hi_ready, _hi_tried = _up_hi(0, pv, pa, "prologue", None, None, None, 0,
+            _hi_ready, _hi_tried = _up_hi(0, pv, pa, "prologue", None, None, None, None, 0,
                                           0, pframes.shape[0], pwav, sample_rate)
             if not _hi_ready:
                 thumbs.append(checkpoint.save_thumb(root, 0, pframes[0]) if use_ckpt else "")
@@ -1367,7 +1447,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if len(pframes.shape) == 5:
                     pframes = pframes.reshape(-1, pframes.shape[-3], pframes.shape[-2], pframes.shape[-1])
                 pwav, sample_rate = _decode_audio(audio_vae, pa)
-                _hi_ready, _hi_tried = _up_hi(g, pv, pa, "insert", None, None, None, 0,
+                _hi_ready, _hi_tried = _up_hi(g, pv, pa, "insert", None, None, None, None, 0,
                                               0, pframes.shape[0], pwav, sample_rate)
                 if not _hi_ready:
                     thumbs.append(checkpoint.save_thumb(root, g, pframes[0]) if use_ckpt else "")
@@ -1431,6 +1511,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             replay = use_ckpt and g < done
             next_wants_bridge = _next_wants_bridge(item_i)
             skip_f = 0 if (item_i == 0 and off == 0) or seg_unlink[i] else ctx
+            # 首帧图段级引用（中段）：头锚 latent——生成段注入 cond，回放段二采补渲染同用
+            #（定义在 replay 分支之前：两路都消费；独立镜头段照常注入，本段主动锚）
+            _head_kf = head_frame_latent \
+                if (i > 0 and seg_first_on[i] and head_frame_latent is not None) else None
             _seg_t.update(cond=0.0, sample=0.0, decode=0.0)
             if replay:
                 video_t, audio_t = checkpoint.load_segment(root, g)
@@ -1484,19 +1568,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     out = MiniMaxH3ImageToVideo.execute(
                         clip=clip, vae=video_vae, prompt=prompt,
                         width=width, height=height, length=seg_len,
-                        first_frame=首帧图片 if i == 0 else None)
+                        first_frame=首帧图片 if (i == 0 and seg_first_on[0]) else None)
                 _seg_t["cond"] += time.perf_counter() - _t
 
                 cond, latent = out[0], out[1]
                 # 独立镜头段：上段桥不注入（guide 屏蔽为 None）；每段尾帧锚定是用户主动
                 # 设定的本段结尾身份锚点，与段间衔接无关，不受断链影响
                 eff_guide = None if seg_unlink[i] else guide
-                # 尾帧图片（FL2VA 剧情终点）：只落在最后一个提示词段的末帧；
-                # 该段不再叠加每段尾帧锚定（同位置唯一锚，剧情终点优先）
-                _is_last_prompt = (i == len(seg_prompts) - 1)
-                _tail_kf = end_frame_latent if (_is_last_prompt and end_frame_latent is not None) \
+                # 尾帧图片（FL2VA 剧情终点/段级尾锚）：勾了尾帧图的段末帧 keyframe
+                # = 尾帧图 latent（同位置唯一锚，优先于每段尾帧锚定）；未勾段回落尾锚
+                _tail_kf = end_frame_latent if (seg_end_on[i] and end_frame_latent is not None) \
                     else tail_anchor_latent
-                if eff_guide is not None or _tail_kf is not None:
+                if eff_guide is not None or _tail_kf is not None or _head_kf is not None:
                     # 实验 E1：强化引导桥——把单桥展开为滑窗/重叠 keyframe 序列。
                     # 全关时 e1_kfs=None，_apply_guide 走现状单桥路径（零影响）。
                     e1_kfs = None
@@ -1524,7 +1607,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             ]
                     cond = cls._apply_guide(
                         cond, eff_guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]),
-                        tail_kf_latent=_tail_kf, e1_windows=e1_kfs, memory_kfs=memory_kfs)
+                        tail_kf_latent=_tail_kf, e1_windows=e1_kfs, memory_kfs=memory_kfs,
+                        head_kf_latent=_head_kf)
                     # 锚定加噪（SkyReels-V2 addnoise_condition 思路）：H3 模型 payload
                     # 原生支持 cond 噪声增强（extra_conds 从 cond dict 任意键取参），
                     # aug=1.0 即不加噪；值越小锚定越「软」，缓解段首刹车/内容重演
@@ -1731,13 +1815,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if use_ckpt:
                 # 二采在段视频落盘前接管：成功/记录沿用则段视频即高清结果（同名覆盖），
                 # 失败才回退基础分辨率保存（fresh 强制重编码，覆盖可能写坏的 mp4）
-                # 尾锚与基础链 _tail_kf 同规则：末段=尾帧图片（剧情终点优先、同位置
-                # 唯一锚不叠加），其余段=每段尾帧锚定——回放段也可能补渲染，就地重算
+                # 尾锚/头锚与基础链同规则：尾帧图段=尾帧图（同位置唯一锚不叠加）、
+                # 其余段=每段尾帧锚定；中段首帧图=头锚——回放段也可能补渲染，就地重算
                 _up_tail_kf = end_frame_latent \
-                    if (i == len(seg_prompts) - 1 and end_frame_latent is not None) \
+                    if (seg_end_on[i] and end_frame_latent is not None) \
                     else tail_anchor_latent
                 hi_ready, hi_tried = _up_hi(g, video_t, audio_t, "prompt", i,
-                                            None if seg_unlink[i] else guide, _up_tail_kf,
+                                            None if seg_unlink[i] else guide, _up_tail_kf, _head_kf,
                                             cur_seed, skip_f, frames.shape[0],
                                             wav, sample_rate)
                 if not hi_ready:
@@ -1765,7 +1849,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seed_txt = cur_seed if cur_seed is not None else "—"
             report.append(f"段{g + 1}/{total}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧({frames.shape[0] / 24:.1f}s)"
                           f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {_seg_t['sample']:.0f}s") + f" | {note}"
-                          + (" · 独立镜头（断链）" if seg_unlink[i] else ""))
+                          + (" · 独立镜头（断链）" if seg_unlink[i] else "")
+                          + (" · 首帧图头锚" if _head_kf is not None else "")
+                          + (" · 尾帧图尾锚" if (seg_end_on[i] and end_frame_latent is not None) else ""))
             report.append(f"⏱ 段{g + 1}：条件 {_seg_t['cond']:.0f}s · 一采 {_seg_t['sample']:.0f}s"
                           f" · 基础解码 {_seg_t['decode']:.0f}s"
                           + (f" · TE缓存 命中{clip.hits}/未中{clip.misses}" if clip.hits or clip.misses else ""))
@@ -1892,7 +1978,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
     @staticmethod
     def _apply_guide(cond, guide, sampled_fc, tail_kf_latent=None, e1_windows=None,
-                     memory_kfs=None):
+                     memory_kfs=None, head_kf_latent=None):
         """把 keyframe 注入 conditioning（官方 minimax_keyframes 协议）。
 
         guide: 首帧引导桥 keyframe（上段尾 latent 切片），None=首段无桥。
@@ -1902,6 +1988,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         e1_windows: 实验 E1 展开后的引导桥 keyframe 列表（滑窗/重叠）；None=现状单桥。
         memory_kfs: 实验 E2 全局记忆锚 keyframe 列表（首段 latent 裁的 reference，
         注入位置由调用方算好）；None=不注入。与 guide/尾锚叠加、互不干扰。
+        head_kf_latent: 段级首帧图引用的头锚 latent，注入段头（resolved_frame_index
+        =0，与段首桥同位叠加）；None=不注入。
         """
         existing = cond[0][1].get("minimax_keyframes", [])
         keyframes = list(existing)
@@ -1910,6 +1998,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 keyframes.extend(e1_windows)
             else:
                 keyframes.append(guide)
+        if head_kf_latent is not None:
+            keyframes.append({"resolved_frame_index": 0, "latent": head_kf_latent})
         if memory_kfs:
             keyframes.extend(memory_kfs)
         if tail_kf_latent is not None:

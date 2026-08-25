@@ -26,6 +26,7 @@
 - 全链记录齐且尺寸一致 → 成片改为流式拼接高清分段（单份产物）
 """
 
+import gc
 import os
 import time
 
@@ -761,8 +762,9 @@ def preflight(模型, cfg, net, video_t, audio_t, report=None):
     if free > 0 and free < need:
         cap = _calc_scale_cap(h, w)
         lines.append(f"✗ 显存不足：放大后重采样至少还需 {need:.1f}GB，当前可回收集仅 {free:.1f}GB"
-                     f"——请把放大倍率降到 ≤{cap:g}×、把精化步数调低/起始σ调小，或降低基础"
-                     "分辨率/增大显存。本报告在分配任何高清内存前生成。")
+                     f"——请把放大倍率降到 ≤{cap:g}×、缩短该段帧数或降低基础分辨率"
+                     "（精化步数/起始σ不影响峰值显存），或增大显存。"
+                     "本报告在分配任何高清内存前生成。")
         fail.append("显存不足")
 
     if fail:
@@ -916,7 +918,8 @@ def _stg_model(model, sigma_start, scale, block, lo=0.15, hi=0.85):
 
 def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
-                  pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
+                  pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent,
+                  cur_seed,
                   采样器, 调度器, report=None, _timing=None):
     """基础段 AV latent -> 高清视频 latent（放大 + 低强度重采样）。
 
@@ -925,6 +928,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     guide: 本段生成时用的上段尾帧桥（None=首段/断链/插入段）——视频 latent
     神经放大后注入重采样 cond（CondSync：锚住段首与上段高清尾的连续性）。
     tail_kf_latent: 尾帧身份锚定的基础 latent（与主循环同语义，同步放大注入）。
+    head_kf_latent: 段级首帧图引用的头锚基础 latent（中段勾首帧图时，同步放大注入）。
     cfg.mix>0 时精化输出做频域细节混合（低频锚回纯放大 latent，见
     freq_mix_latents）；cfg.sharpen>0 时再做 latent 域锐化（sharpen_latents）；
     细节增益在混合/锐化后的交付 latent 上度量。精化链支持多轮递降 cascade
@@ -1001,10 +1005,12 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             clip=clip, vae=video_vae, prompt="", width=tw, height=th, length=length)
     cond, latent = out[0], out[1]
 
-    # 桥锚 CondSync：上段尾帧桥/尾帧锚的 latent 同步神经放大后注入重采样 cond——
-    # 锚住段首与上段高清尾的连续性（只依赖上段基础 latent + scale，可独立重做）
+    # 桥锚 CondSync：上段尾帧桥/尾帧锚/首帧图头锚的 latent 同步神经放大后注入
+    # 重采样 cond——锚住段首与上段高清尾的连续性（只依赖上段基础 latent + scale，
+    # 可独立重做）
     bridged = False
-    if kind == "prompt" and (guide is not None or tail_kf_latent is not None):
+    if kind == "prompt" and (guide is not None or tail_kf_latent is not None
+                             or head_kf_latent is not None):
         up_guide = None
         if guide is not None:
             up_guide = dict(guide)
@@ -1015,16 +1021,24 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         if tail_kf_latent is not None:
             up_tail = upscale_video(tail_kf_latent.to(dev, torch.float32),
                                     net, cfg["scale"], cfg["arch"])
+        up_head = None
+        if head_kf_latent is not None:
+            up_head = upscale_video(head_kf_latent.to(dev, torch.float32),
+                                    net, cfg["scale"], cfg["arch"])
         cond = plugin_nodes.H3SeamlessChainSampler._apply_guide(
-            cond, up_guide, length, tail_kf_latent=up_tail)
+            cond, up_guide, length, tail_kf_latent=up_tail, head_kf_latent=up_head)
 
     # 放大网络工作完毕，卸回 CPU 释放显存给高清重采样
     net.cpu()
     # 抢占式显存腾挪（README 既定设计，be43db8 重构时随三级降级一起被误删，
     # 2026-08-25 1.4× 精化实测 OOM 后恢复）：cond 已建好，TE/videoVAE/audioVAE
     # 精化阶段均用不到——全卸到 CPU（含 UNET），common_ksampler 原生机制只回载
-    # UNET；否则 32GB 卡上 TE 驻留 + UNET + 高清激活三头挤兑，精化必 OOM
+    # UNET；否则 32GB 卡上 TE 驻留 + UNET + 高清激活三头挤兑，精化必 OOM。
+    # gc.collect：跨段累积的 Python 侧 GPU 张量（上段精化输出/条件中间量/
+    # STG 克隆）只有引用回收后显存块才真正归还——多段链后段比首段更易 OOM 的
+    # 主因即在此（引用挂着的 CUDA 块 empty_cache 也收不回）
     comfy.model_management.unload_all_models()
+    gc.collect()
     torch.cuda.empty_cache()
     _tmark("cond", _t)
     # CachedClipProxy 在位时标注本段高清条件构建的 TE 是否命中缓存
@@ -1080,9 +1094,15 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     ks_sampler = ks_sampler or 采样器
     ks_scheduler = ks_scheduler or 调度器
 
-    def _refine_once(sigma_start, cur_latent, cur_seed):
+    def _refine_once(sigma_start, cur_latent, cur_seed, round_desc=""):
         """单轮尾段精化：STG / time-bias / shift 各开关在此拼装（每轮 σ₀ 不同，
         time-bias 窗口与 STG 窗口跟着本轮 σ₀ 走）。OOM → UpscaleAbortError。"""
+        # 轮间清理（2026-08-25 实测：passes≥2 时首轮 σ₀ 成功、次轮 σ₀·decay
+        # OOM——单轮峰值与 σ 无关，差的正是轮间账）：上一轮采样结束只丢函数
+        # 局部引用，分配器缓存块与不可达对象全部滞留显存；每轮开跑前回收
+        # 引用 + 归还空闲缓存块，次轮起点与首轮对齐。round_desc 进报错定位轮次
+        gc.collect()
+        torch.cuda.empty_cache()
         ks_steps, ks_denoise = tail_refine_args(sigma_start, cfg["steps"])
         restore_tb = time_bias_guard(模型.model.diffusion_model, ks_denoise, tb) \
             if tb > 0.0 else None
@@ -1105,9 +1125,12 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             except RuntimeError as e:
                 if not _is_oom(e):
                     raise
-                # 一级自救（fee12e1 机制回归）：全卸驻留模型 + 清缓存后【原参】重试
-                # 一次——参数零改动、产物零降级；仍 OOM 才按既定语义硬停整链
+                # 一级自救（fee12e1 机制回归）：全卸驻留模型 + 回收 Python 残留引用 +
+                # 清缓存后【原参】重试一次——参数零改动、产物零降级；仍 OOM 才按
+                # 既定语义硬停整链。gc.collect 先于 empty_cache：引用不回收，
+                # CUDA 块归不了还
                 comfy.model_management.unload_all_models()
+                gc.collect()
                 torch.cuda.empty_cache()
                 try:
                     return _ksample()
@@ -1116,10 +1139,12 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                         raise
                     e = e2
                 msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样超出当前可回收显存 "
-                       "{1:g}GB，已自动卸载驻留模型原参重试仍失败）："
-                       "请降低放大倍率、把精化步数调低/起始σ调小，或增大显存。"
-                       "当前精化 {2} 步 @ σ≈{3:g}。本段尚未落盘二采产物。".format(
-                           cfg["scale"], _vram_gb(), ks_steps, ks_denoise))
+                       "{1:g}GB，已自动卸载驻留模型并回收残留后原参重试仍失败）："
+                       "峰值显存由画布×帧数决定——请降低放大倍率或缩短该段帧数"
+                       "（精化步数/起始σ只影响耗时、不影响峰值），或增大显存。"
+                       "当前精化 {2} 步 @ σ≈{3:g}{4}。本段尚未落盘二采产物。".format(
+                           cfg["scale"], _vram_gb(), ks_steps, ks_denoise,
+                           round_desc))
                 if report is not None:
                     report.append(msg)
                 raise UpscaleAbortError(msg) from e
@@ -1148,7 +1173,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     try:
         cur = latent
         for k, sk in enumerate(sigmas):
-            cur = _refine_once(sk, cur, (seed + k) % 0xffffffffffffffff)
+            cur = _refine_once(sk, cur, (seed + k) % 0xffffffffffffffff,
+                               f"（第{k + 1}轮/共{len(sigmas)}轮）")
 
         up_out_v, hf_gain = _deliver(cur)
         cur = None
@@ -1160,7 +1186,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             cur2 = latent
             for k, sk in enumerate(sigmas_r):
                 cur2 = _refine_once(sk, cur2,
-                                    (seed + len(sigmas) + k) % 0xffffffffffffffff)
+                                    (seed + len(sigmas) + k) % 0xffffffffffffffff,
+                                    f"（增益重试链第{k + 1}轮/共{len(sigmas_r)}轮）")
             v2, g2 = _deliver(cur2)
             cur2 = None
             if g2 > hf_gain:
@@ -1184,7 +1211,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
 def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                    root, g, video_t, audio_t, kind, idx,
                    seg_prompts, seg_label_orders, pool_tensors, refs,
-                   first_frame, guide, tail_kf_latent, cur_seed,
+                   first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
                    skip_f, vis_len,
                    wav, sample_rate, bh, report, 采样器, 调度器):
     """基础段 AV latent -> 高清分段直接落盘（放大→重采样→解码→裁剪）。
@@ -1208,7 +1235,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
-        pool_tensors, refs, first_frame, guide, tail_kf_latent, cur_seed,
+        pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
         采样器, 调度器, report=report, _timing=_timing)
     # 解码高清 latent -> 高清帧（官方 VAE.decode 自带 OOM→tiled 降级，无需干预）
     _t = time.perf_counter()

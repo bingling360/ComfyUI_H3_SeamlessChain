@@ -482,7 +482,7 @@ function defaultUpscale() {
 }
 
 function defaultSegment() {
-    return { scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false };
+    return { scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, frame_refs: null };
 }
 
 function getDs(node) {
@@ -530,6 +530,11 @@ function getDs(node) {
                 seconds: (isFinite(sec) && sec > 0) ? Math.min(15, Math.max(0.5, sec)) : null,
                 refs: Array.isArray(s?.refs) ? s.refs.map(String).filter((l) => validLabels.has(l)) : [],
                 unlink: !!s?.unlink,
+                /* 段级首尾帧图引用：null=未设置（默认：首段参考首帧图、末段参考尾帧图）；
+                 * 数组=显式勾选（可含 "首帧图"/"尾帧图"，空数组=两图都不参考） */
+                frame_refs: Array.isArray(s?.frame_refs)
+                    ? s.frame_refs.map(String).filter((v) => v === "首帧图" || v === "尾帧图")
+                    : null,
             };
         });
         /* 插入视频段：{pos: 1-based 链位（不含序章）, file: input 目录文件名}；
@@ -757,6 +762,26 @@ function toggleSegmentRef(node, idx, label) {
         }
         seg.refs.push(label);
     }
+    setDs(node, ds);
+}
+
+/** 勾选/取消本段的首尾帧图引用（仅首帧模式有首帧/尾帧图）。
+ *  首次点选把缺省值物化为显式数组（null → 数组），之后再切换；改动进该段
+ *  哈希（与默认不同时）——保存后重跑自动从该段起重做。 */
+function toggleSegmentFrameRef(node, idx, name) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= (ds.segments || []).length) return;
+    if (name !== "首帧图" && name !== "尾帧图") return;
+    const seg = ds.segments[idx];
+    if (!Array.isArray(seg.frame_refs)) {
+        const n = (ds.prompts || ds.segments || []).length;
+        seg.frame_refs = [];
+        if (ds.first_frame && idx === 0) seg.frame_refs.push("首帧图");
+        if (ds.end_frame && idx === n - 1) seg.frame_refs.push("尾帧图");
+    }
+    const pos = seg.frame_refs.indexOf(name);
+    if (pos >= 0) seg.frame_refs.splice(pos, 1);
+    else seg.frame_refs.push(name);
     setDs(node, ds);
 }
 
@@ -2204,7 +2229,10 @@ function cardsSignature(data) {
         plan: (plan || []).map((it) => it.kind === "insert" ? ["i", it.pos, it.file] : ["p", it.text]),
         segs: (ds?.segments || []).map((s) => [s.scene_prompt ?? "", s.character_prompt ?? "",
                                                s.seconds ?? 0, (s.refs || []).join(","),
-                                               !!s.unlink]),
+                                               !!s.unlink,
+                                               Array.isArray(s.frame_refs) ? s.frame_refs.join(",") : null]),
+        /* 首尾帧图文件名也要进签名：上传/换图后段卡片的首尾帧 chips 行才会重建 */
+        frames: [ds?.first_frame ?? "", ds?.end_frame ?? ""],
         labels: (ds?.ref_assets || []).map((a) => a.label),
         mode: ds?.mode ?? "",
         dur: String(getWidgetValue(data.node, W_DUR) ?? ""),
@@ -2704,6 +2732,44 @@ function buildCards(data) {
                     scheduleRefresh(150);
                 };
                 row.append(tpl);
+                body.append(row);
+            }
+
+            /* 首尾帧图段级引用（仅首帧模式）：勾选本段是否参考首帧/尾帧图。
+             * 未设置=默认（首段 i2v 首帧、末段尾帧终点锚，与旧档一致）；
+             * 中段勾首帧图=头部身份锚（keyframe 注入抑制长链漂移）；
+             * 任意段勾尾帧图=该段末帧锚（优先于每段尾帧锚定） */
+            if (node && it.idx !== undefined && data.ds.mode === "首帧视频"
+                    && (data.ds.first_frame || data.ds.end_frame)) {
+                const seg = data.ds.segments[it.idx] || defaultSegment();
+                const n = (data.ds.prompts || data.ds.segments || []).length;
+                const def = [];
+                if (data.ds.first_frame && it.idx === 0) def.push("首帧图");
+                if (data.ds.end_frame && it.idx === n - 1) def.push("尾帧图");
+                const cur = Array.isArray(seg.frame_refs) ? seg.frame_refs : def;
+                const row = el("div", "h3d-refrow");
+                row.append(el("label", "", "首尾帧图"));
+                [["首帧图", data.ds.first_frame], ["尾帧图", data.ds.end_frame]].forEach(([name, file]) => {
+                    if (!file) return;
+                    const on = cur.includes(name);
+                    const chip = el("button", "h3d-refchip" + (on ? " on" : ""));
+                    chip.type = "button";
+                    chip.title = name === "首帧图"
+                        ? "勾选后本段参考首帧图片：首段=i2v 起手帧；中段=头部身份锚"
+                            + "（keyframe 注入，抑制长链漂移）。不勾=本段不参考首帧图"
+                        : "勾选后本段末帧锚定尾帧图片（同位置唯一锚，优先于每段尾帧锚定）；"
+                            + "不勾=回落到每段尾帧锚定（若设）";
+                    const im = document.createElement("img");
+                    im.loading = "lazy";
+                    im.src = inputViewUrl(file);
+                    im.onerror = () => im.remove();
+                    chip.append(im, document.createTextNode(name));
+                    chip.onclick = () => { toggleSegmentFrameRef(node, it.idx, name); scheduleRefresh(80); };
+                    row.append(chip);
+                });
+                if (!Array.isArray(seg.frame_refs)) {
+                    row.insertAdjacentHTML("beforeend", '<span class="h3d-secs-hint">未设置=默认</span>');
+                }
                 body.append(row);
             }
 
