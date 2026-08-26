@@ -46,7 +46,7 @@ const W_DS = "导演台状态";
 const W_AR = "宽高比";
 const W_MP = "百万像素";
 /* 版本标记：浏览器控制台过滤 [h3-director] 可确认加载的是新 JS 还是缓存旧版 */
-const H3D_VER = "20260824+upscale-antiblur";
+const H3D_VER = "20260826+portrait-thumb";
 const W_DUR = "每段时长";
 const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
@@ -1883,9 +1883,18 @@ function injectStyles() {
     .h3d-merge-sum{flex:1;min-width:200px;color:#e9c07a;font-size:11.5px;line-height:1.7;word-break:break-all}
     .h3d-merge-sum b{color:#f5d9a0}
     .h3d-merge-sum small{display:block;color:var(--h3d-muted);font:10px ui-monospace,Consolas;word-break:break-all}
-    .h3d-thumb{width:150px;aspect-ratio:16/9;border-radius:6px;overflow:hidden;background:#10151c;display:grid;place-items:center;color:#636e7b;font:700 11px ui-monospace,Consolas}
-    .h3d-thumb video,.h3d-thumb img{width:100%;height:100%;object-fit:cover}
+    .h3d-thumb{position:relative;width:150px;aspect-ratio:16/9;border-radius:6px;overflow:hidden;background:#10151c;display:grid;place-items:center;color:#636e7b;font:700 11px ui-monospace,Consolas}
+    /* 视频/图片绝对定位填满盒子：若走普通流，grid 自动行高会把竖屏视频的 intrinsic 高度
+       （如 9:16 → 150×266.7）当元素高度，底部控制栏被 overflow:hidden 整条裁掉——
+       16:9 恰好 intrinsic 高度=盒高才侥幸正常。绝对定位让元素恒等于盒子尺寸，控制栏任何画幅都在。 */
+    .h3d-thumb video,.h3d-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
     .h3d-thumb video.h3d-segvideo{object-fit:contain;background:#000}
+    /* 竖屏段：缩略盒换竖版（高 150、宽自适应），预览面积约 2.6 倍且 contain 不再只剩细条 */
+    .h3d-thumb.portrait{aspect-ratio:9/16;width:auto;height:150px;justify-self:center}
+    /* 缩略图悬浮操作：全屏 / 下载 —— 不依赖原生控制栏（元素窄到 84px 时浏览器会隐藏 ⋮ 菜单） */
+    .h3d-thumb-acts{position:absolute;top:4px;right:4px;display:flex;gap:4px;z-index:2}
+    .h3d-tact{width:21px;height:21px;display:grid;place-items:center;border-radius:5px;border:1px solid #444c56cc;background:#1c2128dd;color:#cdd9e1;font-size:11.5px;line-height:1;cursor:pointer;text-decoration:none}
+    .h3d-tact:hover{filter:brightness(1.35);border-color:var(--h3d-cyan)}
     .h3d-cbody{min-width:0;display:flex;flex-direction:column;gap:5px}
     .h3d-ctitle{display:flex;gap:7px;align-items:center;flex-wrap:wrap;font-weight:700}
     .h3d-cmeta{color:var(--h3d-muted);font:11px ui-monospace,Consolas;word-break:break-all}
@@ -2550,6 +2559,31 @@ function buildCards(data) {
             ?? `<div>${isDone ? "…" : isInsert ? "插入段" : "待生成"}</div>`;
         const img = thumb.querySelector("img");
         if (img) img.onerror = () => { img.replaceWith(el("div", "", "⚠ 加载失败")); };
+
+        /* 缩略图视频：竖屏段换竖版盒；任何画幅都提供悬浮「全屏 / 下载」，
+           不再依赖原生控制栏右下角 ⋮ 菜单（小尺寸元素下浏览器会隐藏它） */
+        const segVid = thumb.querySelector("video");
+        if (segVid) {
+            const markPortrait = () => {
+                if (segVid.videoHeight > segVid.videoWidth) thumb.classList.add("portrait");
+            };
+            if (segVid.readyState >= 1) markPortrait();
+            else segVid.addEventListener("loadedmetadata", markPortrait, { once: true });
+            const vidUrl = segVid.getAttribute("src") || "";
+            const acts = el("div", "h3d-thumb-acts");
+            const fsBtn = el("button", "h3d-tact", "⛶");
+            fsBtn.title = "全屏播放本段";
+            fsBtn.onclick = () => {
+                const p = segVid.requestFullscreen ? segVid.requestFullscreen() : null;
+                if (p && p.catch) p.catch(() => { window.open(vidUrl, "_blank"); });
+            };
+            const dl = el("a", "h3d-tact", "⬇");
+            dl.href = vidUrl;
+            dl.download = (mf?.videos || [])[idx] || "segment.mp4";
+            dl.title = "下载本段视频";
+            acts.append(fsBtn, dl);
+            thumb.append(acts);
+        }
 
         const body = el("div", "h3d-cbody");
         const segData = (it.idx !== undefined && data.ds.segments)
