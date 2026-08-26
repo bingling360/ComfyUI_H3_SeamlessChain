@@ -667,7 +667,7 @@ def _diff_model(model):
 
 
 def _vram_gb():
-    """当前可回收集显存（GB，comfy 语义；失败回退 torch，再失败返回 0）。"""
+    """当前空闲显存（GB，comfy 语义；失败回退 torch，再失败返回 0）。"""
     try:
         import comfy.model_management as mm
         return mm.get_free_memory() / (1024 ** 3)
@@ -702,6 +702,40 @@ _ACTIVATION_FACTOR = 4.0   # 采样峰值激活 ≈ 初始高清 latent 体积 �
 _SAFE_MARGIN_GB = 1.0      # 显存账目安全余量（避免贴着上沿静默崩）
 
 
+def _dynamic_vram_active():
+    """comfy-aimdo DynamicVRAM 是否在管权重。该机制把显存当权重缓存故意填满、
+    按需换页（空闲显存小是常态而非异常），权重占用是弹性的——显存账目对它
+    只作参考不作硬约束。"""
+    try:
+        import sys
+        if any("aimdo" in k for k in sys.modules):
+            return True
+        import importlib.util
+        return importlib.util.find_spec("aimdo") is not None
+    except Exception:
+        return False
+
+
+def _reclaimable_gb(unet_model):
+    """重采样前 unload_all_models() 必然释放的其他模型权重（TE/videoVAE/audioVAE，GB）。
+    预检在 cond 构建之前测量——此刻它们仍驻留显存；真正采样发生在全卸之后、
+    只回载 UNET，账目须把这部分确定性腾挪加回。DynamicVRAM 分页下 model_size
+    是总量上界（实际驻留更少），只会放宽预检；真不够时由运行时 OOM 降级链兜底。"""
+    try:
+        import comfy.model_management as mm
+        target = id(unet_model)
+        total = 0
+        for lm in mm.current_loaded_models():
+            mp = getattr(lm, "model", None)
+            size_fn = getattr(mp, "model_size", None) if mp is not None else None
+            if size_fn is None or id(mp) == target:
+                continue
+            total += size_fn()
+        return total / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
 def _calc_scale_cap(h_latent, w_latent):
     """画布不超 _CANVAS_ABORT_MP 的最大放大倍率（向下取整到 0.5）。"""
     cur = (w_latent * 16) * (h_latent * 16)
@@ -711,14 +745,24 @@ def _calc_scale_cap(h_latent, w_latent):
     return max(1.0, int(cap * 2) / 2.0)
 
 
+def _vram_scale_cap(latent_gb, scale, free_gb):
+    """显存允许的最大放大倍率（latent 体积 ∝ 倍率²，向下取整到 0.5）。"""
+    base = latent_gb / (scale * scale)
+    if base <= 0 or free_gb <= _SAFE_MARGIN_GB:
+        return 1.0
+    cap = ((free_gb - _SAFE_MARGIN_GB) / (_ACTIVATION_FACTOR * base)) ** 0.5
+    return max(1.0, int(cap * 2) / 2.0)
+
+
 def preflight(模型, cfg, net, video_t, audio_t, report=None):
     """二采前置健康预检——在【放大 / 分配高清内存之前】跑，把问题一次暴露：
 
     - 放大模型就绪；
     - 二采画布（target_hw ×16）超上限即停并提示可用的最大倍率；
       >2.5MP 提示 fp16 高频溢出花屏风险（不硬停，不挡正当高清需求）；
-    - 显存账目 = 当前可回收集 对比 高清重采样新增峰值（不含已在显存的 UNET），
-      连最小新增需求都盖不住即停。
+    - 显存账目 = 重采样时刻可用（当前空闲 + 重采样前必卸载的 TE/VAE 权重）
+      对比 高清重采样新增峰值；非 DynamicVRAM 环境连最小需求都盖不住才停，
+      DynamicVRAM（权重弹性换页）环境账面紧张只 ⚠ 不硬停。
 
     每行 "✓/⚠/✗ …"，任一 ✗ -> 完整报告 append 进 report 并抛 UpscaleAbortError，
     终止整链。正常返回报告行（供调用方登记，非致命 ⚠ 已含）。
@@ -751,21 +795,36 @@ def preflight(模型, cfg, net, video_t, audio_t, report=None):
         lines.append(f"⚠ 高清画布 {mp:.1f}MP 超 2.5MP 安全解码区，注意 fp16 高频溢出"
                      f"（出花屏/色块就降倍率或提采样精度）")
 
-    # 3) 显存账目：当前可回收集 vs 高清重采样新增峰值（UNET 已在显存，不计双重）
+    # 3) 显存账目：对比【重采样时刻】可用 vs 高清新增峰值。
+    # 预检时 TE/VAE/UNET 常全驻留（DynamicVRAM 更会把显存当权重缓存填满，
+    # 空闲趋近 0 是常态），但 render_latent 在采样前 unload_all_models()
+    # 全卸、只回载 UNET——可用 = 当前空闲 + 其他模型权重（确定性腾挪）。
+    # DynamicVRAM 下权重本身可按需换页（弹性），账面紧张只 ⚠ 不硬停，
+    # 真 OOM 由运行时降级链（自动卸载重试/LOW_VRAM 分块）兜底。
     free = _vram_gb()
+    reclaim = _reclaimable_gb(模型)
+    free_eff = free + reclaim
+    dyn = _dynamic_vram_active()
     unet_gb = _unet_size_gb(模型)
     frames = grid.latent_t_to_frames(video_t.shape[2])
     latent_gb = (int(video_t.shape[1]) * frames * h2 * w2 * 4.0) / (1024 ** 3)
     need = latent_gb * _ACTIVATION_FACTOR + _SAFE_MARGIN_GB
-    lines.append(f"… 显存账目：UNET≈{unet_gb:.1f}GB（已在显存）· 高清重采样需新增≈"
-                 f"{need:.1f}GB（含 {_SAFE_MARGIN_GB:.1f}GB 余量）· 当前可回收集 {free:.1f}GB")
-    if free > 0 and free < need:
-        cap = _calc_scale_cap(h, w)
-        lines.append(f"✗ 显存不足：放大后重采样至少还需 {need:.1f}GB，当前可回收集仅 {free:.1f}GB"
-                     f"——请把放大倍率降到 ≤{cap:g}×、缩短该段帧数或降低基础分辨率"
-                     "（精化步数/起始σ不影响峰值显存），或增大显存。"
-                     "本报告在分配任何高清内存前生成。")
-        fail.append("显存不足")
+    lines.append(f"… 显存账目：UNET 权重≈{unet_gb:.1f}GB · 高清重采样需新增≈"
+                 f"{need:.1f}GB（含 {_SAFE_MARGIN_GB:.1f}GB 余量）· 可用≈{free_eff:.1f}GB"
+                 f"（空闲 {free:.1f} + 卸载腾挪 {reclaim:.1f}）"
+                 + ("· DynamicVRAM 权重可换页" if dyn else ""))
+    if free_eff > 0 and free_eff < need:
+        cap = _vram_scale_cap(latent_gb, scale, free_eff)
+        if dyn:
+            lines.append(f"⚠ 显存账面紧张（需 {need:.1f}GB / 可用≈{free_eff:.1f}GB）"
+                         "——DynamicVRAM 会按需换出权重页，本段继续执行；"
+                         "若真 OOM 由运行时降级（自动卸载重试/LOW_VRAM 分块）兜底。")
+        else:
+            lines.append(f"✗ 显存不足：放大后重采样至少还需 {need:.1f}GB，"
+                         f"可用仅≈{free_eff:.1f}GB——请把放大倍率降到 ≤{cap:g}×、"
+                         "缩短该段帧数或降低基础分辨率（精化步数/起始σ不影响峰值显存），"
+                         "或增大显存。本报告在分配任何高清内存前生成。")
+            fail.append("显存不足")
 
     if fail:
         msg = "二采健康预检未通过（已停止运行）：\n" + "\n".join(lines)
