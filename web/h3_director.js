@@ -154,6 +154,9 @@ let lastDir = "";            // 最近一次数据刷新解析出的当前项目
 /* 合并模式（纯内存勾选态，不落 ds / 不触发重做）：勾选已完成段（含序章/插入段，
  * 按链顺序）+ 可追加上传外部素材 -> 拼接出新 merged_*.mp4，不动链与存档 */
 const mergeSel = { on: false, segs: [], files: [] };
+/* 拖拽调序进行中（{idx: 提示词数组下标, fromP: 当前 plan 位}）：
+ * 重建锁定 + drop 目标计算用；dragend 后置 null */
+let dragSeg = null;
 
 /* ---------- 小工具 ---------- */
 
@@ -463,7 +466,7 @@ function fixInvalidArWidget(node) {
 /* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
 
 function defaultDs() {
-    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", end_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], upscale: defaultUpscale(), experiments: defaultExperiments() };
+    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", end_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], redo_segs: [], upscale: defaultUpscale(), experiments: defaultExperiments() };
 }
 
 function defaultUpscale() {
@@ -482,7 +485,7 @@ function defaultUpscale() {
 }
 
 function defaultSegment() {
-    return { scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, frame_refs: null };
+    return { scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, disabled: false, frame_refs: null };
 }
 
 function getDs(node) {
@@ -530,6 +533,7 @@ function getDs(node) {
                 seconds: (isFinite(sec) && sec > 0) ? Math.min(15, Math.max(0.5, sec)) : null,
                 refs: Array.isArray(s?.refs) ? s.refs.map(String).filter((l) => validLabels.has(l)) : [],
                 unlink: !!s?.unlink,
+                disabled: !!s?.disabled,
                 /* 段级首尾帧图引用：null=未设置（默认：首段参考首帧图、末段参考尾帧图）；
                  * 数组=显式勾选（可含 "首帧图"/"尾帧图"，空数组=两图都不参考） */
                 frame_refs: Array.isArray(s?.frame_refs)
@@ -603,6 +607,11 @@ function getDs(node) {
             ref_assets: refAssets,
             segments,
             inserts,
+            /* 重摇标记（选择性重做）：{slot: 0-based 全局槽位（含序章），mode: 锚定模式}。
+               后端 _parse_redo_segs 同口径校验；旧 JSON 无此键 = 空（普通续跑） */
+            redo_segs: (Array.isArray(raw.redo_segs) ? raw.redo_segs : [])
+                .filter((x) => x && typeof x === "object" && Number.isInteger(Number(x.slot)))
+                .map((x) => ({ slot: Number(x.slot), mode: REDO_MODES.some((r) => r[0] === x.mode) ? x.mode : "双锚" })),
             upscale,
             experiments: normalizeExperiments(raw.experiments),
         };
@@ -708,6 +717,7 @@ function clearPrompts(node) {
     if (ds.segments) ds.segments = ds.segments.map((s) => ({
         ...defaultSegment(), seconds: s?.seconds ?? null,
         refs: Array.isArray(s?.refs) ? s.refs : [], unlink: !!s?.unlink,
+        disabled: !!s?.disabled,
     }));
     setDs(node, ds);
 }
@@ -1037,6 +1047,14 @@ function applyMasterPrompt(node, text) {
 /* ---- 潜空间放大二采：状态读写（ds.upscale，主循环内逐段渲染：采样定稿后、段落盘前） ---- */
 
 const UP_MODES = ["关闭", "跟随生成", "手动选择"];
+
+/* 重摇锚定模式（与后端 nodes.py _REDO_MODES 同表）：决定重摇本段时模型看向哪些锚点 */
+const REDO_MODES = [
+    ["双锚", "首锚=上段尾帧桥 · 尾锚=下段首帧：两端接缝都平滑，无缝替换（推荐）"],
+    ["仅锚上段", "开头接续上段结尾，结尾自由发挥：接下来还打算重摇下一段时用"],
+    ["仅锚下段", "开头重新起手，结尾接续下段首帧"],
+    ["无锚", "完全自由发挥：两端硬切（独立镜头式重摇）"],
+];
 const UP_PRECISIONS = ["fp32", "fp16", "bf16"];
 const UP_ENCODES = ["标准", "高清", "极致"];
 
@@ -1083,30 +1101,66 @@ function upTargetCanvas(node, scale) {
     return `${even(w / 16 * scale) * 16}×${even(h / 16 * scale) * 16}`;
 }
 
-/** 清掉某段的二采记录与产物（POST /h3chain/upscale_reset） */
-async function doUpscaleReset(btn, dir, segNo) {
+/** 单段重新二采：清该段记录 → 临时切「手动选择+只勾本段」提交队列 → 立即还原设置。
+ *  后端走既有路径（手动选择模式 + 全链回放）：本段 latent 存档载入 → 神经放大重采样
+ *  → 覆盖 seg_NNN.mp4，全程不碰视频编解码；其他段回放 fresh=False 直接沿用已有 mp4，
+ *  不会被基础分辨率覆盖（含插入视频段——其 latent 在插入时已一次性 VAE 编码存档）。
+ *  二采渲染确定性：参数未变时重渲=同输出；价值在参数已变/记录缺失/补做时立即执行。 */
+async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出"); return; }
+    const ds = getDs(node);
+    if (!ds.upscale?.model) {
+        alert("请先在右栏「二采面板」选择放大模型，再对本段执行二采。");
+        return;
+    }
+    if (done < total
+        && !confirm(`链未完成（${done}/${total} 段）：本次运行会先继续生成剩余段落，`
+            + `再对段 ${dispNo} 执行二采（本次新生成的段按当前模式处理）。\n继续？`)) return;
     const old = btn.textContent;
     btn.disabled = true;
-    btn.textContent = "重置中…";
+    btn.textContent = "提交中…";
     try {
+        /* 1. 清该段二采记录（幂等，无记录无害）——保证强制重做而非沿用 */
         const r = await api.fetchApi("/h3chain/upscale_reset", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ dir, seg: segNo }),
         });
         const j = await r.json().catch(() => ({}));
-        if (r.ok && j.ok) {
-            setLed("done", `段${segNo} 二采记录已清除`);
-            scheduleRefresh(300);
+        if (!r.ok || !j.ok) {
+            if (r.status === 404 || r.status === 405) {
+                setApiError(`二采接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`);
+            } else {
+                alert(`重新二采失败：${j.error || `HTTP ${r.status}`}`);
+            }
             return;
         }
-        if (r.status === 404 || r.status === 405) {
-            setApiError(`二采接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`);
-        } else {
-            alert(`重置失败：${j.error || `HTTP ${r.status}`}`);
+        /* 2. 临时切手动选择+只勾本段提交（原模式"关闭"时 parse_state 返回 None 不执行）；
+              提交后立即还原——队列快照已在服务端，用户界面不残留临时值 */
+        const prevMode = ds.upscale.mode;
+        const prevInc = [...(ds.upscale.include || [])];
+        const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
+        setWidgetValue(node, W_REROLL, 0);
+        ds.upscale.mode = "手动选择";
+        ds.upscale.include = [segNo - 1];
+        setDs(node, ds);
+        syncModeWidget(node, ds.mode);
+        setLed("running", `段 ${dispNo} 重新二采已提交`);
+        try {
+            await app.queuePrompt();
+        } catch (e) {
+            console.warn("[h3-director] queue failed:", e);
         }
+        const ds2 = getDs(node);
+        ds2.upscale.mode = prevMode;
+        ds2.upscale.include = prevInc;
+        setDs(node, ds2);
+        setWidgetValue(node, W_REROLL, prevReroll);
+        scheduleRefresh();
     } catch (e) {
-        alert("重置请求失败：" + e);
+        alert("重新二采请求失败：" + e);
     } finally {
         btn.disabled = false;
         btn.textContent = old;
@@ -1374,6 +1428,175 @@ function planFromDs(node) {
     return { plan, drafts, ds };
 }
 
+/** 拖拽调序纯函数：把提示词段 dragIdx 移到「插入线」处，返回新 prompts 序
+ *  （null = 非法或原位不动）。ins = 线在当前 plan 的位置（0..plan.length）。
+ *  规则：新序位 k = 线上方其余提示词段数（其余段保持相对序，仅拖拽段换位）。
+ *  插入段 pos 固定不动——线落在插入段与提示词段之间且线上的提示词不足时
+ *  该位置不可达（返回 null/无操作），此时插到链尾等价于跨插入段下移。 */
+function reorderChain(prompts, plan, dragIdx, ins) {
+    if (!Array.isArray(prompts) || !Array.isArray(plan)) return null;
+    if (!Number.isInteger(dragIdx) || dragIdx < 0 || dragIdx >= prompts.length) return null;
+    if (!Number.isInteger(ins) || ins < 0 || ins > plan.length) return null;
+    if (!plan.some((it) => it?.kind === "prompt" && it.idx === dragIdx)) return null;
+    let k = 0;
+    for (let i = 0; i < ins; i++) {
+        const it = plan[i];
+        if (it?.kind === "prompt" && it.idx !== dragIdx) k += 1;
+    }
+    if (k === dragIdx) return null;                    // 原位（线在自身上下沿）
+    const without = prompts.filter((_x, i) => i !== dragIdx);
+    const out = without.slice(0, k);
+    out.push(prompts[dragIdx]);
+    out.push(...without.slice(k));
+    return out;
+}
+
+/** 提交拖拽调序：prompts/segments 按同一置换搬移（段级属性随段走）。
+ *  链序变化由哈希机制自动级联重做（首个变化段起截断重生成，接缝重新衔接）。
+ *  拖动范围内的段槽位整体错位一位——清掉该范围内的重摇标记与二采勾选
+ *  （范围外的段槽位不变，标记仍有效；manifest 运行队列随截断自动清空）。 */
+function applyReorder(node, data, dragIdx, ins) {
+    const ds = getDs(node);
+    const perm = reorderChain((ds.prompts || []).map((_x, i) => i), data.plan, dragIdx, ins);
+    if (!perm) return;
+    const oldPrompts = [...(ds.prompts || [])];
+    const oldSegs = [...(ds.segments || [])];
+    ds.prompts = perm.map((i) => oldPrompts[i]);
+    ds.segments = perm.map((i) => oldSegs[i] || defaultSegment());
+    /* 拖动范围 = 拖拽段新旧 plan 位之间（新位 = 现 rank-k 提示词段的位置） */
+    const k = perm.indexOf(dragIdx);
+    const posOf = (rank) => {
+        let c = -1;
+        for (let i = 0; i < data.plan.length; i++) {
+            if (data.plan[i]?.kind === "prompt") {
+                c += 1;
+                if (c === rank) return i;
+            }
+        }
+        return data.plan.length;
+    };
+    const lo = Math.min(posOf(dragIdx), posOf(k));
+    const hi = Math.max(posOf(dragIdx), posOf(k));
+    const off = planOff(data.mf);
+    const inRange = (slot) => { const i = Number(slot) - off; return i >= lo && i <= hi; };
+    ds.redo_segs = (ds.redo_segs || []).filter((x) => x && !inRange(x.slot));
+    if (ds.upscale?.mode === "手动选择") {
+        ds.upscale.include = (ds.upscale.include || []).filter((s) => !inRange(s));
+    }
+    setDs(node, ds);
+    setLed("idle", `段序已调整：从首个变化段起自动级联重做（换位段的接缝需重新生成）`);
+    scheduleRefresh(60);
+}
+
+/** ⬆/⬇ 兜底调序的落线位置（拖不动时可用）：按提示词段名次换位，
+ *  中间隔着插入视频时一并跨过（与拖拽同语义，走同一条 applyReorder 路径）。
+ *  up=与上一名次段换位；down=与下一名次段换位。返回 null=已在边界不可移。 */
+function nudgeIns(data, dragIdx, up) {
+    const plan = data.plan || [];
+    const pos = [];   // pos[rank] = 该名次提示词段的 plan 下标
+    let r = -1;
+    plan.forEach((it, i) => {
+        if (it?.kind !== "prompt") return;
+        pos.push(i);
+        if (it.idx === dragIdx) r = pos.length - 1;
+    });
+    if (r < 0) return null;
+    if (up) {
+        if (r === 0) return null;
+        return pos[r - 1];           // 线放上一名次段之前 → 目标名次 r-1
+    }
+    if (r >= pos.length - 1) return null;   // 已是最后一段
+    /* 线放「下下名次段」之前（前方恰有 r+1 个非拖拽段）；无下下名次则线放链尾 */
+    return r + 2 < pos.length ? pos[r + 2] : plan.length;
+}
+
+/** 指针 Y 在卡片列表中的插入线位置（0..卡数）：越过某卡中点=线在该卡前 */
+function dropIndexAt(wrap, y) {
+    const cards = [...wrap.querySelectorAll(":scope > .h3d-card")];
+    for (let i = 0; i < cards.length; i++) {
+        const r = cards[i].getBoundingClientRect();
+        if (y < r.top + r.height / 2) return i;
+    }
+    return cards.length;
+}
+
+/** 插入线吸附显示：只在「可落位」处画线（原位/不可达不显示），
+ *  线画在拖拽段将占据的位置（现 rank-k 提示词卡之前 / 链尾），所见即所得 */
+function setDropLine(wrap, data, dragIdx, ins) {
+    wrap.querySelectorAll(".h3d-drop-before, .h3d-drop-end")
+        .forEach((n) => n.classList.remove("h3d-drop-before", "h3d-drop-end"));
+    const n = (data.ds?.prompts || []).length;
+    const perm = reorderChain([...Array(n).keys()], data.plan, dragIdx, ins);
+    if (!perm) return;
+    const k = perm.indexOf(dragIdx);
+    const cards = [...wrap.querySelectorAll(":scope > .h3d-card")];
+    let rank = 0, shown = false;
+    for (let i = 0; i < data.plan.length && i < cards.length; i++) {
+        if (data.plan[i]?.kind !== "prompt") continue;
+        if (rank === k) { cards[i].classList.add("h3d-drop-before"); shown = true; break; }
+        rank += 1;
+    }
+    if (!shown && cards.length) cards[cards.length - 1].classList.add("h3d-drop-end");
+}
+
+/* ---- 槽位口径：plan 索引（不含序章） <-> 后端全局槽位（含序章） ---- */
+
+/** manifest 槽位偏移：序章（起始视频接线）占全局槽 0，plan 索引从序章之后起算。
+ *  后端 seeds/thumbs/videos/二采记录/重摇队列全部按全局槽位索引——
+ *  序章项目必须 +off 换算，否则卡片媒体/勾选/重摇错位一段。 */
+function planOff(mf) {
+    return mf?.has_prologue ? 1 : 0;
+}
+
+/** 重摇标记合并视图 slot -> mode：manifest 运行队列（已提交）打底，ds 标记（未提交）
+ *  覆盖同槽位——与后端"ds 优先合并队列"同规则（改模式=重新标记即可覆盖队列）。 */
+function redoMap(ds, mf) {
+    const m = new Map();
+    for (const x of (mf?.redo_queue || [])) {
+        if (Array.isArray(x) && Number.isInteger(Number(x[0]))) {
+            m.set(Number(x[0]), REDO_MODES.some((r) => r[0] === x[1]) ? String(x[1]) : "双锚");
+        }
+    }
+    for (const x of (ds?.redo_segs || [])) {
+        if (x && Number.isInteger(Number(x.slot))) {
+            m.set(Number(x.slot), REDO_MODES.some((r) => r[0] === x.mode) ? x.mode : "双锚");
+        }
+    }
+    return m;
+}
+
+/** 槽位可重摇校验：落在"已完成的启用提示词段"上才有效
+ *  ——与后端 _parse_redo_segs 同口径（未完成/插入段/序章/越界/已禁用不重摇） */
+function redoSlotValid(slot, mf, plan, ds) {
+    const off = planOff(mf);
+    const done = Math.max(0, (mf?.done ?? 0) - off);
+    const i = slot - off;
+    if (!(i >= 0 && i < done && i < (plan || []).length && plan[i]?.kind === "prompt")) return false;
+    const seg = (ds?.segments || [])[plan[i].idx];
+    return !seg?.disabled;
+}
+
+/** 未提交标记数（ds.redo_segs，页脚「重摇已标记 N 段」CTA 计数）。
+ *  manifest 队列另算（redoQueued）：提交后 ds 清空、队列接管徽章显示。 */
+function redoPending(data) {
+    let n = 0;
+    for (const x of (data?.ds?.redo_segs || [])) {
+        if (x && Number.isInteger(x.slot) && redoSlotValid(x.slot, data.mf, data.plan, data.ds)) n += 1;
+    }
+    return n;
+}
+
+/** manifest 重摇队列剩余条目数（已提交未执行完：审片逐段推进时每运行一段停一次，
+ *  剩余段驻留队列等下次运行——页脚显示「继续重摇剩余 N 段」） */
+function redoQueued(data) {
+    let n = 0;
+    for (const x of (data?.mf?.redo_queue || [])) {
+        if (Array.isArray(x) && Number.isInteger(Number(x[0]))
+            && redoSlotValid(Number(x[0]), data.mf, data.plan, data.ds)) n += 1;
+    }
+    return n;
+}
+
 function queuePrompt() {
     if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出，再提交生成"); return; }
     const node = findNode();
@@ -1394,38 +1617,168 @@ function scheduleRefresh(delay = 900) {
 
 /* ---------- 项目动作（游戏式存读档） ---------- */
 
-function doReroll(segNo) {
+/** 提交重摇（页脚 CTA）：随机种子 + 临时开审片（逐段推进：每重摇一段暂停审看），
+ *  队列快照在服务端——提交后立即恢复控件并清 ds 标记（manifest 队列接管徽章显示）。
+ *  redo 与「重跑起始段」互斥（后端 redo 优先）：提交时显式清零避免旧值干扰。 */
+async function submitRedo() {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    const okReroll = setWidgetValue(node, W_REROLL, segNo);
-    setWidgetValue(node, W_SEED, Math.floor(Math.random() * 2 ** 48));
-    pendingReset = okReroll;
-    queuePrompt();
-}
-
-/** 只跑某一段：审片模式（每次运行只生成一段即返回）+ 重跑起始段组合。
- *  segNo ≤ done：重跑起始段=segNo → 重做该段后暂停（其后段落存档被截断，继续时重新生成）；
- *  segNo = done+1：不设重跑 → 顺序生成下一段后暂停（无损）；
- *  segNo > done+1：链式续拍必须按顺序，拦截并说明。
- *  队列提交后立即还原控件（提示词快照已在服务端，用户界面不残留临时值）。 */
-async function doRunOnly(segNo, done) {
-    const node = findNode();
-    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    if (!Number.isInteger(segNo) || segNo < 1) return;
-    if (segNo > done + 1) {
-        alert(`链式续拍需按顺序生成：段 ${done + 1} 尚未完成。\n`
-            + `请先连续生成到段 ${done + 1}（普通「▶ 继续」每次一段），或对已完成段用「重摇此段」。`);
-        return;
-    }
-    if (segNo <= done
-        && !confirm(`重做段 ${segNo}？该段及其后的断点存档会被丢弃，确认满意后继续跑会逐段重新生成。`)) return;
+    if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出，再提交重摇"); return; }
     const prevReview = getWidgetValue(node, "审片模式") ?? "关闭";
     const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
     if (!setWidgetValue(node, "审片模式", "逐段确认")) {
         alert("节点上没有「审片模式」控件：请重新载入配套工作流");
         return;
     }
-    setWidgetValue(node, W_REROLL, segNo <= done ? segNo : 0);
+    setWidgetValue(node, W_REROLL, 0);
+    setWidgetValue(node, W_SEED, Math.floor(Math.random() * 2 ** 48));
+    const ds = getDs(node);          // redo_segs 已在弹窗标记时写入
+    setDs(node, ds);
+    syncModeWidget(node, ds.mode);
+    setLed("running", "重摇已提交（逐段审片推进，满意后继续）");
+    try {
+        await app.queuePrompt();
+    } catch (e) {
+        console.warn("[h3-director] queue failed:", e);
+    }
+    setWidgetValue(node, "审片模式", prevReview);
+    setWidgetValue(node, W_REROLL, prevReroll);
+    const ds2 = getDs(node);
+    ds2.redo_segs = [];
+    setDs(node, ds2);
+    scheduleRefresh();
+}
+
+/* ---- 重摇锚定模式选择模态（段卡片「🎲 重摇」入口） ---- */
+
+/** 标记/修改/取消重摇：弹窗选锚定模式 → 写入 ds.redo_segs（不立即执行），
+ *  多段分别标记后由页脚「重摇已标记 N 段」统一提交。
+ *  已标记段再点 = 改模式或「取消重摇标记」（撤销 ds 标记，并调
+ *  /h3chain/redo_cancel 幂等清掉已入队的同槽位条目——覆盖提交后反悔场景）。 */
+function openRerollModal(idx, data) {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出，再标记重摇"); return; }
+    if (document.querySelector(".h3d-overlay")) return;
+
+    const { mf, plan, ds, state } = data;
+    const slot = idx + planOff(mf);
+    if (!redoSlotValid(slot, mf, plan, ds)) return;
+    const cur = redoMap(ds, mf).get(slot);
+    let picked = cur ?? "双锚";
+
+    const overlay = el("div", "h3d-overlay");
+    const dialog = el("div", "h3d-dialog");
+    dialog.innerHTML = `
+        <h3>🎲 重摇段 ${idx + 1}</h3>
+        <p class="h3d-lead">只重做这一段（换种子重新采样），其余段保留不动——
+        可先给多段分别标记，再点页脚「重摇已标记 N 段」一次提交（互不级联）。
+        锚定模式决定重采样时模型看向哪些接缝锚点（与本段「独立镜头」属性无关）。</p>
+        <div class="h3d-sub">锚定模式${cur ? `（当前：${cur}）` : ""}</div>`;
+    const optrow = el("div", "h3d-optrow");
+    REDO_MODES.forEach(([m, tip]) => {
+        const lab = el("label", "h3d-opt" + (m === picked ? " on" : ""));
+        const radio = document.createElement("input");
+        radio.type = "radio";
+        radio.name = "h3d-redo-mode";
+        radio.checked = m === picked;
+        radio.onchange = () => {
+            picked = m;
+            optrow.querySelectorAll(".h3d-opt").forEach((x) => x.classList.remove("on"));
+            lab.classList.add("on");
+        };
+        const txt = el("div", "");
+        txt.innerHTML = `<b>${m}</b><small>${tip}</small>`;
+        lab.append(radio, txt);
+        optrow.append(lab);
+    });
+    const err = el("div", "h3d-err", "");
+    const row = el("div", "h3d-dialog-row");
+    const cancel = el("button", "h3d-btn", "取消");
+    const unmark = el("button", "h3d-btn h3d-btn-danger", "取消重摇标记");
+    const ok = el("button", "h3d-btn h3d-btn-cta", cur ? "更新标记" : "标记重摇");
+    if (cur) row.append(unmark);
+    row.append(cancel, ok);
+    dialog.append(optrow, err, row);
+    overlay.append(dialog);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.append(overlay);
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
+    optrow.querySelector("input:checked")?.focus();   // 聚焦使 Escape 可关
+
+    const close = () => overlay.remove();
+    cancel.onclick = close;
+
+    /* 标记/改模式：upsert 进 ds.redo_segs（其余段标记不动），卡片立即出徽章 */
+    ok.onclick = () => {
+        const d = getDs(node);
+        const rest = (d.redo_segs || []).filter((x) => x && Number(x.slot) !== slot);
+        d.redo_segs = [...rest, { slot, mode: picked }].sort((a, b) => a.slot - b.slot);
+        setDs(node, d);
+        setLed("idle", `段 ${idx + 1} 已标记重摇（${picked}）：可继续标记其他段，或点页脚提交`);
+        close();
+        scheduleRefresh(60);
+    };
+
+    /* 撤销标记：清 ds 条目 + 幂等清 manifest 队列同槽位条目（接口未注册时
+       仅清 ds——队列条目留待运行消费，不阻断） */
+    unmark.onclick = async () => {
+        unmark.disabled = true;
+        unmark.textContent = "撤销中…";
+        try {
+            const d = getDs(node);
+            d.redo_segs = (d.redo_segs || []).filter((x) => x && Number(x.slot) !== slot);
+            setDs(node, d);
+            if (state?.dir) {
+                const r = await api.fetchApi("/h3chain/redo_cancel", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ dir: state.dir, slot }),
+                });
+                if (r.status === 404 || r.status === 405) {
+                    setApiError(`撤销接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`
+                        + `本次仅撤销了未提交标记，已入队条目需运行消费。`);
+                } else if (!r.ok) {
+                    const j = await r.json().catch(() => ({}));
+                    err.textContent = `撤销失败：${j.error || `HTTP ${r.status}`}`;
+                    unmark.disabled = false;
+                    unmark.textContent = "取消重摇标记";
+                    return;
+                }
+            }
+            setLed("idle", `段 ${idx + 1} 重摇标记已撤销`);
+            close();
+            scheduleRefresh(60);
+        } catch (e) {
+            err.textContent = "撤销请求失败：" + e;
+            unmark.disabled = false;
+            unmark.textContent = "取消重摇标记";
+        }
+    };
+}
+
+/** 只跑某一段（预览下一段）：审片模式组合，顺序生成段 done+1 后暂停（无损）。
+ *  segNo = done+1：不设重跑 → 顺序生成下一段后暂停；
+ *  segNo > done+1：链式续拍必须按顺序，拦截并说明；
+ *  segNo <= done：已完成段不走此入口（「重摇」只重做本段 /「从这段继续」级联重做）。
+ *  队列提交后立即还原控件（提示词快照已在服务端，用户界面不残留临时值）。 */
+async function doRunOnly(segNo, done) {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    if (!Number.isInteger(segNo) || segNo < 1) return;
+    if (segNo !== done + 1) {
+        alert(`链式续拍需按顺序生成：段 ${done + 1} 尚未完成。\n`
+            + `请先连续生成到段 ${done + 1}（普通「▶ 继续」每次一段）；`
+            + `已完成段想重做请用「🎲 重摇」（只重做该段）或「▶ 从这段继续」（其后全部重做）。`);
+        return;
+    }
+    const prevReview = getWidgetValue(node, "审片模式") ?? "关闭";
+    const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
+    if (!setWidgetValue(node, "审片模式", "逐段确认")) {
+        alert("节点上没有「审片模式」控件：请重新载入配套工作流");
+        return;
+    }
+    setWidgetValue(node, W_REROLL, 0);
     const ds = getDs(node);
     setDs(node, ds);
     syncModeWidget(node, ds.mode);
@@ -1441,16 +1794,20 @@ async function doRunOnly(segNo, done) {
 }
 
 /** 从段 idx+1 之后继续生成到底（游戏读档语义）：
- *  保留第 1..N 段，N 之后有旧存档时先截断（弹确认），然后连续生成到链尾。 */
-function continueFromSegment(idx, done) {
+ *  保留第 1..n 段（n=idx+1，plan 口径），n 之后有旧存档时先截断（弹确认），
+ *  然后连续生成到链尾。「重跑起始段」= 全局 1-based（序章占 1），提交后立即还原——
+ *  残留旧值会让下一次普通运行再次截断（本次修复的隐患）。 */
+async function continueFromSegment(idx, done, off) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
     const n = idx + 1;
     if (n < done
         && !confirm(`从段 ${n + 1} 继续生成？\n段 ${n + 1} 之后的旧存档会被丢弃，从段 ${n + 1} 起逐段重新生成到链尾。`)) return;
-    setWidgetValue(node, W_REROLL, n < done ? n + 1 : 0);
+    const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
+    setWidgetValue(node, W_REROLL, n < done ? n + (off || 0) + 1 : 0);
     setLed("running", `从段 ${Math.min(n + 1, done + 1)} 续拍已提交`);
-    queuePrompt();
+    await queuePrompt();
+    setWidgetValue(node, W_REROLL, prevReroll);
 }
 
 /** 删除项目 = 删除整个项目文件夹（分段视频/成片/提示词/latent 全删）。 */
@@ -1758,8 +2115,9 @@ async function collectData() {
 }
 
 function statusLine(state, mf, plan) {
-    const total = plan ? plan.length : (mf?.total ?? state?.total ?? 0);
-    const done = mf?.done ?? state?.done ?? 0;
+    const off = planOff(mf);
+    const total = plan ? plan.length : Math.max(0, (mf?.total ?? state?.total ?? 0) - off);
+    const done = Math.max(0, (mf?.done ?? state?.done ?? 0) - off);
     if (!total) return { text: "尚未配置段落：在流水线卡片填写提示词，或点「＋ 添加一段」", next: false };
     if (done >= total) return { text: `本链已全部完成（${total}/${total} 段）✓ 可「＋ 新建项目」开下一条`, next: false };
     const anchored = done > 0 ? `，锚定段 ${done} 尾部` : "";
@@ -1768,10 +2126,11 @@ function statusLine(state, mf, plan) {
 
 function segMediaHtml(state, mf, idx) {
     const done = mf?.done ?? 0;
-    if (idx >= done || !state?.dir) return null;
+    const g = idx + planOff(mf);   // 全局槽位：序章占 0，manifest 数组按全局槽位索引
+    if (g >= done || !state?.dir) return null;
     const sub = `h3_projects/${state.dir}`;
-    const thumbFile = (mf.thumbs || [])[idx];
-    const videoFile = (mf.videos || [])[idx];
+    const thumbFile = (mf.thumbs || [])[g];
+    const videoFile = (mf.videos || [])[g];
     const thumbSrc = thumbFile ? viewUrl(sub, thumbFile) : "";
     if (videoFile) {
         return `<video class="h3d-segvideo" controls preload="metadata"${thumbSrc ? ` poster="${thumbSrc}"` : ""} src="${viewUrl(sub, videoFile)}"></video>`;
@@ -1872,12 +2231,28 @@ function injectStyles() {
     .h3d-rail span.done{background:var(--h3d-cyan)}
     .h3d-rail span.next{background:#6e7b8c;animation:h3d-blink 1.2s infinite}
     .h3d-rail span.unlink{background:repeating-linear-gradient(135deg,#e0823d 0 4px,#444c56 4px 8px)}
+    .h3d-rail span.offchain{background:repeating-linear-gradient(90deg,#3a414c 0 3px,#22272e 3px 6px)}
     .h3d-cards{display:grid;gap:10px}
     .h3d-card{display:grid;grid-template-columns:150px minmax(0,1fr);gap:11px;padding:10px;border:1px solid #3f4854;border-radius:9px;background:#262c36}
     .h3d-card.todo{opacity:.72}
     .h3d-card.todo:hover{opacity:1}
     .h3d-card.mergeable{grid-template-columns:auto 150px minmax(0,1fr);align-items:start}
     .h3d-card.mergeable-off{opacity:.4}
+    /* 拖拽调序：把手 / 拖动中的源卡 / 插入线（线画在目标位卡片的上沿或链尾卡的下沿） */
+    .h3d-grip{flex:none;width:18px;height:20px;display:inline-grid;place-items:center;border-radius:5px;color:#8794a3;font-size:13px;letter-spacing:-1px;cursor:grab;user-select:none}
+    .h3d-grip:hover{color:var(--h3d-cyan);background:#1c2128}
+    .h3d-grip:active{cursor:grabbing}
+    /* ⬆/⬇ 兜底调序小按钮：默认隐藏，卡片 hover 时露出（与把手并排） */
+    .h3d-mv{flex:none;width:16px;height:18px;display:inline-grid;place-items:center;border:0;border-radius:4px;padding:0;background:transparent;color:#8794a3;font-size:10px;line-height:1;cursor:pointer;opacity:0;transition:opacity .12s}
+    .h3d-card:hover .h3d-mv{opacity:1}
+    .h3d-mv:hover:not(:disabled){color:var(--h3d-cyan);background:#1c2128}
+    .h3d-mv:disabled{opacity:.25!important;cursor:not-allowed}
+    .h3d-card.h3d-dragging{opacity:.35;border-style:dashed}
+    .h3d-card.h3d-drop-before{box-shadow:0 -3px 0 0 var(--h3d-cyan)}
+    .h3d-card.h3d-drop-end{box-shadow:0 3px 0 0 var(--h3d-cyan)}
+    /* 段禁用（不上链）：半透明虚线框，与待生成 todo 区分 */
+    .h3d-card.offchain{opacity:.5;border-style:dashed;border-color:#59626f}
+    .h3d-card.offchain:hover{opacity:.85}
     .h3d-mergecb{width:15px;height:15px;margin:4px 0 0 2px;accent-color:#6cb6ff;cursor:pointer;flex:none}
     .h3d-mergebar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:-2px 0 14px;padding:9px 12px;border:1px solid #7a5f36;border-radius:8px;background:linear-gradient(90deg,#352a19,#2d333b)}
     .h3d-merge-sum{flex:1;min-width:200px;color:#e9c07a;font-size:11.5px;line-height:1.7;word-break:break-all}
@@ -2059,6 +2434,13 @@ function injectStyles() {
     .h3d-err{color:#e89090;font-size:11px;min-height:16px;margin-bottom:6px}
     .h3d-check{display:flex;gap:8px;align-items:center;color:var(--h3d-muted);font-size:12px;margin-bottom:14px;cursor:pointer}
     .h3d-dialog-row{display:flex;gap:8px;justify-content:flex-end}
+    .h3d-optrow{display:flex;flex-direction:column;gap:7px;margin:0 0 14px}
+    .h3d-opt{display:flex;gap:10px;align-items:flex-start;padding:9px 11px;border:1px solid #3a352c;border-radius:9px;background:#211f1a;cursor:pointer;transition:border-color .12s,background .12s}
+    .h3d-opt:hover{border-color:#46604f}
+    .h3d-opt.on{border-color:#2f6e57;background:#12291f}
+    .h3d-opt input{margin-top:3px;accent-color:#2f6e57;flex:none}
+    .h3d-opt b{display:block;font-size:12.5px}
+    .h3d-opt small{color:var(--h3d-muted);font-size:11px;line-height:1.5}
 
     /* ---- 总提示词模态（宽版 + 等宽多行编辑 + 实时识别预览） ---- */
     .h3d-dialog-wide{width:min(760px,calc(100vw - 40px))}
@@ -2086,7 +2468,8 @@ function renderMini(data) {
     const card = el("div", "h3d-mini");
 
     const total = plan ? plan.length : 0;
-    const done = mf?.done ?? state?.done ?? 0;
+    const off = planOff(mf);
+    const done = Math.max(0, (mf?.done ?? state?.done ?? 0) - off);
 
     const head = el("div", "h3d-mini-head");
     const brand = el("div", "h3d-mini-brand", "长片导演台");
@@ -2228,22 +2611,29 @@ function isVideoPlaying(root) {
 }
 
 function cardsSignature(data) {
-    const { state, plan, ds } = data;
+    const { state, plan, ds, mf } = data;
     return JSON.stringify({
         dir: state?.dir ?? "",
         done: state?.done ?? 0,
         total: plan?.length ?? 0,
         review: !!state?.review,
         reroll: state?.reroll ?? 0,
+        prologue: !!mf?.has_prologue,
         plan: (plan || []).map((it) => it.kind === "insert" ? ["i", it.pos, it.file] : ["p", it.text]),
         segs: (ds?.segments || []).map((s) => [s.scene_prompt ?? "", s.character_prompt ?? "",
                                                s.seconds ?? 0, (s.refs || []).join(","),
-                                               !!s.unlink,
+                                               !!s.unlink, !!s.disabled,
                                                Array.isArray(s.frame_refs) ? s.frame_refs.join(",") : null]),
         /* 首尾帧图文件名也要进签名：上传/换图后段卡片的首尾帧 chips 行才会重建 */
         frames: [ds?.first_frame ?? "", ds?.end_frame ?? ""],
         labels: (ds?.ref_assets || []).map((a) => a.label),
         mode: ds?.mode ?? "",
+        /* 二采模式/勾选也要进签名：切模式或勾选段后卡片重建——
+           手动选择勾选框才会立即出现（不进签名则要切页再回来才刷新） */
+        up: [ds?.upscale?.mode ?? "", (ds?.upscale?.include || []).join(",")],
+        /* 重摇标记/运行队列同样进签名：标记/取消/队列消费后待重摇徽章即时刷新 */
+        redo: [(ds?.redo_segs || []).map((x) => `${x.slot}:${x.mode}`).join(","),
+               (mf?.redo_queue || []).map((x) => (Array.isArray(x) ? x.join(":") : "")).join(",")],
         dur: String(getWidgetValue(data.node, W_DUR) ?? ""),
         merge: [mergeSel.on, [...mergeSel.segs].sort((a, b) => a - b).join(","),
                 (mergeSel.files || []).join(",")],
@@ -2370,8 +2760,9 @@ function renderLeftColumn(sec, data) {
     sec.append(newrow);
 
     if (state?.dir) {
-        const done = mf?.done ?? state.done ?? 0;
-        const total = state.total ?? 0;
+        const off = planOff(mf);
+        const done = Math.max(0, (mf?.done ?? state.done ?? 0) - off);
+        const total = data.plan?.length ?? Math.max(0, (state.total ?? 0) - off);
         const ps = paramsSummary(node, data.mf);
         const totalSec = data.plan?.length
             ? `共${chainSeconds(node, data.ds, data.plan).toFixed(1)}s` : "";
@@ -2400,9 +2791,10 @@ function mergeProjects(projects, state) {
 
 function renderCenterColumn(colC, data) {
     const sig = cardsSignature(data);
-    // 编辑中（常驻 textarea 聚焦 / 临时编辑器打开 / 视频播放中）跳过重建，防丢焦丢草稿
+    // 编辑中（常驻 textarea 聚焦 / 临时编辑器打开 / 视频播放中 / 拖拽调序进行中）
+    // 跳过重建，防丢焦丢草稿 / 防拖动中卡片列表被轮询刷新换掉导致 drop 目标失效
     const taFocus = !!colC.querySelector(".h3d-ta:focus");
-    const locked = taFocus || !!colC.querySelector(".h3d-editor") || isVideoPlaying(colC);
+    const locked = taFocus || !!colC.querySelector(".h3d-editor") || isVideoPlaying(colC) || !!dragSeg;
     if (!locked && (sig !== desk.cardsSig || !colC.querySelector(".h3d-center-pad"))) {
         desk.cardsSig = sig;
         [...colC.children].slice(1).forEach((n) => n.remove());
@@ -2414,7 +2806,8 @@ function buildCenterBody(data) {
     const { node, state, mf, plan, drafts } = data;
     const wrap = el("div", "h3d-center-pad");
     const total = plan ? plan.length : 0;
-    const done = mf?.done ?? state?.done ?? 0;
+    const off = planOff(mf);
+    const done = Math.max(0, (mf?.done ?? state?.done ?? 0) - off);
 
     /* 状态条 */
     const bar = el("div", "h3d-statusbar");
@@ -2453,12 +2846,15 @@ function buildCenterBody(data) {
                 ? (data.ds.segments[it.idx]?.seconds ?? def) : def;
             const unlinked = it?.kind === "prompt" && it.idx !== undefined
                 && !!(data.ds.segments[it.idx]?.unlink);
+            const offchain = it?.kind === "prompt" && it.idx !== undefined
+                && !!(data.ds.segments[it.idx]?.disabled);
             const sp = el("span", (i < done ? "done" : i === done ? "next" : "")
-                + (unlinked ? " unlink" : ""));
+                + (unlinked ? " unlink" : "") + (offchain ? " offchain" : ""));
             sp.style.flexGrow = String(Math.max(1, sec));
             sp.title = `段 ${i + 1} · ${sec}s`
                 + (it?.kind === "insert" ? "（插入视频，按默认估）" : "")
-                + (unlinked ? " · 独立镜头（与上段硬切）" : "");
+                + (unlinked ? " · 独立镜头（与上段硬切）" : "")
+                + (offchain ? " · 已禁用（不上链）" : "");
             rail.append(sp);
         }
         wrap.append(rail);
@@ -2469,7 +2865,7 @@ function buildCenterBody(data) {
         const mbar = el("div", "h3d-mergebar");
         const segsSorted = [...mergeSel.segs].sort((a, b) => a - b);
         const segSum = segsSorted.length
-            ? segsSorted.map((s) => `段${s}`).join("＋") : "未勾选段";
+            ? segsSorted.map((s) => `段${Math.max(1, s - off)}`).join("＋") : "未勾选段";
         const fileSum = (mergeSel.files || []).length
             ? ` ＋ 外部视频×${mergeSel.files.length}` : "";
         const sum = el("div", "h3d-merge-sum",
@@ -2534,10 +2930,13 @@ function buildCenterBody(data) {
 
 function buildCards(data) {
     const { node, state, mf, plan } = data;
-    const done = mf?.done ?? state?.done ?? 0;
+    const off = planOff(mf);
+    const done = Math.max(0, (mf?.done ?? state?.done ?? 0) - off);
+    const total = plan.length;
     const seeds = mf?.seeds || [];
     const seams = mf?.seams || [];
     const bridges = mf?.bridge_scores || [];
+    const redoMarks = redoMap(data.ds, mf);   // slot -> mode（ds 标记 ∪ manifest 队列）
     const wrap = el("div", "h3d-cards");
 
     if (!plan.length) {
@@ -2552,7 +2951,11 @@ function buildCards(data) {
         const isDone = idx < done;
         const isInsert = it.kind === "insert";
         const isHead = isInsert && it.pos === 1;
-        const card = el("div", "h3d-card" + (isDone ? "" : " todo"));
+        /* 段禁用（不上链）：仅提示词段；插入段位置固定不参与（有专用移除操作） */
+        const segData0 = (it.idx !== undefined && data.ds.segments)
+            ? (data.ds.segments[it.idx] || defaultSegment()) : null;
+        const isDisabled = !isInsert && !!segData0?.disabled;
+        const card = el("div", "h3d-card" + (isDone ? "" : " todo") + (isDisabled ? " offchain" : ""));
         const media = segMediaHtml(state, mf, idx);
         const thumb = el("div", "h3d-thumb");
         thumb.innerHTML = media
@@ -2586,31 +2989,76 @@ function buildCards(data) {
         }
 
         const body = el("div", "h3d-cbody");
-        const segData = (it.idx !== undefined && data.ds.segments)
-            ? (data.ds.segments[it.idx] || defaultSegment()) : null;
+        const segData = segData0;
         const stateChip = !isDone
             ? badge(isInsert ? "插入段（未跑）" : "待生成", "")
             : isHead ? badge("片头（上传）", "media")
             : isInsert ? badge("插入段", "media") : badge("已完成", "ok");
         const unlinkChip = !isInsert && segData?.unlink ? badge("独立镜头", "warn") : "";
-        const upRec = isDone ? (mf?.upscale?.segs || [])[idx] : null;
+        const offChip = isDisabled ? badge("⏸ 已禁用", "warn") : "";
+        /* 待重摇徽章：已标记（未提交）或已在运行队列（审片逐段推进剩余量） */
+        const redoMode = isDone && !isInsert ? redoMarks.get(idx + off) : null;
+        const redoChip = redoMode ? badge(`🔁 待重摇·${redoMode}`, "warn") : "";
+        const upRec = isDone ? (mf?.upscale?.segs || [])[idx + off] : null;
         const upChip = upRec?.done
             ? badge(`二采${upRec.size?.length ? ` ${upRec.size[0]}×${upRec.size[1]}` : "✓"}`, "cyan") : "";
         const title = el("div", "h3d-ctitle",
-            `<span>段 ${idx + 1}${isInsert ? `（位置 ${it.pos}）` : ""}</span>${stateChip}${unlinkChip}${upChip}`);
+            `<span>段 ${idx + 1}${isInsert ? `（位置 ${it.pos}）` : ""}</span>${stateChip}${offChip}${unlinkChip}${redoChip}${upChip}`);
+        /* 拖拽调序把手（仅提示词段；插入段位置固定由 pos 决定，不参与拖拽） */
+        if (!isInsert && node && !mergeSel.on && it.idx !== undefined) {
+            const grip = el("span", "h3d-grip", "⠿");
+            grip.title = "按住拖动调整此段在链上的位置：其余段保持相对顺序，"
+                + "从首个变化段起自动级联重做（接缝重新衔接）";
+            grip.draggable = true;
+            grip.addEventListener("dragstart", (e) => {
+                dragSeg = { idx: it.idx };
+                card.classList.add("h3d-dragging");
+                try {
+                    e.dataTransfer.effectAllowed = "move";
+                    e.dataTransfer.setData("text/plain", String(it.idx));
+                } catch (err) { /* IE 模式忽略 */ }
+            });
+            grip.addEventListener("dragend", () => {
+                dragSeg = null;
+                wrap.querySelectorAll(".h3d-dragging, .h3d-drop-before, .h3d-drop-end")
+                    .forEach((n) => n.classList.remove("h3d-dragging", "h3d-drop-before", "h3d-drop-end"));
+                scheduleRefresh(60);   // 清残留态并恢复常规重建
+            });
+            title.append(grip);
+            /* ⬆/⬇ 兜底小按钮（hover 显示）：拖拽不可用/不顺手时按名次换位，
+               走同一条 applyReorder 路径（含拖动范围清重摇标记/二采勾选） */
+            const mvUp = el("button", "h3d-mv", "⬆");
+            mvUp.title = "与上一个提示词段换位（中间隔着插入视频则一并跨过）；"
+                + "从首个变化段起自动级联重做";
+            mvUp.onclick = () => {
+                const ins = nudgeIns(data, it.idx, true);
+                if (ins !== null) applyReorder(node, data, it.idx, ins);
+            };
+            const mvDn = el("button", "h3d-mv", "⬇");
+            mvDn.title = "与下一个提示词段换位（中间隔着插入视频则一并跨过）；"
+                + "从首个变化段起自动级联重做";
+            mvDn.onclick = () => {
+                const ins = nudgeIns(data, it.idx, false);
+                if (ins !== null) applyReorder(node, data, it.idx, ins);
+            };
+            mvUp.disabled = nudgeIns(data, it.idx, true) === null;
+            mvDn.disabled = nudgeIns(data, it.idx, false) === null;
+            title.append(mvUp, mvDn);
+        }
 
-        /* 合并模式：已完成段（含序章/插入段）可勾选拼接进 merged_*.mp4 */
+        /* 合并模式：已完成段（含插入段）可勾选拼接进 merged_*.mp4（勾选值=全局 1-based 段号）；
+           已禁用段不进成片（与自动成片/二采拼接同口径），不给勾选 */
         if (mergeSel.on) {
-            if (isDone) {
+            if (isDone && !isDisabled) {
                 const cb = document.createElement("input");
                 cb.type = "checkbox";
                 cb.className = "h3d-mergecb";
-                cb.checked = mergeSel.segs.includes(idx + 1);
+                const g1 = idx + off + 1;
+                cb.checked = mergeSel.segs.includes(g1);
                 cb.title = `勾选后并入合并导出（链位 ${idx + 1}，按链顺序拼接）`;
                 cb.onchange = () => {
-                    const n = idx + 1;
                     mergeSel.segs = cb.checked
-                        ? [...mergeSel.segs, n] : mergeSel.segs.filter((x) => x !== n);
+                        ? [...mergeSel.segs, g1] : mergeSel.segs.filter((x) => x !== g1);
                     scheduleRefresh(0);
                 };
                 card.classList.add("mergeable");
@@ -2618,14 +3066,16 @@ function buildCards(data) {
             } else {
                 card.classList.add("mergeable-off");
             }
-        } else if (data.ds.upscale?.mode === "手动选择" && node && isDone) {
-            /* 手动选择二采：已完成段（含插入视频/序章）勾选后随下次运行二采 */
+        } else if (data.ds.upscale?.mode === "手动选择" && node && isDone && !isDisabled) {
+            /* 手动选择二采：已完成段（含插入视频段）勾选后随下次运行二采
+               （勾选值=全局槽位 0-based，与后端 in_scope 校验同口径）；
+               已禁用段不进成片，勾了二采也无意义，不显示 */
             const cb = document.createElement("input");
             cb.type = "checkbox";
             cb.className = "h3d-upcb";
-            cb.checked = (data.ds.upscale.include || []).includes(idx);
+            cb.checked = (data.ds.upscale.include || []).includes(idx + off);
             cb.title = "勾选后点「开始生成」对本段执行潜空间放大二采（外部素材段同样可二采）";
-            cb.onchange = () => toggleUpscaleInclude(node, idx);
+            cb.onchange = () => toggleUpscaleInclude(node, idx + off);
             card.classList.add("upable");
             card.prepend(cb);
         }
@@ -2658,10 +3108,10 @@ function buildCards(data) {
         }
         body.append(title);
 
-        const seedTxt = isDone && !isInsert && seeds[idx] != null ? `种子 ${seeds[idx]}` : "";
-        const seamTxt = isDone && seams[idx]
-            ? `接缝 ${seams[idx][0]}${seams[idx][1] == null ? "" : ` / ${seams[idx][1]}dB`}` : "";
-        const bridgeTxt = isDone && !isInsert && bridges[idx] != null ? `桥分 ${bridges[idx]}` : "";
+        const seedTxt = isDone && !isInsert && seeds[idx + off] != null ? `种子 ${seeds[idx + off]}` : "";
+        const seamTxt = isDone && seams[idx + off]
+            ? `接缝 ${seams[idx + off][0]}${seams[idx + off][1] == null ? "" : ` / ${seams[idx + off][1]}dB`}` : "";
+        const bridgeTxt = isDone && !isInsert && bridges[idx + off] != null ? `桥分 ${bridges[idx + off]}` : "";
         const meta = [seedTxt, seamTxt, bridgeTxt].filter(Boolean).join(" · ");
         if (meta) body.append(el("div", "h3d-cmeta", escapeHtml(meta)));
 
@@ -2880,40 +3330,57 @@ function buildCards(data) {
             }
             actions.append(insertButton("在此段后插入", idx + 2));
         } else {
-            if (isDone) {
+            if (isDisabled) {
+                /* 已禁用段只提供恢复入口（重摇/继续/二采均无意义——不执行不进成片） */
+                const back = el("button", "h3d-btn h3d-btn-cyan", "▶ 重新上链");
+                back.title = "恢复本段自动执行：已完成段直接沿用存档（零成本），"
+                    + "未完成段下次运行起正常采样；前后接缝自动重新衔接";
+                back.onclick = () => setSegmentField(node, it.idx, "disabled", false);
+                actions.append(back);
+            } else if (isDone) {
+                /* 已完成段两个入口：「从这段继续」= 其后全部级联重做（主动想全重来时用）；
+                   「重摇」= 只重做本段（换种子，按锚定模式接缝），其余段保留不动——
+                   可标记多段后由页脚统一提交（间隔选择重做，互不级联） */
                 const cont = el("button", "h3d-btn h3d-btn-cta", "▶ 从这段继续");
                 cont.title = `保留段 1–${idx + 1}，从段 ${idx + 2} 起连续生成到链尾`
                     + (idx + 1 < done ? `（段 ${idx + 2} 之后的旧存档会被丢弃）` : "");
                 cont.onclick = () => continueFromSegment(idx, done);
                 actions.append(cont);
-            }
-            const runOne = el("button", "h3d-btn h3d-btn-cyan",
-                isDone ? "▶ 重跑这段" : "▶ 只跑这段");
-            runOne.title = isDone
-                ? `重做段 ${idx + 1} 后暂停（审片模式+重跑起始段=${idx + 1}），满意再继续`
-                : `只生成段 ${idx + 1} 后暂停（审片模式）：预览单段效果，满意再继续整链`;
-            runOne.onclick = () => doRunOnly(idx + 1, done);
-            actions.append(runOne);
-            if (isDone) {
-                const rerollBtn = el("button", "h3d-btn", "🎲 重摇此段");
-                rerollBtn.title = `设「重跑起始段」=${idx + 1} 并换种子重新生成该段及之后`;
-                rerollBtn.onclick = () => doReroll(idx + 1);
+                const rerollBtn = el("button", "h3d-btn", redoMode ? "🎲 重摇·改标记" : "🎲 重摇此段");
+                rerollBtn.title = `只重做段 ${idx + 1}（换种子重新采样，按锚定模式接缝），其余段保留不动；`
+                    + `可连续标记多段，点页脚「重摇已标记 N 段」一次提交；`
+                    + `「从这段继续」才是该段之后全部重做`;
+                rerollBtn.onclick = () => openRerollModal(idx, data);
                 actions.append(rerollBtn);
             } else {
+                const runOne = el("button", "h3d-btn h3d-btn-cyan", "▶ 只跑这段");
+                runOne.title = `只生成段 ${idx + 1} 后暂停（审片模式）：预览单段效果，满意再继续整链`;
+                runOne.onclick = () => doRunOnly(idx + 1, done);
+                actions.append(runOne);
                 actions.append(insertButton(`插视频到段 ${idx + 1} 前`, idx + 1));
             }
             if (node && it.idx !== undefined) {
+                const offBtn = el("button", "h3d-btn", "⏸ 不上链");
+                offBtn.title = "本段保留在链上但跳过执行：不采样不解码不进成片，"
+                    + "槽位与存档记录原样保留（随时恢复零成本），下段锚定自动跨接到"
+                    + "本段之前最近一个已执行段的尾帧；若本段尚未生成，重新上链时会正常采样";
+                offBtn.onclick = () => setSegmentField(node, it.idx, "disabled", true);
+                actions.append(offBtn);
                 const rm = el("button", "h3d-btn h3d-btn-danger", "✕ 删除此段");
                 rm.title = "删除这一段提示词（其后段落自动前移）";
                 rm.onclick = () => removePromptSegment(node, it.idx);
                 actions.append(rm);
             }
         }
-        /* 已有二采产物：一键清记录（下次二采运行重做该段；基础链不受影响） */
-        if (upRec?.done && node && state?.dir) {
-            const rst = el("button", "h3d-btn", "↺ 重置二采");
-            rst.title = "清掉本段二采记录与高清产物（段视频/缩略图一并删，下次运行按记录缺失自愈重建；基础链 latent 与成片记录不受影响）";
-            rst.onclick = () => doUpscaleReset(rst, state.dir, idx + 1);
+        /* 单段重新二采（含插入视频段）：已完成段随时可单独补做/重做二采，
+           不动其他段——显示条件放宽到"选了模型"即可见（未做过二采的段也能补做）；
+           已禁用段不进成片，不做二采 */
+        if (isDone && !isDisabled && node && state?.dir && (upRec?.done || data.ds?.upscale?.model)) {
+            const rst = el("button", "h3d-btn", "🔄 重新二采此段");
+            rst.title = "清本段二采记录并立即重做：latent 存档载入 → 神经放大重采样 → 覆盖段视频"
+                + "（不做视频编解码；插入视频段同样适用）。其他段不受影响。"
+                + "参数未变时重渲=同输出；效果不满意请调右栏二采参数";
+            rst.onclick = () => doUpscaleSeg(rst, state.dir, idx + off + 1, idx + 1, done, total);
             actions.append(rst);
         }
         body.append(actions);
@@ -2921,6 +3388,27 @@ function buildCards(data) {
         card.append(thumb, body);
         wrap.append(card);
     });
+
+    /* 容器拖放：把手拖动中按指针 Y 换算插入线并吸附显示（setDropLine 只在
+       可落位处画线），松手时提交调序。dragover 高频触发——dropIndexAt 是
+       纯 DOM 测量、reorderChain 在 setDropLine 内纯计算，无状态副作用。 */
+    if (node && !mergeSel.on) {
+        wrap.addEventListener("dragover", (e) => {
+            if (!dragSeg) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+            setDropLine(wrap, data, dragSeg.idx, dropIndexAt(wrap, e.clientY));
+        });
+        wrap.addEventListener("drop", (e) => {
+            if (!dragSeg) return;
+            e.preventDefault();
+            const dragIdx = dragSeg.idx;
+            dragSeg = null;   // 先清再提交：applyReorder 内的 scheduleRefresh 不受拖动态干扰
+            wrap.querySelectorAll(".h3d-dragging, .h3d-drop-before, .h3d-drop-end")
+                .forEach((n) => n.classList.remove("h3d-dragging", "h3d-drop-before", "h3d-drop-end"));
+            applyReorder(node, data, dragIdx, dropIndexAt(wrap, e.clientY));
+        });
+    }
     return wrap;
 }
 
@@ -3987,15 +4475,37 @@ function renderFooter(z, data) {
 
     const run = z.run;
     run.onclick = queuePrompt;
+    const pend = redoPending(data), queued = redoQueued(data);
     if (mergeSel.on) {
         run.disabled = true;
         run.textContent = "⧉ 合并模式进行中（退出后可生成）";
     } else if (!total) {
         run.disabled = true;
         run.textContent = "▶ 开始生成（先配置段落）";
+    } else if (pend && node) {
+        /* 重摇标记优先（最新意图）：提交=随机种子+逐段审片推进；
+           队列残留段后端自动合并进本次执行 */
+        run.disabled = false;
+        run.textContent = `🎲 重摇已标记 ${pend} 段`;
+        run.onclick = submitRedo;
+    } else if (queued && node) {
+        /* 已提交队列未消费完（审片逐段推进每运行一段停一次）：普通提交续跑，
+           后端先消费队列再继续剩余段（种子逐段自动 bump，控件种子不动） */
+        run.disabled = false;
+        run.textContent = `🎲 继续重摇剩余 ${queued} 段`;
+        run.onclick = queuePrompt;
     } else if (done >= total) {
-        run.disabled = true;
-        run.textContent = `✓ 本链已完成（${total} 段）`;
+        /* 链已完成但仍可单独执行二采：手动选择模式勾了段且选了模型——
+           全链回放只跑二采（勾选段重渲高清，其余段沿用），不再被"已完成"锁死 */
+        const inc = data.ds?.upscale?.mode === "手动选择"
+            ? (data.ds.upscale.include || []) : [];
+        if (inc.length && data.ds.upscale?.model) {
+            run.disabled = false;
+            run.textContent = `▶ 执行二采（已勾选 ${inc.length} 段）`;
+        } else {
+            run.disabled = true;
+            run.textContent = `✓ 本链已完成（${total} 段）`;
+        }
     } else {
         run.disabled = false;
         run.textContent = done > 0

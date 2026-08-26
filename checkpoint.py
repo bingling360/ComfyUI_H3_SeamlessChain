@@ -95,6 +95,9 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
     """
     out = dict(manifest)
     out["done"] = start
+    # 链结构变化（提示词改/手动重跑/调序）使重摇标记的槽位语义作废，一并清空
+    if out.get("redo_queue"):
+        out["redo_queue"] = []
     for key in ("seeds", "trims", "prompt_hashes", "thumbs", "videos", "prompts",
                 "seams", "bridge_scores", "anchors", "seam_metrics"):
         if key in out:

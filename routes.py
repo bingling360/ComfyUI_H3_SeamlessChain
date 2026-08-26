@@ -49,6 +49,7 @@ ROUTES = [
     ("POST", "/h3chain/delete_file"),
     ("POST", "/h3chain/merge"),
     ("POST", "/h3chain/upscale_reset"),
+    ("POST", "/h3chain/redo_cancel"),
 ]
 
 _ROUTES_LOG = ", ".join(f"{m} {p}" for m, p in ROUTES)
@@ -190,6 +191,15 @@ def add_routes(routes):
             return web.json_response({"error": str(e)}, status=400)
         return web.json_response({"ok": True, "manifest": manifest})
 
+    async def redo_cancel(request):
+        """撤销重摇标记：从 manifest 重摇队列移除该槽位（幂等）。"""
+        data = await request.json()
+        try:
+            manifest = projects.redo_cancel(str(data.get("dir") or ""), data.get("slot"))
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True, "manifest": manifest})
+
     handlers = [
         ("GET", "/h3chain/ping", ping),
         ("GET", "/h3chain/projects", list_projects),
@@ -203,6 +213,7 @@ def add_routes(routes):
         ("POST", "/h3chain/delete_file", delete_file),
         ("POST", "/h3chain/merge", merge),
         ("POST", "/h3chain/upscale_reset", upscale_reset),
+        ("POST", "/h3chain/redo_cancel", redo_cancel),
     ]
 
     def _mount(target, method, path, handler):

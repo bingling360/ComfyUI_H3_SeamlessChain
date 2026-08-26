@@ -251,6 +251,90 @@ def _parse_frame_refs(segments, n, has_first, has_end):
     return picked, explicit
 
 
+_REDO_MODES = ("双锚", "仅锚上段", "仅锚下段", "无锚")
+
+
+def _parse_redo_segs(ds, done, exec_kinds, off, disabled=None):
+    """导演台重摇标记 ds.redo_segs -> 合法 (slot, mode) 列表（去重，按提交序）。
+
+    slot=全局槽位 0-based（含序章位，与二采 include 同口径）；合法性：
+    已完成（slot < done，未完成段本来就要生成）、非序章（slot >= off）、
+    提示词段（插入段/序章各有专用操作，不可重摇）、mode 合法、非禁用段
+    （禁用段不执行不进成片，重摇无意义——前端 redoSlotValid 同口径拦截，
+    这里防御性复验）。无有效标记返回空列表（普通续跑/回放，行为与现状完全一致）。
+    disabled=按 exec_items 位置的禁用布尔表（与 exec_kinds 同口径；
+    None=全部启用，兼容旧调用）。
+    """
+    raw = ds.get("redo_segs") if isinstance(ds, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out, seen = [], set()
+    for x in raw:
+        if not isinstance(x, dict):
+            continue
+        try:
+            slot = int(x.get("slot"))
+        except (TypeError, ValueError):
+            continue
+        mode = str(x.get("mode") or "双锚")
+        if mode not in _REDO_MODES:
+            continue
+        if slot in seen or not off <= slot < done:
+            continue
+        i = slot - off
+        k = exec_kinds[i] if 0 <= i < len(exec_kinds) else ""
+        if k != "prompt":
+            continue
+        if disabled is not None and 0 <= i < len(disabled) and disabled[i]:
+            continue
+        out.append((slot, mode))
+        seen.add(slot)
+    return out
+
+
+def _redo_seed(ctrl_seed, i, archived):
+    """重摇段种子：控件种子等差序列（与「重跑起始段」同规则），再与该段存档
+    种子相同时 +1（bump）——保证每次重摇种子必变，驱动 base_hash 变化，
+    二采记录自动失效重渲（重摇换种子 = 高清必须跟着重做）。
+    连续多次重摇同段：本段存档种子已被上次更新，bump 天然交替不出死循环。
+    """
+    s = (int(ctrl_seed) + i) % 0xffffffffffffffff
+    if archived is not None:
+        try:
+            if s == int(archived) % 0xffffffffffffffff:
+                s = (s + 1) % 0xffffffffffffffff
+        except (TypeError, ValueError):
+            pass
+    return s
+
+
+def _merged_list(new_seq, old_seq, upto):
+    """选择性重做的 manifest 列表合并：新积累前缀 + 旧记录补尾。
+
+    审片中段 break 时循环内积累的列表长度 < done，直接写 [:done] 会丢后续
+    保留段记录；正常顺序推进（len >= upto）时纯截断，与现状逐位一致。
+    旧列表长度不足时切片自动安全（补不满的部分维持缺失，与现状同）。"""
+    new_seq = list(new_seq or [])
+    old_seq = list(old_seq or [])
+    if len(new_seq) >= upto:
+        return new_seq[:upto]
+    return new_seq + old_seq[len(new_seq):upto]
+
+
+def _seam_tail_kf(video_t, skip_frames):
+    """下一段保留段存档 latent -> 重摇段尾锚 latent（裁头后首个可见 token 直切）。
+
+    帧归属 token：帧0→token0，帧 f>=1 → token (f+3)//4（token t 含帧
+    [4t-3, 4t]）。锚「裁头后首帧所在 token」= 接缝区（token 内含少量上段
+    桥锚定帧 + 下段首帧，正是接缝过渡语义）。无可见内容（越界）返回 None。
+    单 token 视觉锚，与每段尾帧锚定同形态（不带音频）。
+    """
+    k = (int(skip_frames) + 3) // 4
+    if k < 0 or k >= video_t.shape[2]:
+        return None
+    return video_t[:, :, k:k + 1, :, :].clone()
+
+
 def _autosave_final(root, frames, wav, sample_rate, fps=24, crf=20, preset="veryfast",
                     aq_mode=None, dither=False):
     """完整链（或审片已确认部分）PyAV 编码成片到项目文件夹，成功返回路径。
@@ -788,6 +872,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
             seg_unlink.append(bool(seg.get("unlink")))
 
+        # 段级禁用（不上链）：槽位稳定方案——禁用段保留在执行序列与哈希序列中
+        # （禁用/启用不触发任何重做），仅执行时跳过：不采样/不解码/不进成片；
+        # 下段锚定跨接到最近一个已执行段的尾帧。插入段不可禁用（有专用移除操作）。
+        seg_disabled = []
+        for i in range(len(seg_prompts)):
+            seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
+            seg_disabled.append(bool(seg.get("disabled")))
+
         # 潜空间放大二采（导演台面板控制）：每段采样定稿后立即「神经放大 latent →
         # 低强度重采样 → 解码」，分段视频与成片直接保存二采结果（同名覆盖，不再
         # 产出 upseg_* 副本）。模型在主循环前预加载：缺失/不匹配当场降级为基础
@@ -959,6 +1051,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                        if it[0] == "prompt" and seg_unlink[it[1]]]
         if _unlink_pos:
             report.append(f"独立镜头：{len(_unlink_pos)} 段与上段断链（无桥接/硬切，段 {'、'.join(_unlink_pos)}）")
+        _off_pos = [str(item_i + 1) for item_i, it in enumerate(exec_items)
+                    if it[0] == "prompt" and seg_disabled[it[1]]]
+        if _off_pos:
+            report.append(f"段禁用：{len(_off_pos)} 段不上链（跳过执行不进成片，段 {'、'.join(_off_pos)}；"
+                          "已禁用段与启用段可混排，随时恢复零成本）")
         if up_cfg:
             _tb = float(up_cfg.get("time_bias") or 0.0)
             _mix = float(up_cfg.get("mix") or 0.0)
@@ -1155,6 +1252,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         root, manifest, done, seeds = None, None, 0, []
         proj_title, proj_created, proj_finals = "", None, []
         proj_inserts = []
+        # 选择性重做（重摇标记）：{全局槽位: 锚定模式}，队列 = 未跑完的标记快照
+        redo_map, redo_queue, _redo_started = {}, [], False
         off = 1 if 起始视频 is not None else 0
         if use_ckpt:
             root = checkpoint.ckpt_dir(ckpt_params, 存档目录.strip())
@@ -1188,20 +1287,53 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 done = checkpoint.contiguous_done(root, int(manifest.get("done", 0)))
                 full_hashes = ([prologue_hash] if off else []) + exec_hashes
                 hashes = list(manifest.get("prompt_hashes", []))
+                # 选择性重做（重摇标记）：redo 优先于「重跑起始段」（互斥——redo=只重做
+                # 标记段其余保留；reroll=从某段起全部级联重做，语义不同不叠加）
+                exec_kinds = [it[0] for it in exec_items]
+                _exec_disabled = [seg_disabled[it[1]] if it[0] == "prompt" else False
+                                  for it in exec_items]
+                _redo_ds = _parse_redo_segs(ds, done, exec_kinds, off, _exec_disabled)
+                if _redo_ds and reroll > 0:
+                    report.append("注意：已标记重摇段，「重跑起始段」本次忽略——"
+                                  "重摇=只重做标记段（其余保留），与级联重做互斥")
+                    reroll = 0
                 # 「重跑起始段」为 1-based 段号（与 tooltip 一致）：N=从第 N 段起重做
                 start = min(max(reroll - 1, 0), done) if reroll > 0 else min(
                     checkpoint.reroll_start(hashes, full_hashes, done), done)
                 if start < done:
                     manifest = checkpoint.truncate(root, manifest, start)
                     done = start
+                    # 截断后 done 变小：越界的重摇标记槽位作废（truncate 已联动清队列）
+                    _redo_ds = [x for x in _redo_ds if x[0] < done]
                     proj_inserts = [x for x in proj_inserts
                                     if int(x.get("slot", -1)) < start]
                     原因 = "手动指定「重跑起始段」" if reroll > 0 else "检测到该段提示词已修改"
                     report.append(f"存档续跑：{原因}，从段 {start + 1} 起重新生成"
                                   + (f"（段 1-{start} 沿用存档）" if start else "（整链重做）"))
                 seeds = [int(s) for s in manifest.get("seeds", [])]
+                # 合并上次未跑完的重摇队列（审片逐段推进场景：ds 只带本次新标记，
+                # 残留队列在 manifest；链结构变化时已随 truncate 清空，此处防御性复验）
+                redo_map = dict(_redo_ds)
+                for x in (manifest.get("redo_queue") or []):
+                    try:
+                        _s, _m = int(x[0]), str(x[1])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    # 防御性复验：槽位/类型/模式/禁用——段标记后被禁用时条目在此
+                    # 滤掉（禁用分支先于队列消费，不滤会永久滞留每次运行都报却永不执行）
+                    if _s not in redo_map and _m in _REDO_MODES \
+                            and off <= _s < done and 0 <= _s - off < len(exec_kinds) \
+                            and exec_kinds[_s - off] == "prompt" \
+                            and not _exec_disabled[_s - off]:
+                        redo_map[_s] = _m
+                if redo_map:
+                    redo_queue = [[s, redo_map[s]] for s in sorted(redo_map)]
+                    _redo_started = True
+                    report.append("选择性重做：" + "、".join(
+                        f"段{s + 1}（{m}）" for s, m in redo_queue)
+                        + "——只重做以上标记段，其余段沿用存档")
                 report.append(f"存档续跑：载入已完成 {done}/{len(exec_items) + off} 段，目录 {root}")
-                if reroll == 0 and seeds:
+                if reroll == 0 and seeds and not redo_map:
                     report.append("控件种子仅在「重跑起始段」> 0 时生效，当前沿用存档种子序列")
         full_hashes = ([prologue_hash] if off else []) + exec_hashes
         # 二采记录沿用：主循环的全量 manifest 覆写必须带上 upscale 键，
@@ -1229,6 +1361,64 @@ class H3SeamlessChainSampler(io.ComfyNode):
         sample_rate = None
         seam_metrics_rows = []   # 每缝五维 z-score（与 seams 列表对齐；无缝/指标不可用为 None）
         memory_anchor_rec = None   # 实验 E2：首段落盘的全局记忆锚记录串，回写 manifest memory_anchor 键
+
+        # 选择性重做支撑：旧记录快照（审片中段 break 时循环内积累的列表短于 done，
+        # 直接写 [:done] 会丢保留段记录，写盘前用 _merged_list 补尾）
+        _old_lists = ({k: list(manifest.get(k) or [])
+                       for k in ("thumbs", "videos", "seams", "bridge_scores",
+                                 "seam_metrics", "trims")}
+                      if (use_ckpt and manifest is not None) else None)
+
+        def _ml(new_lists, upto):
+            """manifest 增量键合并写入：新积累 + 旧记录补尾。"""
+            if _old_lists is None:
+                return {k: list(v)[:upto] for k, v in new_lists.items()}
+            return {k: _merged_list(v, _old_lists.get(k, []), upto)
+                    for k, v in new_lists.items()}
+
+        prev_end_t = None   # 上一处理生成段的输出末端 token 边界（重摇 unlink 段上锚对齐用；序章/插入段重置 None）
+
+        def _redo_prev_bridge(g):
+            """重摇独立镜头段的上锚现算：前段（g-1）存档 latent 尾部切桥。
+
+            unlink 段的前段没为它留 guide（next_wants_bridge=False，guide 变量
+            陈旧），需直读前段存档；前段也在重摇列表时其新 latent 已先落盘
+            （顺序处理），载入即最新。前段是序章/插入段时 prev_end_t=None
+            → 原始尾部（与两处的 guide 更新规则一致）。不可锚返回 None。
+            """
+            prev_g = g - 1
+            if prev_g < 0 or root is None:
+                return None
+            if prev_g >= off and prev_g - off >= len(exec_items):
+                return None
+            try:
+                pv, pa = checkpoint.load_segment(root, prev_g)
+            except Exception:
+                return None
+            return _tail_keyframe(pv.to(video_vae.device), pa.to(audio_vae.device),
+                                  ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
+                                  end_tokens=prev_end_t, full_bridge=full_bridge)
+
+        def _redo_next_anchor(g):
+            """重摇段的下锚现算：下一段保留段存档 latent 裁头后首 token。
+
+            下段不存在/插入段/unlink 段/禁用段/未完成/也在重摇列表 → None（该侧
+            锚自动缺省——转场本就硬切、禁用段不进成片、或由下次重摇自己衔接）。"""
+            nxt_g, ni = g + 1, g + 1 - off
+            if root is None or ni < 0 or ni >= len(exec_items):
+                return None
+            if nxt_g >= done or nxt_g in redo_map:
+                return None
+            kind, idx = exec_items[ni]
+            if kind != "prompt" or seg_unlink[idx] or seg_disabled[idx]:
+                return None
+            try:
+                nv, _na = checkpoint.load_segment(root, nxt_g)
+            except Exception:
+                return None
+            skip2 = 0 if _is_fact_first(ni) else ctx
+            kf = _seam_tail_kf(nv, skip2)
+            return kf.to(video_vae.device) if kf is not None else None
 
         def _up_hi(g, video_t, audio_t, kind, idx, guide_kf, tail_kf, head_kf, cur_seed,
                    skip_f, vis_len, wav, rate):
@@ -1317,7 +1507,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "total": total, "thumbs": [], "videos": [], "prompts": prompt_list,
                         "seams": [None], "bridge_scores": [None], "params": ckpt_params,
                         "seam_metrics": [None], "seam_refine": seam_refine, "experiments": exp.describe(),
-                        "inserts": list(proj_inserts), "upscale": proj_upscale})
+                        "inserts": list(proj_inserts), "upscale": proj_upscale,
+                        "redo_queue": list(redo_queue)})
                 report.append(f"序章：上传视频编码为段 1/{total}（{fc} 帧"
                               + ("，超长仅取前段" if raw_fc > fc else "")
                               + "，经一次 VAE 重编码，按 24fps 处理"
@@ -1407,11 +1598,28 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _seg_t["decode"] += time.perf_counter() - _t
             return frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, lines
 
+        def _is_fact_first(ni):
+            """事实首段判定：ni 位置之前（含序章位）没有任何已执行段。
+            序章存在或前方有插入段/启用提示词段 → 非事实首段（有锚定来源）；
+            禁用段不算已执行段——禁用段 0 时段 1 成为事实首段（不裁头不锚定）。"""
+            if off:
+                return False
+            for j in range(ni):
+                it = exec_items[j]
+                if it[0] == "insert" or not seg_disabled[it[1]]:
+                    return False
+            return True
+
         def _next_wants_bridge(item_i):
             """混排序列中 item_i 的下一段是否接收本段尾帧桥：下段不存在/是插入段/
             是独立镜头提示词段 → False（插入段不吃 guide，独立镜头不要桥）"""
             nxt = exec_items[item_i + 1] if item_i + 1 < len(exec_items) else None
             return bool(nxt) and nxt[0] == "prompt" and not seg_unlink[nxt[1]]
+
+        # E2 记忆锚来源段：第一个启用的提示词段——段 0 禁用时锚从首个执行段取，
+        # 否则全链无锚文件、E2 静默失效（禁用不触发重做，回放段不重落锚是设计内）
+        _anchor_src = next((it[1] for it in exec_items
+                            if it[0] == "prompt" and not seg_disabled[it[1]]), None)
 
         for item_i, item in enumerate(exec_items):
             # ---- 插入视频段：画面+原声进成片，尾帧 latent 桥接指导下一段 ----
@@ -1486,31 +1694,62 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     done = g + 1
                     checkpoint.save_manifest(root, {
                         "schema": checkpoint.SCHEMA, "done": done, "has_prologue": bool(off),
-                        "seeds": list(seeds[:done]), "trims": list(trims[:done]),
+                        "seeds": list(seeds[:done]),
                         "prompt_hashes": full_hashes[:done],
-                        "total": total, "thumbs": list(thumbs[:done]), "videos": list(videos[:done]),
+                        "total": total,
                         "prompts": prompt_list[:done],
-                        "seams": seams[:done], "bridge_scores": bridge_scores[:done],
-                        "seam_metrics": seam_metrics_rows[:done],
                         "params": ckpt_params, "seam_refine": seam_refine, "experiments": exp.describe(),
                         "memory_anchor": memory_anchor_rec,
                         "inserts": list(proj_inserts),
                         "title": proj_title, "created_at": proj_created,
                         "updated_at": time.time(), "finals": list(proj_finals),
                         "upscale": proj_upscale,
+                        "redo_queue": list(redo_queue),
+                        **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
+                               "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
+                               "trims": trims}, done),
                     })
+                prev_end_t = None   # 插入段无 token 对齐末端（重摇上锚回落原始尾部）
                 if review and not ins_replay and item_i + 1 < len(exec_items):
                     report.append(f"审片：段 {g + 1}（插入视频）已完成并落盘 → seg_{g:03d}.mp4；"
                                   "满意请直接重新运行继续下一段")
                     break
                 continue
 
-            i = item[1]   # 提示词段索引（seg_lengths/seg_unlink/seg_label_orders 均按此索引）
+            i = item[1]   # 提示词段索引（seg_lengths/seg_unlink/seg_disabled/seg_label_orders 均按此索引）
             prompt = seg_prompts[i]
             g = item_i + off  # 全局段下标（有序章时序章占 0 号）
-            replay = use_ckpt and g < done
+            # 段禁用（不上链）：槽位占位跳过——不采样/不解码/不进成片；manifest
+            # 记录类列表沿用旧记录（无则空占位）保槽位不错位；done 照常推进
+            #（禁用段视作已处理；段文件缺失由下方 replay 存在性守卫兜底，重新
+            # 上链时自动采样）；guide/prev_tail 不更新 → 下段锚定最近一个已执行
+            # 段的尾帧（与成片实际顺序一致）
+            if seg_disabled[i]:
+                def _old_rec(k, default):
+                    seq = (_old_lists or {}).get(k) or []
+                    return seq[g] if g < len(seq) else default
+                thumbs.append(_old_rec("thumbs", ""))
+                videos.append(_old_rec("videos", ""))
+                seams.append(_old_rec("seams", None))
+                bridge_scores.append(_old_rec("bridge_scores", None))
+                seam_metrics_rows.append(_old_rec("seam_metrics", None))
+                trims.append(_old_rec("trims", 0))
+                if g >= len(seeds):
+                    seeds.append(0)   # 种子占位（与插入段同规则；不执行不消费）
+                if g + 1 > done:
+                    done = g + 1
+                report.append(f"段{g + 1}/{total}：跳过（已禁用，不上链——不采样不进成片，"
+                              "「重新上链」随时恢复）")
+                pbar.update(1)
+                continue
+            # 重摇段不走回放（重新采样）；其余已完成段照常直读存档。
+            # 段文件存在性守卫：禁用段从未生成过（done 却已推进越过它）或存档
+            # 被手动删除时，落回采样分支重新生成——replay 不再因缺文件崩溃
+            _redo_mode = redo_map.get(g)
+            replay = (use_ckpt and g < done and _redo_mode is None
+                      and os.path.exists(checkpoint.seg_path(root, g)))
             next_wants_bridge = _next_wants_bridge(item_i)
-            skip_f = 0 if (item_i == 0 and off == 0) or seg_unlink[i] else ctx
+            skip_f = 0 if _is_fact_first(item_i) or seg_unlink[i] else ctx
             # 首帧图段级引用（中段）：头锚 latent——生成段注入 cond，回放段二采补渲染同用
             #（定义在 replay 分支之前：两路都消费；独立镜头段照常注入，本段主动锚）
             _head_kf = head_frame_latent \
@@ -1525,9 +1764,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, gate_lines = \
                     _decode_crop(i, video_t, audio_t, skip_f, gi=g, next_bridge=next_wants_bridge)
             else:
-                # 种子规则：重摇（重跑起始段>0）用控件种子；否则延续断点种子序列的等差，
-                # 使审片多轮运行与一次跑完逐帧一致；断点无生成段种子（仅序章/新链）才用控件种子
-                if reroll > 0:
+                # 种子规则：重摇段用控件种子（与存档相同则 bump +1，保证每次重摇必变
+                # ——base_hash 随种子变化驱动二采自动重渲）；重摇（重跑起始段>0）用
+                # 控件种子；否则延续断点种子序列的等差，使审片多轮运行与一次跑完
+                # 逐帧一致；断点无生成段种子（仅序章/新链）才用控件种子
+                if _redo_mode is not None:
+                    cur_seed = _redo_seed(seed, i, seeds[g] if g < len(seeds) else None)
+                elif reroll > 0:
                     cur_seed = (seed + i) % 0xffffffffffffffff
                 elif len(seeds) > off:
                     cur_seed = (seeds[-1] + g - len(seeds) + 1) % 0xffffffffffffffff
@@ -1572,13 +1815,31 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _seg_t["cond"] += time.perf_counter() - _t
 
                 cond, latent = out[0], out[1]
-                # 独立镜头段：上段桥不注入（guide 屏蔽为 None）；每段尾帧锚定是用户主动
-                # 设定的本段结尾身份锚点，与段间衔接无关，不受断链影响
-                eff_guide = None if seg_unlink[i] else guide
-                # 尾帧图片（FL2VA 剧情终点/段级尾锚）：勾了尾帧图的段末帧 keyframe
-                # = 尾帧图 latent（同位置唯一锚，优先于每段尾帧锚定）；未勾段回落尾锚
-                _tail_kf = end_frame_latent if (seg_end_on[i] and end_frame_latent is not None) \
-                    else tail_anchor_latent
+                # 锚定来源：普通段 = 段属性（unlink 屏蔽上桥、尾帧图/每段尾帧锚定收尾）；
+                # 重摇段 = 四种锚定模式（本次重做的临时策略，独立于段属性 unlink）——
+                # 显式身份锚（尾帧图/每段尾帧锚定/首帧图）不受模式影响，模式只控制接缝锚
+                if _redo_mode is not None:
+                    _user_tail = end_frame_latent \
+                        if (seg_end_on[i] and end_frame_latent is not None) else tail_anchor_latent
+                    if _redo_mode in ("双锚", "仅锚上段"):
+                        # unlink 前段没为它留 guide（陈旧），需直读前段存档现算尾桥
+                        eff_guide = _redo_prev_bridge(g) if seg_unlink[i] else guide
+                    else:
+                        eff_guide = None
+                    if _user_tail is not None:
+                        _tail_kf = _user_tail
+                    elif _redo_mode in ("双锚", "仅锚下段"):
+                        _tail_kf = _redo_next_anchor(g)   # 下段不可锚自动缺省 None
+                    else:
+                        _tail_kf = None
+                else:
+                    # 独立镜头段：上段桥不注入（guide 屏蔽为 None）；每段尾帧锚定是用户主动
+                    # 设定的本段结尾身份锚点，与段间衔接无关，不受断链影响
+                    eff_guide = None if seg_unlink[i] else guide
+                    # 尾帧图片（FL2VA 剧情终点/段级尾锚）：勾了尾帧图的段末帧 keyframe
+                    # = 尾帧图 latent（同位置唯一锚，优先于每段尾帧锚定）；未勾段回落尾锚
+                    _tail_kf = end_frame_latent if (seg_end_on[i] and end_frame_latent is not None) \
+                        else tail_anchor_latent
                 if eff_guide is not None or _tail_kf is not None or _head_kf is not None:
                     # 实验 E1：强化引导桥——把单桥展开为滑窗/重叠 keyframe 序列。
                     # 全关时 e1_kfs=None，_apply_guide 走现状单桥路径（零影响）。
@@ -1803,7 +2064,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # token 的视频 latent 落盘为全局记忆锚（供后续段 load_memory_anchor 注入）。
             # 整链重做/首段重做即重落（truncate(0) 已清旧锚文件）。沿用 latent 数值均值/方差
             # 构造哈希（同 prologue_hash 思路），参与 manifest memory_anchor 键回写。
-            if (exp.has("e2_memory_anchor") and root and not replay and i == 0
+            if (exp.has("e2_memory_anchor") and root and not replay and i == _anchor_src
                     and not seg_unlink[i]):
                 _mem_t = experiments.memory_tokens(
                     int(exp.param("e2_memory_anchor", "记忆帧数", 2)), frames_to_latent_t)
@@ -1816,12 +2077,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # 二采在段视频落盘前接管：成功/记录沿用则段视频即高清结果（同名覆盖），
                 # 失败才回退基础分辨率保存（fresh 强制重编码，覆盖可能写坏的 mp4）
                 # 尾锚/头锚与基础链同规则：尾帧图段=尾帧图（同位置唯一锚不叠加）、
-                # 其余段=每段尾帧锚定；中段首帧图=头锚——回放段也可能补渲染，就地重算
-                _up_tail_kf = end_frame_latent \
-                    if (seg_end_on[i] and end_frame_latent is not None) \
-                    else tail_anchor_latent
+                # 其余段=每段尾帧锚定；中段首帧图=头锚——回放段也可能补渲染，就地重算；
+                # 重摇段直接复用采样的 eff 锚（eff_guide/_tail_kf）——二采重采样锚与
+                # 基础链采样锚一致，基础/高清接缝行为不漂移
+                if _redo_mode is not None:
+                    _up_guide_kf, _up_tail_kf = eff_guide, _tail_kf
+                else:
+                    _up_guide_kf = None if seg_unlink[i] else guide
+                    _up_tail_kf = end_frame_latent \
+                        if (seg_end_on[i] and end_frame_latent is not None) \
+                        else tail_anchor_latent
                 hi_ready, hi_tried = _up_hi(g, video_t, audio_t, "prompt", i,
-                                            None if seg_unlink[i] else guide, _up_tail_kf, _head_kf,
+                                            _up_guide_kf, _up_tail_kf, _head_kf,
                                             cur_seed, skip_f, frames.shape[0],
                                             wav, sample_rate)
                 if not hi_ready:
@@ -1845,6 +2112,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 note = "guide=无（首段）"
             if seg_unlink[i]:
                 note = "guide=无（独立镜头断链）"
+            if _redo_mode is not None:
+                note = f"重摇（{_redo_mode}）：首锚{'上段尾帧桥' if eff_guide is not None else '无'}" \
+                       f" · 尾锚{'接下段' if _tail_kf is not None else '无'} · 其余段保留存档"
             origin = "存档载入" if replay else f"采样{latent_t_to_frames(video_t.shape[2])}帧"
             seed_txt = cur_seed if cur_seed is not None else "—"
             report.append(f"段{g + 1}/{total}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧({frames.shape[0] / 24:.1f}s)"
@@ -1856,56 +2126,83 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           f" · 基础解码 {_seg_t['decode']:.0f}s"
                           + (f" · TE缓存 命中{clip.hits}/未中{clip.misses}" if clip.hits or clip.misses else ""))
 
+            # 生成段输出末端 token 边界（重摇 unlink 段上锚现算对齐用）
+            prev_end_t = end_t
+
             if next_wants_bridge:
                 # end_tokens=kept 末端：锚定末端与输出末端重合（回退量已含在 vis_len 里）
                 guide = _tail_keyframe(video_t, audio_t, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
                                        end_tokens=end_t, full_bridge=full_bridge)
 
             if use_ckpt and not replay:
-                done = g + 1
+                # 选择性重做不倒退进度：重摇段完成后 done 保持全链完成数
+                #（保留段的 done 记录与新 latent 同为有效进度）
+                if g + 1 > done:
+                    done = g + 1
+                if _redo_mode is not None:
+                    # 队列逐段消费（原子落盘：审片中段 break 后剩余队列仍在 manifest，
+                    # 前端据此显示「待重摇」徽章与「继续重摇剩余 N 段」入口）
+                    redo_queue = [x for x in redo_queue if int(x[0]) != g]
                 checkpoint.save_manifest(root, {
                     "schema": checkpoint.SCHEMA, "done": done, "has_prologue": bool(off),
-                    "seeds": list(seeds[:done]), "trims": list(trims[:done]),
+                    "seeds": list(seeds[:done]),
                     "prompt_hashes": full_hashes[:done],
-                    "total": total, "thumbs": list(thumbs[:done]), "videos": list(videos[:done]),
+                    "total": total,
                     "prompts": prompt_list[:done],
-                    "seams": seams[:done], "bridge_scores": bridge_scores[:done],
-                    "seam_metrics": seam_metrics_rows[:done],
                     "params": ckpt_params, "seam_refine": seam_refine, "experiments": exp.describe(),
                     "memory_anchor": memory_anchor_rec,
                     "inserts": list(proj_inserts),
                     "title": proj_title, "created_at": proj_created,
                     "updated_at": time.time(), "finals": list(proj_finals),
                     "upscale": proj_upscale,
+                    "redo_queue": list(redo_queue),
+                    **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
+                           "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
+                           "trims": trims}, done),
                 })
 
             pbar.update(1)
 
             if review and not replay and item_i + 1 < len(exec_items):
-                report.append(f"审片：段 {g + 1} 已完成并落盘 → 看项目文件夹里的 seg_{g:03d}.mp4；"
-                              f"满意请直接重新运行继续段 {g + 2}；不满意：改该段提示词后运行（自动从本段重跑），"
-                              f"或设「重跑起始段={g + 1}」+ 换种子重摇")
+                if _redo_mode is not None:
+                    _left = len(redo_queue)
+                    report.append(f"重摇：段 {g + 1} 已重做并落盘 → seg_{g:03d}.mp4"
+                                  + (f"；剩余 {_left} 段待重摇，满意请重新运行继续重摇下一段"
+                                     if _left else "；重摇队列已全部完成")
+                                  + "；全部确认后运行一次自动重拼全片（或用合并导出）")
+                else:
+                    report.append(f"审片：段 {g + 1} 已完成并落盘 → 看项目文件夹里的 seg_{g:03d}.mp4；"
+                                  f"满意请直接重新运行继续段 {g + 2}；不满意：改该段提示词后运行（自动从本段重跑），"
+                                  f"或设「重跑起始段={g + 1}」+ 换种子重摇")
                 break
+
+        # 禁用段（不上链）全局槽位集：成片与二采拼接同口径剔除（执行跳过的段不进片）
+        _off_slots = {item_i + off for item_i, it in enumerate(exec_items)
+                      if it[0] == "prompt" and seg_disabled[it[1]]}
+        # 成片应含段数 = 序章（如有）+ 实际执行段（禁用段不执行不进成片）
+        _final_segs = total - len(_off_slots)
 
         if use_ckpt:
             # 兜底回写：纯回放运行（无新段）也会重解码全部段，把缩略图/分段视频/指标
             # 等增量键补齐——旧版本存档的 manifest 缺这些键时由此自愈，无需重跑整链
             checkpoint.save_manifest(root, {
                 "schema": checkpoint.SCHEMA, "done": done, "has_prologue": bool(off),
-                "seeds": list(seeds[:done]), "trims": list(trims[:done]),
+                "seeds": list(seeds[:done]),
                 "prompt_hashes": full_hashes[:done],
-                "total": total, "thumbs": list(thumbs[:done]), "videos": list(videos[:done]),
+                "total": total,
                 "prompts": prompt_list[:done],
-                "seams": seams[:done], "bridge_scores": bridge_scores[:done],
-                "seam_metrics": seam_metrics_rows[:done],
                 "params": ckpt_params, "seam_refine": seam_refine, "experiments": exp.describe(),
                 "inserts": list(proj_inserts),
                 "title": proj_title, "created_at": proj_created,
                 "updated_at": time.time(), "finals": list(proj_finals),
                 "upscale": proj_upscale,
+                "redo_queue": list(redo_queue),
+                **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
+                       "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
+                       "trims": trims}, done),
             })
             if review:
-                if len(seg_frames) == total:
+                if len(seg_frames) == _final_segs:
                     report.append("审片：本链已全部完成")
                 if reroll > 0:
                     report.append(f"注意：「重跑起始段」={reroll} 已生效，确认无误后请改回 0")
@@ -1914,26 +2211,41 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                    "review": bool(review), "reroll": reroll,
                                    "report": "\n".join(report), "updated_at": time.time()})
 
-        images = torch.cat(all_frames, dim=0)
+        if all_frames:
+            images = torch.cat(all_frames, dim=0)
+        else:
+            # 全禁用链：无帧可拼——单帧黑场占位保下游节点不崩，报告说明（无成片内容）
+            images = torch.zeros(1, height, width, 3)
+            if all_wav is None:
+                all_wav = torch.zeros(1, 2, 24000)
+                sample_rate = 24000
+            report.append("注意：所有段均已禁用（不上链）——输出为单帧黑场占位，无成片内容")
         # 自动成片：完整链（或审片已确认部分）编码成片，直接落项目文件夹。
         # 二采开启且全链高清记录齐时优先流式拼接高清分段（单份产物，成片=二采结果）；
         # 链未完成/记录不齐/尺寸混排/拼接失败回退内存帧编码基础分辨率成片。
-        # 由「自动成片」独立开关控制（与「自动保存」解耦）：关闭则完全不成片
+        # 禁用段两路同口径剔除：高清拼接传 skip_slots，内存帧本就不含禁用段
         if autosave_final:
-            if not (up_cfg and upscale.try_final(root, up_cfg, report)):
-                final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate,
-                                               crf=_bcrf, preset=_bpreset, aq_mode=_baq,
-                                               dither=_bdith)
-                if final_name:
-                    proj_finals.append(os.path.basename(final_name))
-                    mf = checkpoint.load_manifest(root) or {}
-                    mf["finals"] = list(proj_finals)
-                    checkpoint.save_manifest(root, mf)
-                    report.append(f"自动保存：分段与成片已就绪 → {root}"
-                                  f"（seg_XXX.mp4 逐段，{os.path.basename(final_name)} 完整成片）")
+            if not (up_cfg and upscale.try_final(root, up_cfg, report, skip_slots=_off_slots)):
+                if _redo_started and len(seg_frames) < _final_segs:
+                    # 重摇审片中段 break：内存帧只有已处理段，编码会产出半截成片污染
+                    # finals；重摇段 mp4 已覆盖、保留段沿用，全部分段都在盘——下次
+                    # 全链运行（redo 队列清空）自动重拼全片，或用合并导出即时取片
+                    report.append("重摇：本次为部分重做（审片中段），跳过自动成片——"
+                                  "剩余段全部确认后运行一次自动重拼全片，或用合并导出")
                 else:
-                    err_detail = f"（{enc_err}）" if enc_err else ""
-                    report.append(f"自动保存：成片编码失败{err_detail}，分段 mp4 不受影响")
+                    final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate,
+                                                   crf=_bcrf, preset=_bpreset, aq_mode=_baq,
+                                                   dither=_bdith)
+                    if final_name:
+                        proj_finals.append(os.path.basename(final_name))
+                        mf = checkpoint.load_manifest(root) or {}
+                        mf["finals"] = list(proj_finals)
+                        checkpoint.save_manifest(root, mf)
+                        report.append(f"自动保存：分段与成片已就绪 → {root}"
+                                      f"（seg_XXX.mp4 逐段，{os.path.basename(final_name)} 完整成片）")
+                    else:
+                        err_detail = f"（{enc_err}）" if enc_err else ""
+                        report.append(f"自动保存：成片编码失败{err_detail}，分段 mp4 不受影响")
             # 状态指针重写：带上自动保存/二采成片的报告行（此前的 save_state 在其之前）
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
                                    "review": bool(review), "reroll": reroll,

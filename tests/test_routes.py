@@ -22,7 +22,8 @@ from test_node_structure import _install_stubs
 ROUTE_SET = {"/h3chain/ping", "/h3chain/projects", "/h3chain/project",
              "/h3chain/upscale_models", "/h3chain/experiments", "/h3chain/create_project",
              "/h3chain/save_prompts", "/h3chain/delete", "/h3chain/delete_project",
-             "/h3chain/delete_file", "/h3chain/merge", "/h3chain/upscale_reset"}
+             "/h3chain/delete_file", "/h3chain/merge", "/h3chain/upscale_reset",
+             "/h3chain/redo_cancel"}
 # 新版前端 api.fetchApi() 强制给非 /api 路径加 /api 前缀（ComfyApi.apiURL），
 # 自定义路由必须同时挂 /api 副本，否则新前端全部 404
 API_ROUTE_SET = {"/api" + p for p in ROUTE_SET}
@@ -329,6 +330,42 @@ def test_upscale_reset_endpoint():
         for bad in ({"dir": "甲", "seg": "x"}, {"dir": "甲", "seg": 0},
                     {"dir": "甲", "seg": 3}, {"dir": "nope", "seg": 1},
                     {"dir": "../up", "seg": 1}, {"dir": "", "seg": 1}, {}):
+            resp = asyncio.run(handler(_Req(bad)))
+            assert resp["status"] == 400, bad
+            assert "error" in resp["json"]
+
+
+def test_redo_cancel_endpoint():
+    """重摇队列撤销端点：移除指定槽位条目（幂等，不在队列也成功）；非法 -> 400。"""
+    with _server_env() as (out, router):
+        handler = router.table["/h3chain/redo_cancel"]
+        _mk_project(out, "乙", {"schema": "h3seamless/ckpt-v3", "done": 3, "total": 3,
+                                "redo_queue": [[1, "双锚"], [2, "仅锚上段"]]})
+
+        resp = asyncio.run(handler(_Req({"dir": "乙", "slot": 1})))
+        assert resp["json"]["ok"] is True
+        assert resp["json"]["manifest"]["redo_queue"] == [[2, "仅锚上段"]]   # 槽1已移除，槽2保留
+
+        # 幂等：同槽位再撤一次（已不在队列）依旧成功，队列不变
+        resp = asyncio.run(handler(_Req({"dir": "乙", "slot": 1})))
+        assert resp["json"]["ok"] is True
+        assert resp["json"]["manifest"]["redo_queue"] == [[2, "仅锚上段"]]
+
+        # 落盘持久：重新从磁盘读 manifest 验证（而非仅响应回显）
+        with open(os.path.join(out, "h3_projects", "乙", "manifest.json"),
+                  encoding="utf-8") as f:
+            assert json.load(f)["redo_queue"] == [[2, "仅锚上段"]]
+
+        # 队列无此键的旧存档：撤销后写入空列表（防御性归一）
+        _mk_project(out, "丙", {"schema": "h3seamless/ckpt-v3", "done": 2, "total": 2})
+        resp = asyncio.run(handler(_Req({"dir": "丙", "slot": 0})))
+        assert resp["json"]["ok"] is True
+        assert resp["json"]["manifest"]["redo_queue"] == []
+
+        # 槽位/项目名非法 -> 400（ValueError 映射）
+        for bad in ({"dir": "乙", "slot": "x"}, {"dir": "乙", "slot": -1},
+                    {"dir": "乙"}, {"dir": "nope", "slot": 0},
+                    {"dir": "../up", "slot": 0}, {"dir": "", "slot": 0}, {}):
             resp = asyncio.run(handler(_Req(bad)))
             assert resp["status"] == 400, bad
             assert "error" in resp["json"]

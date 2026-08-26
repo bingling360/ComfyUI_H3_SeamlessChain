@@ -5,7 +5,7 @@ let src = fs.readFileSync(path.join(__dirname, "../web/h3_director.js"), "utf8")
 src = src
     .replace('import { app } from "/scripts/app.js";', "const app = { graph: null, registerExtension() {} };")
     .replace('import { api } from "/scripts/api.js";', "const api = { addEventListener() {}, fetchApi: async () => ({ ok: true }) };");
-const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapOldWidgetValuesToCurrent, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, toggleUpscaleInclude, upTargetCanvas, defaultExperiments, normalizeExperiments, expActiveList, expLocked, parseMasterPrompt, exportMasterPrompt, applyMasterPrompt };")(() => {}, () => true);
+const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapOldWidgetValuesToCurrent, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, toggleUpscaleInclude, upTargetCanvas, defaultExperiments, normalizeExperiments, expActiveList, expLocked, parseMasterPrompt, exportMasterPrompt, applyMasterPrompt, planOff, redoMap, redoSlotValid, redoPending, redoQueued, reorderChain, nudgeIns };")(() => {}, () => true);
 let fails = 0;
 function eq(name, got, want) {
     const ok = JSON.stringify(got) === JSON.stringify(want);
@@ -217,6 +217,76 @@ const nodeZ = { widgets: [
     { name: "宽高比", value: "自定义" }, { name: "宽度", value: 864 }, { name: "高度", value: 480 },
 ] };
 eq("自定义仍读宽高控件", mod.upTargetCanvas(nodeZ, 2), "1728×960");
+
+/* ---- 选择性重做（重摇标记）：槽位校验 / 标记合并 / 计数（与后端 _parse_redo_segs 同口径） ---- */
+const mkPlan = (kinds) => kinds.map((k) => ({ kind: k }));
+/* 无序章：done=3（前 3 段完成，第 2 段是插入段） */
+const rd = {
+    ds: { redo_segs: [{ slot: 0, mode: "双锚" }, { slot: 1, mode: "无锚" }, { slot: 5, mode: "仅锚上段" }] },
+    mf: { done: 3, redo_queue: [[2, "双锚"], [3, "无锚"]] },   // 槽3未完成 → 计数剔除
+    plan: mkPlan(["prompt", "insert", "prompt", "prompt", "prompt", "prompt"]),
+};
+eq("planOff 无序章", mod.planOff(rd.mf), 0);
+eq("redoMap 队列+ds合并（Map插入序：队列先）", [...mod.redoMap(rd.ds, rd.mf)],
+    [[2, "双锚"], [3, "无锚"], [0, "双锚"], [1, "无锚"], [5, "仅锚上段"]]);
+eq("redoMap ds覆盖同槽位队列", mod.redoMap({ redo_segs: [{ slot: 1, mode: "无锚" }] },
+    { redo_queue: [[1, "仅锚上段"]] }).get(1), "无锚");
+ok("槽0 已完成提示词段可重摇", mod.redoSlotValid(0, rd.mf, rd.plan));
+ok("槽1 插入段不可重摇", !mod.redoSlotValid(1, rd.mf, rd.plan));
+ok("槽2 已完成提示词段可重摇", mod.redoSlotValid(2, rd.mf, rd.plan));
+ok("槽3 未完成段不可重摇", !mod.redoSlotValid(3, rd.mf, rd.plan));
+ok("槽9 越界不可重摇", !mod.redoSlotValid(9, rd.mf, rd.plan));
+eq("redoPending 只计有效ds标记", mod.redoPending(rd), 1);   // 槽0 有效；槽1插入/槽5未完成剔除
+eq("redoQueued 只计有效队列条目", mod.redoQueued(rd), 1);   // 槽2 有效；槽3未完成剔除
+/* redoMap 非法 mode 回落双锚 / 非数组条目忽略（防旧存档脏数据，显示层兜底） */
+eq("redoMap 非法mode回落", [...mod.redoMap({ redo_segs: [{ slot: 0, mode: "全锚" }] },
+    { redo_queue: [[1, "乱写"], "bad", [2]] })],
+    [[1, "双锚"], [2, "双锚"], [0, "双锚"]]);
+/* 序章项目：全局槽 0=序章不可重摇，plan 索引 0=全局槽 1 */
+const rdP = {
+    ds: { redo_segs: [{ slot: 0, mode: "双锚" }, { slot: 1, mode: "双锚" }] },
+    mf: { done: 3, has_prologue: true, redo_queue: [] },
+    plan: mkPlan(["prompt", "prompt"]),
+};
+eq("planOff 序章", mod.planOff(rdP.mf), 1);
+ok("序章槽0不可重摇", !mod.redoSlotValid(0, rdP.mf, rdP.plan));
+ok("序章后首段=全局槽1", mod.redoSlotValid(1, rdP.mf, rdP.plan));
+eq("序章项目标记计数", mod.redoPending(rdP), 1);
+/* 空 ds / 空 manifest：全部归零不抛异常 */
+eq("空数据计数", [mod.redoPending({}), mod.redoQueued({})], [0, 0]);
+
+/* ---- 拖拽调序（reorderChain）：新序位 k = 线上方其余提示词段数；插入段位置固定 ---- */
+const mkPlanIdx = (kinds) => {
+    let n = 0;
+    return kinds.map((k) => (k === "prompt" ? { kind: k, idx: n++ } : { kind: k }));
+};
+const rP = mkPlanIdx(["prompt", "insert", "prompt", "prompt"]);   // P0 I P1 P2
+eq("拖尾段到顶", mod.reorderChain([0, 1, 2], rP, 2, 0), [2, 0, 1]);
+eq("拖首段到尾", mod.reorderChain([0, 1, 2], rP, 0, 4), [1, 2, 0]);
+eq("拖首段跨插入段到P1后", mod.reorderChain([0, 1, 2], rP, 0, 3), [1, 0, 2]);
+eq("拖中段到顶", mod.reorderChain([0, 1, 2], rP, 1, 0), [1, 0, 2]);
+eq("拖中段到尾", mod.reorderChain([0, 1, 2], rP, 1, 4), [0, 2, 1]);
+eq("原位不动（线在自身上沿）", mod.reorderChain([0, 1, 2], rP, 1, 2), null);
+eq("跨插入段但未跨提示词段=原位", mod.reorderChain([0, 1, 2], rP, 0, 2), null);
+eq("非法dragIdx", mod.reorderChain([0, 1, 2], rP, 5, 1), null);
+eq("非法ins", mod.reorderChain([0, 1, 2], rP, 0, 9), null);
+eq("非数组入参", [mod.reorderChain(null, rP, 0, 1), mod.reorderChain([0, 1], null, 0, 1)], [null, null]);
+eq("dragIdx非提示词段", mod.reorderChain([0, 1, 2], mkPlan(["insert", "prompt", "prompt"]), 0, 1), null);
+
+/* ---- ⬆/⬇ 兜底调序（nudgeIns）：名次换位落线，跨插入段，边界返回 null ---- */
+const nd = { plan: rP };   // P0 I P1 P2（plan 长 4，提示词段名次 0/1/2）
+eq("⬆ 首段不可移", mod.nudgeIns(nd, 0, true), null);
+eq("⬇ 尾段不可移", mod.nudgeIns(nd, 2, false), null);
+eq("⬆ P1（跨插入段）→ 线在P0前", mod.nudgeIns(nd, 1, true), 0);
+eq("⬇ P1 → 线在链尾", mod.nudgeIns(nd, 1, false), 4);
+eq("⬆ P2 → 线在P1前", mod.nudgeIns(nd, 2, true), 2);
+eq("⬇ P0 → 线在P2前", mod.nudgeIns(nd, 0, false), 3);
+eq("⬇ 倒数第二段（无下下名次）→ 线在链尾", mod.nudgeIns({ plan: mkPlanIdx(["prompt", "prompt", "insert"]) }, 0, false), 3);
+eq("非法dragIdx", mod.nudgeIns(nd, 9, true), null);
+/* 与 reorderChain 联动：⬆/⬇ 算出的线喂给 reorderChain 必须得到换位结果 */
+eq("联动 ⬆ P1", mod.reorderChain([0, 1, 2], rP, 1, mod.nudgeIns(nd, 1, true)), [1, 0, 2]);
+eq("联动 ⬇ P1", mod.reorderChain([0, 1, 2], rP, 1, mod.nudgeIns(nd, 1, false)), [0, 2, 1]);
+eq("联动 ⬇ P0（跨插入段）", mod.reorderChain([0, 1, 2], rP, 0, mod.nudgeIns(nd, 0, false)), [1, 0, 2]);
 
 /* ---- 总提示词（parseMasterPrompt / exportMasterPrompt / applyMasterPrompt） ---- */
 const mp1 = mod.parseMasterPrompt("【段1】\n场景：黄昏教室\n角色：短发少女\n提示词：推近。\n少女说「好」。\n\n【第2段】\n环境音：蝉鸣\n时长：6\n提示词：拉远。");

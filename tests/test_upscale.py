@@ -1043,6 +1043,57 @@ def test_try_final_uses_selected_encode_profile(monkeypatch):
         assert "1280×720" in report[-1]
 
 
+def test_try_final_skips_disabled_slots(monkeypatch):
+    """段禁用（不上链）：skip_slots 槽位不校验不拼接——禁用段无记录不阻塞全片高清，
+    有旧记录也不混进成片；全禁用时无可拼段返回 False。"""
+    with _env() as (out, _):
+        from ComfyUI_H3_SeamlessChain import media
+
+        root = os.path.join(out, "h3_projects", "跳禁用")
+        os.makedirs(root)
+        cfg = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth"}})
+        ph = upscale.params_hash(cfg)
+        f0, f2 = checkpoint.upscale_files(0), checkpoint.upscale_files(2)
+        checkpoint.save_manifest(root, {
+            "schema": "h3seamless/ckpt-v3", "done": 3, "total": 3,
+            "prompt_hashes": ["a", "b", "c"], "seeds": [1, 2, 3],
+            "upscale": {"segs": [
+                {"hash": ph, "base_hash": "a|1", "done": True,
+                 "size": [1280, 720], "files": f0},
+                None,   # 禁用段：无任何高清记录
+                {"hash": ph, "base_hash": "c|3", "done": True,
+                 "size": [1280, 720], "files": f2}]}})
+        for files in (f0, f2):
+            for name in files.values():
+                open(os.path.join(root, name), "wb").close()
+
+        # 不传 skip：段1 无有效记录 -> 阻塞回退（旧行为，向后兼容）
+        report = []
+        assert upscale.try_final(root, cfg, report) is False
+        assert "无有效高清记录" in report[-1]
+
+        called = {}
+
+        def fake_concat(sources, out_path, **kwargs):
+            called["sources"] = sources
+            called["out_path"] = out_path
+            return True
+
+        monkeypatch.setattr(media, "probe_video_size", lambda _p: (1280, 720))
+        monkeypatch.setattr(media, "concat_av_mp4", fake_concat)
+        # 传 skip={1}：禁用段不校验不拼接，其余齐 -> 拼出全片高清
+        report = []
+        assert upscale.try_final(root, cfg, report, skip_slots={1}) is True
+        assert called["sources"] == [os.path.join(root, f0["mp4"]),
+                                     os.path.join(root, f2["mp4"])]
+        assert "剔除禁用段 1 段" in report[-1]
+
+        # 全禁用：无可拼段 -> False
+        report = []
+        assert upscale.try_final(root, cfg, report, skip_slots={0, 1, 2}) is False
+        assert "所有段均已禁用" in report[-1]
+
+
 def test_upscale_reset():
     with _env() as (out, _):
         root = os.path.join(out, "h3_projects", "乙")

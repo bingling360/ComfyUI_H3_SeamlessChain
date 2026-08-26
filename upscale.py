@@ -1442,13 +1442,17 @@ def _load_frame_png(path, device=None):
         return None
 
 
-def try_final(root, cfg, report):
+def try_final(root, cfg, report, skip_slots=None):
     """全链段高清记录齐且尺寸一致时，流式拼接 seg_*.mp4 -> final_时间戳.mp4。
 
+    skip_slots=不进成片的槽位集合（段禁用「不上链」）：跳过这些段的记录
+    校验与拼接——禁用段无记录不阻塞全片高清，有旧记录也不混进成片
+    （与基础分辨率成片口径一致：禁用段不进成片）。
     返回 True 表示已产出高清成片（调用方跳过基础分辨率成片编码，单份产物）；
     链未完成 / 记录不齐 / 尺寸不一致（混排手动二采）/ 编码失败均返回 False
     （回退主循环内存帧编码基础成片，分段高清不受影响）。
     """
+    skip = {int(s) for s in (skip_slots or [])}
     mf = checkpoint.load_manifest(root) or {}
     total = int(mf.get("total") or 0)
     done = int(mf.get("done") or 0)
@@ -1459,16 +1463,20 @@ def try_final(root, cfg, report):
     if len(segs) < total:
         report.append("二采成片：分段高清记录不全（手动模式未全选），成片按基础分辨率编码")
         return False
-    for g in range(total):
+    use = [g for g in range(total) if g not in skip]
+    if not use:
+        report.append("二采成片：所有段均已禁用（不上链），无成片可拼")
+        return False
+    for g in use:
         if not _record_valid(segs, root, g, ph, base_hash(mf, g)):
             report.append("二采成片：部分段无有效高清记录（手动模式未全选或记录失效），"
                           "成片按基础分辨率编码")
             return False
-    size0 = segs[0].get("size") or [None, None]
-    if any((segs[g].get("size") or [None, None]) != size0 for g in range(total)):
+    size0 = segs[use[0]].get("size") or [None, None]
+    if any((segs[g].get("size") or [None, None]) != size0 for g in use):
         report.append("二采成片：分段高清尺寸不一致（手动模式混排），成片按基础分辨率编码")
         return False
-    sources = [os.path.join(root, segs[g]["files"]["mp4"]) for g in range(total)]
+    sources = [os.path.join(root, segs[g]["files"]["mp4"]) for g in use]
     out_name = f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
     try:
         from . import media
@@ -1490,8 +1498,9 @@ def try_final(root, cfg, report):
         fresh["upscale"] = up_state
         fresh["updated_at"] = time.time()
         checkpoint.save_manifest(root, fresh)
-        report.append(f"二采成片：{total} 段高清流式拼接 → {out_name}"
-                      f"（{sz[0]}×{sz[1]}，音轨沿用原声）")
+        report.append(f"二采成片：{len(use)} 段高清流式拼接 → {out_name}"
+                      f"（{sz[0]}×{sz[1]}，音轨沿用原声）"
+                      + (f"，剔除禁用段 {len(skip)} 段" if len(use) < total else ""))
         return True
     report.append(f"二采成片编码失败（{media.last_error}）——回退编码基础分辨率成片，"
                   "分段高清不受影响")

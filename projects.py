@@ -218,6 +218,41 @@ def upscale_reset(name, seg):
     return manifest
 
 
+def redo_cancel(name, slot):
+    """从 manifest 重摇队列移除某段（撤销已提交未执行的重摇标记）。
+
+    slot 是 0-based 全局槽位（与 redo_queue 条目、前端 ds.redo_segs 同口径）。
+    幂等：槽位不在队列时同样返回成功（前端「取消重摇标记」统一走此口，
+    覆盖 ds 标记与已入队条目两种来源）。只改 manifest，不动段 latent 存档
+    与已成产物。项目/槽位非法抛 ValueError（路由层映射 400）。
+    """
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    try:
+        s = int(slot)
+    except (TypeError, ValueError):
+        raise ValueError(f"槽位必须是整数：{slot!r}") from None
+    if s < 0:
+        raise ValueError("槽位从 0 开始（0-based 全局槽位）")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    kept = []
+    for x in (manifest.get("redo_queue") or []):
+        try:
+            if int(x[0]) == s:
+                continue
+        except (TypeError, ValueError, IndexError):
+            pass
+        kept.append(x)
+    manifest["redo_queue"] = kept
+    manifest["updated_at"] = time.time()
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
 def _merge_sources(root: str, manifest: dict, items):
     """合并清单 -> 按序绝对路径列表。非法/缺失抛 ValueError。
 
