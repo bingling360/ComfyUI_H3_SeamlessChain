@@ -1422,16 +1422,21 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         def _up_hi(g, video_t, audio_t, kind, idx, guide_kf, tail_kf, head_kf, cur_seed,
                    skip_f, vis_len, wav, rate):
-            """二采渲染段 g 并落盘高清产物（序章/插入段/生成段统一入口）。
+            """二采渲染段 g 并落盘高清产物（仅生成段；序章/插入视频等外部素材段跳过）。
 
             返回 (ready, tried)：ready=True 表示高清产物已在盘（本次渲染成功或
             记录有效沿用——调用方跳过基础分辨率保存，段视频就是二采结果）；
             ready=False 且 tried=True 表示渲染失败（调用方基础保存强制重编码，
-            覆盖可能写坏的 mp4 自愈）；范围外/关闭时 (False, False) 正常基础保存。
+            覆盖可能写坏的 mp4 自愈）；范围外/关闭/外部素材段 (False, False) 正常基础保存。
             proj_upscale 原地更新（写盘最新 upscale 存档状态）。
             """
             nonlocal proj_upscale
             if not (up_cfg and use_ckpt):
+                return False, False
+            # 外部素材段（序章/插入视频）不做二采：内容本就是成品视频，VAE 重编码
+            # 后再做神经放大+低强度重采样只引入二次损失；成片拼接时这些段按需
+            # reformat 缩放对齐（upscale.try_final 混合源处理）
+            if kind != "prompt":
                 return False, False
             if not upscale.in_scope(up_cfg, g):
                 return False, False

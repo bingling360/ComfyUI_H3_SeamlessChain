@@ -1443,14 +1443,16 @@ def _load_frame_png(path, device=None):
 
 
 def try_final(root, cfg, report, skip_slots=None):
-    """全链段高清记录齐且尺寸一致时，流式拼接 seg_*.mp4 -> final_时间戳.mp4。
+    """全链段高清记录齐时流式拼接 seg_*.mp4 -> final_时间戳.mp4。
 
     skip_slots=不进成片的槽位集合（段禁用「不上链」）：跳过这些段的记录
     校验与拼接——禁用段无记录不阻塞全片高清，有旧记录也不混进成片
     （与基础分辨率成片口径一致：禁用段不进成片）。
-    返回 True 表示已产出高清成片（调用方跳过基础分辨率成片编码，单份产物）；
-    链未完成 / 记录不齐 / 尺寸不一致（混排手动二采）/ 编码失败均返回 False
-    （回退主循环内存帧编码基础成片，分段高清不受影响）。
+    外部素材段（序章/插入视频）本版起不做二采：无记录时按基础分辨率分段
+    直通，拼接时统一 reformat 缩放到目标画幅；旧版存档里已二采过的记录
+    仍沿用（记录有效=文件已是高清）。生成段（提示词段）必须有有效高清
+    记录，缺任一段回退主循环内存帧编码基础分辨率成片（分段高清不受影响）。
+    返回 True 表示已产出高清成片（调用方跳过基础分辨率成片编码，单份产物）。
     """
     skip = {int(s) for s in (skip_slots or [])}
     mf = checkpoint.load_manifest(root) or {}
@@ -1460,35 +1462,50 @@ def try_final(root, cfg, report, skip_slots=None):
         return False
     ph = params_hash(cfg)
     segs = _records(mf)
-    if len(segs) < total:
-        report.append("二采成片：分段高清记录不全（手动模式未全选），成片按基础分辨率编码")
-        return False
     use = [g for g in range(total) if g not in skip]
     if not use:
         report.append("二采成片：所有段均已禁用（不上链），无成片可拼")
         return False
+    ins_slots = {int(x.get("slot", -1)) for x in (mf.get("inserts") or [])
+                 if isinstance(x, dict)}
+    if mf.get("has_prologue"):
+        ins_slots.add(0)
+    sources, rec_sizes, first_rec = [], [], -1
     for g in use:
-        if not _record_valid(segs, root, g, ph, base_hash(mf, g)):
-            report.append("二采成片：部分段无有效高清记录（手动模式未全选或记录失效），"
-                          "成片按基础分辨率编码")
+        if g < len(segs) and _record_valid(segs, root, g, ph, base_hash(mf, g)):
+            sources.append(os.path.join(root, segs[g]["files"]["mp4"]))
+            rec_sizes.append(segs[g].get("size") or [None, None])
+            if first_rec < 0:
+                first_rec = len(sources) - 1
+        elif g in ins_slots:
+            # 外部素材段直通：高清产物与基础分段同名（seg_NNN.mp4），
+            # 无有效记录时该文件就是基础分辨率版本
+            basic = os.path.join(root, f"seg_{g:03d}.mp4")
+            if not os.path.isfile(basic):
+                report.append(f"二采成片：段{g + 1} 基础分段缺失（seg_{g:03d}.mp4），"
+                              "成片按基础分辨率编码")
+                return False
+            sources.append(basic)
+        else:
+            report.append("二采成片：部分生成段无有效高清记录，成片按基础分辨率编码")
             return False
-    size0 = segs[use[0]].get("size") or [None, None]
-    if any((segs[g].get("size") or [None, None]) != size0 for g in use):
-        report.append("二采成片：分段高清尺寸不一致（手动模式混排），成片按基础分辨率编码")
+    if rec_sizes and any(s != rec_sizes[0] for s in rec_sizes):
+        report.append("二采成片：分段高清尺寸不一致，成片按基础分辨率编码")
         return False
-    sources = [os.path.join(root, segs[g]["files"]["mp4"]) for g in use]
     out_name = f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
     try:
         from . import media
     except ImportError:
         import media
-    # 画幅/报告行取首个分段【实测】尺寸：记录 size 修复前存的是转置 [高, 宽]
-    # （tw/th 对调遗留），实测口径对旧/新记录都正确；一致性门控仍用记录值
-    # （旧记录整批同向转置，互相比较不受影响）。concat 缺省即按首源实测画幅。
-    sz = media.probe_video_size(sources[0]) or tuple(size0)
+    # 目标画幅取首个带记录分段【实测】尺寸（记录 size 修复前存的是转置 [高, 宽]），
+    # 显式传给 concat：直通的基础分辨率外部素材段按此缩放对齐；实测失败不传，
+    # concat 退回首源画幅（首个带记录源优先排在前时两者一致）
+    target_wh = media.probe_video_size(sources[first_rec]) if first_rec >= 0 else None
     _crf, _preset, _aq, _dither = _ENCODE_SETTINGS.get(
         str(cfg.get("encode") or "标准"), _ENCODE_SETTINGS["标准"])
     if media.concat_av_mp4(sources, os.path.join(root, out_name),
+                           width=target_wh[0] if target_wh else None,
+                           height=target_wh[1] if target_wh else None,
                            crf=_crf, preset=_preset, aq_mode=_aq,
                            dither=_dither):
         fresh = checkpoint.load_manifest(root) or dict(mf)
@@ -1498,9 +1515,13 @@ def try_final(root, cfg, report, skip_slots=None):
         fresh["upscale"] = up_state
         fresh["updated_at"] = time.time()
         checkpoint.save_manifest(root, fresh)
-        report.append(f"二采成片：{len(use)} 段高清流式拼接 → {out_name}"
+        sz = target_wh or media.probe_video_size(sources[0]) or ("?", "?")
+        _ins_n = sum(1 for g in use if g in ins_slots and (g >= len(segs)
+                    or not _record_valid(segs, root, g, ph, base_hash(mf, g))))
+        report.append(f"二采成片：{len(use)} 段流式拼接 → {out_name}"
                       f"（{sz[0]}×{sz[1]}，音轨沿用原声）"
-                      + (f"，剔除禁用段 {len(skip)} 段" if len(use) < total else ""))
+                      + (f"，剔除禁用段 {len(skip)} 段" if len(use) < total else "")
+                      + (f"，外部素材段 {_ins_n} 段按基础分辨率缩放对齐" if _ins_n else ""))
         return True
     report.append(f"二采成片编码失败（{media.last_error}）——回退编码基础分辨率成片，"
                   "分段高清不受影响")

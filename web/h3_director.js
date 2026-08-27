@@ -1046,7 +1046,11 @@ function applyMasterPrompt(node, text) {
 
 /* ---- 潜空间放大二采：状态读写（ds.upscale，主循环内逐段渲染：采样定稿后、段落盘前） ---- */
 
-const UP_MODES = ["关闭", "跟随生成", "手动选择"];
+/* 二采模式（前端）：关闭 / 跟随生成。「手动选择」已从界面移除（勾选交互
+   怪异且与单段二采按钮重复）——后端 parse_state 仍认它，仅作单段重新二采
+   的内部提交通道（doUpscaleSeg 临时切换，用户不可见）；旧状态经 getDs
+   归一自动迁移为「关闭」 */
+const UP_MODES = ["关闭", "跟随生成"];
 
 /* 重摇锚定模式（与后端 nodes.py _REDO_MODES 同表）：决定重摇本段时模型看向哪些锚点 */
 const REDO_MODES = [
@@ -1062,25 +1066,13 @@ function setUpscaleField(node, field, value) {
     const ds = getDs(node);
     if (field === "mode") {
         ds.upscale.mode = value;
-        if (value !== "手动选择") ds.upscale.include = [];   // 切模式清勾选，避免残留误导
+        ds.upscale.include = [];   // 切模式清勾选（单段二采的临时勾选不跨模式残留）
     } else {
         ds.upscale[field] = value;
     }
     setDs(node, ds);
     scheduleRefresh(60);
     repaintUpscale();          // 编辑即刷新：徽章/参数区当场更新（见 repaintUpscale 注释）
-}
-
-/** 手动选择模式：勾/取消某段（slot=0-based 全局槽位，含序章/插入段） */
-function toggleUpscaleInclude(node, slot) {
-    const ds = getDs(node);
-    const inc = new Set(ds.upscale.include || []);
-    if (inc.has(slot)) inc.delete(slot);
-    else inc.add(slot);
-    ds.upscale.include = [...inc].sort((a, b) => a - b);
-    setDs(node, ds);
-    scheduleRefresh(60);
-    repaintUpscale();          // 段落卡勾选后二采区计数当场更新
 }
 
 /** 目标画布估算（与后端 target_hw 同口径：latent 偶数对齐=像素 32 倍数）。
@@ -1102,10 +1094,17 @@ function upTargetCanvas(node, scale) {
 }
 
 /** 单段重新二采：清该段记录 → 临时切「手动选择+只勾本段」提交队列 → 立即还原设置。
- *  后端走既有路径（手动选择模式 + 全链回放）：本段 latent 存档载入 → 神经放大重采样
- *  → 覆盖 seg_NNN.mp4，全程不碰视频编解码；其他段回放 fresh=False 直接沿用已有 mp4，
- *  不会被基础分辨率覆盖（含插入视频段——其 latent 在插入时已一次性 VAE 编码存档）。
- *  二采渲染确定性：参数未变时重渲=同输出；价值在参数已变/记录缺失/补做时立即执行。 */
+ *  「手动选择」是后端保留的内部模式（界面上已无此选项）：parse_state 认它，
+ *  doUpscaleSeg 借它实现"只重渲这一段"；其他段回放 fresh=False 直接沿用已有
+ *  mp4，不会被基础分辨率覆盖。本段 latent 存档载入 → 神经放大重采样
+ *  → 覆盖 seg_NNN.mp4，全程不碰视频编解码。
+ *  二采渲染确定性：参数未变时重渲=同输出；价值在参数已变/记录缺失/补做时立即执行。
+ *  健壮性（与 submitRedo 同口径）：①提交前自动套用存档共享参数——二采=同链重渲，
+ *  后端 assert_match 硬校验参数一致，画布改过参数会整次运行失败（用户只看到
+ *  "二采没生效"）；②临时清重摇标记/关审片逐段确认——残留的重摇会劫持本次提交
+ *  （redo 优先走重采样），逐段审片会把全链回放打断成多次运行；③提交前校验放大
+ *  权重文件在位——换卡/重装后权重丢失时 load_net 降级只有报告行，提前 alert；
+ *  ④队列提交失败不再只 console.warn，LED 直接报出来。 */
 async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
@@ -1122,6 +1121,15 @@ async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
     btn.disabled = true;
     btn.textContent = "提交中…";
     try {
+        /* 0. 放大权重在位校验：文件丢失时后端 load_net 降级只有报告行，
+              这里提前拦下（换卡/重装 ComfyUI 后 models 目录易缺文件） */
+        const um = await apiGet("/h3chain/upscale_models");
+        if (Array.isArray(um?.models) && um.models.length
+            && !um.models.includes(ds.upscale.model)) {
+            alert(`放大模型「${ds.upscale.model}」不在 models/latent_upscale_models/ 目录里`
+                + "——请重新选择权重文件后再试。");
+            return;
+        }
         /* 1. 清该段二采记录（幂等，无记录无害）——保证强制重做而非沿用 */
         const r = await api.fetchApi("/h3chain/upscale_reset", {
             method: "POST",
@@ -1137,27 +1145,44 @@ async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
             }
             return;
         }
-        /* 2. 临时切手动选择+只勾本段提交（原模式"关闭"时 parse_state 返回 None 不执行）；
-              提交后立即还原——队列快照已在服务端，用户界面不残留临时值 */
+        /* 2. 存档参数静默套用（后端 assert_match 同口径）——二采段与链上其余段
+              共享锚定与采样配置，参数漂移会让整次运行在校验处失败 */
+        let restored = [];
+        const mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
+        if (mf?.params) restored = applyChainParams(node, mf.params);
+        /* 3. 临时切手动选择+只勾本段提交（原模式"关闭"时 parse_state 返回 None 不执行）；
+              同时清残留重摇标记（redo 优先会劫持成本段重采样）、关审片逐段确认
+              （会把全链回放打断成多次运行）——提交后立即全部还原，
+              队列快照已在服务端，用户界面不残留临时值 */
         const prevMode = ds.upscale.mode;
         const prevInc = [...(ds.upscale.include || [])];
+        const prevRedo = [...(ds.redo_segs || [])];
+        const prevReview = getWidgetValue(node, "审片模式") ?? "关闭";
         const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
         setWidgetValue(node, W_REROLL, 0);
+        setWidgetValue(node, "审片模式", "关闭");
         ds.upscale.mode = "手动选择";
         ds.upscale.include = [segNo - 1];
+        ds.redo_segs = [];
         setDs(node, ds);
         syncModeWidget(node, ds.mode);
-        setLed("running", `段 ${dispNo} 重新二采已提交`);
+        setLed("running", `段 ${dispNo} 重新二采已提交（其余段照常回放）`
+            + (restored.length ? `；已自动还原存档参数：${restored.join("、")}` : ""));
         try {
             await app.queuePrompt();
         } catch (e) {
             console.warn("[h3-director] queue failed:", e);
+            setApiError(`段 ${dispNo} 重新二采提交队列失败：${e}——`
+                + "该段二采记录已清（下次开启二采的运行会自动补渲染）");
         }
+        /* 4. 全量还原（含重摇标记与审片模式） */
         const ds2 = getDs(node);
         ds2.upscale.mode = prevMode;
         ds2.upscale.include = prevInc;
+        ds2.redo_segs = prevRedo;
         setDs(node, ds2);
         setWidgetValue(node, W_REROLL, prevReroll);
+        setWidgetValue(node, "审片模式", prevReview);
         scheduleRefresh();
     } catch (e) {
         alert("重新二采请求失败：" + e);
@@ -1480,9 +1505,6 @@ function applyReorder(node, data, dragIdx, ins) {
     const off = planOff(data.mf);
     const inRange = (slot) => { const i = Number(slot) - off; return i >= lo && i <= hi; };
     ds.redo_segs = (ds.redo_segs || []).filter((x) => x && !inRange(x.slot));
-    if (ds.upscale?.mode === "手动选择") {
-        ds.upscale.include = (ds.upscale.include || []).filter((s) => !inRange(s));
-    }
     setDs(node, ds);
     setLed("idle", `段序已调整：从首个变化段起自动级联重做（换位段的接缝需重新生成）`);
     scheduleRefresh(60);
@@ -1619,11 +1641,19 @@ function scheduleRefresh(delay = 900) {
 
 /** 提交重摇（页脚 CTA）：随机种子 + 临时开审片（逐段推进：每重摇一段暂停审看），
  *  队列快照在服务端——提交后立即恢复控件并清 ds 标记（manifest 队列接管徽章显示）。
- *  redo 与「重跑起始段」互斥（后端 redo 优先）：提交时显式清零避免旧值干扰。 */
+ *  redo 与「重跑起始段」互斥（后端 redo 优先）：提交时显式清零避免旧值干扰。
+ *  共享参数自动套用存档值（applyChainParams）：重摇=同链换种子重做，参数必须与
+ *  存档一致，画布控件若在成链后被改过会在后端 assert_match 硬报错——静默纠偏，
+ *  实际改动项写进 LED 让用户知情。 */
 async function submitRedo() {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
     if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出，再提交重摇"); return; }
+    let restored = [];
+    if (lastDir) {
+        const mf = await fetchJson(`h3_projects/${lastDir}`, "manifest.json");
+        if (mf?.params) restored = applyChainParams(node, mf.params);
+    }
     const prevReview = getWidgetValue(node, "审片模式") ?? "关闭";
     const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
     if (!setWidgetValue(node, "审片模式", "逐段确认")) {
@@ -1635,7 +1665,8 @@ async function submitRedo() {
     const ds = getDs(node);          // redo_segs 已在弹窗标记时写入
     setDs(node, ds);
     syncModeWidget(node, ds.mode);
-    setLed("running", "重摇已提交（逐段审片推进，满意后继续）");
+    setLed("running", "重摇已提交（逐段审片推进，满意后继续）"
+        + (restored.length ? `；已自动还原存档参数：${restored.join("、")}` : ""));
     try {
         await app.queuePrompt();
     } catch (e) {
@@ -1923,43 +1954,83 @@ async function switchProject(dir) {
     scheduleRefresh(200);
 }
 
-/** 把项目 manifest 的共享参数映射回画布控件（画幅优先尝试 宽高比×MP combo 匹配）。 */
-function applyParamsToCanvas(node, params) {
-    if (!node || !params) return;
+/** 把 manifest 共享参数静默映射回画布控件，返回实际改动（值未变不记）的描述列表。
+ *  覆盖进指纹的全部共享参数：画幅/时长/引导帧数/步数/CFG/采样器/调度器/
+ *  递减锚定/桥帧门控三件套——重摇提交前自动调用纠偏参数漂移（后端
+ *  assert_match 同口径），也供手动「套用参数」按钮复用。
+ *  自定义画幅（无 AR×MP 命中）同时把宽高比切到「自定义」：非自定义时后端
+ *  会按宽高比×MP 重新换算宽高，只写宽/高控件不生效。 */
+function applyChainParams(node, params) {
+    if (!node || !params) return [];
     const applied = [];
+    /* setWidgetValue 的带回报版：值变化才写并记录描述（幂等重放不产生噪音） */
+    const put = (name, value, label) => {
+        const wd = (node.widgets || []).find((x) => x.name === name);
+        if (!wd || String(wd.value ?? "") === String(value)) return false;
+        return setWidgetValue(node, name, value) ? (applied.push(label), true) : false;
+    };
     const w = Number(params.width), h = Number(params.height);
     if (w && h) {
         const combo = matchCanvasCombo(w, h);
-        if (combo && setWidgetValue(node, W_AR, combo[0]) && setWidgetValue(node, W_MP, combo[1])) {
-            applied.push(`画幅 ${combo[0]}·${combo[1]}MP（${w}×${h}）`);
-        } else if (setWidgetValue(node, W_WIDTH, w) && setWidgetValue(node, W_HEIGHT, h)) {
-            applied.push(`宽×高 ${w}×${h}（自定义）`);
+        if (combo) {
+            const oldAr = String(getWidgetValue(node, W_AR) ?? "");
+            const oldMp = String(getWidgetValue(node, W_MP) ?? "");
+            setWidgetValue(node, W_AR, combo[0]);
+            setWidgetValue(node, W_MP, combo[1]);
+            if (oldAr !== combo[0] || oldMp !== String(combo[1])) {
+                applied.push(`画幅 ${combo[0]}·${combo[1]}MP（${w}×${h}）`);
+            }
+        } else {
+            const old = [String(getWidgetValue(node, W_AR) ?? ""),
+                String(getWidgetValue(node, W_WIDTH) ?? ""),
+                String(getWidgetValue(node, W_HEIGHT) ?? "")];
+            setWidgetValue(node, W_AR, "自定义");
+            setWidgetValue(node, W_WIDTH, w);
+            setWidgetValue(node, W_HEIGHT, h);
+            if (old[0] !== "自定义" || old[1] !== String(w) || old[2] !== String(h)) {
+                applied.push(`宽×高 ${w}×${h}（自定义）`);
+            }
         }
     }
     if (params.length) {
         const sec = +(params.length / 24).toFixed(2);
-        if (setWidgetValue(node, W_DUR, sec)) applied.push(`每段时长 ${sec}s`);
+        put(W_DUR, sec, `每段时长 ${sec}s`);
     }
     if (params.ctx != null) {
         const v = String(params.ctx);
         const wd = (node.widgets || []).find((x) => x.name === "引导帧数");
         if (!wd || (wd.options?.options || []).includes(v)) {
-            if (setWidgetValue(node, "引导帧数", v)) applied.push(`引导帧数 ${v}`);
+            put("引导帧数", v, `引导帧数 ${v}`);
         }
     }
-    if (params.steps && setWidgetValue(node, "步数", params.steps)) applied.push(`步数 ${params.steps}`);
-    if (params.cfg != null && setWidgetValue(node, "CFG", params.cfg)) applied.push(`CFG ${params.cfg}`);
+    if (params.steps) put("步数", params.steps, `步数 ${params.steps}`);
+    if (params.cfg != null) put("CFG", params.cfg, `CFG ${params.cfg}`);
     for (const [name, key] of [["采样器", "sampler"], ["调度器", "scheduler"]]) {
         const v = params[key];
         if (!v) continue;
         const wd = (node.widgets || []).find((x) => x.name === name);
         if (wd && !(wd.options?.options || []).includes(v)) continue;
-        if (setWidgetValue(node, name, v)) applied.push(`${name} ${v}`);
+        put(name, v, `${name} ${v}`);
     }
+    if (params.fade_ratio != null) {
+        const v = Number(params.fade_ratio) === 0 ? "关闭" : String(params.fade_ratio);
+        put("递减锚定", v, `递减锚定 ${v}`);
+    }
+    const gate = params.gate || {};
+    if (gate.mode) put("桥帧门控", gate.mode, `桥帧门控 ${gate.mode}`);
+    if (gate.threshold != null) put("清晰度阈值", gate.threshold, `清晰度阈值 ${gate.threshold}`);
+    /* 回退上限：指纹存的是 //17*17 对齐值，直接写回同值（limit 已对齐再对齐不变） */
+    if (gate.limit != null) put("回退上限", gate.limit, `回退上限 ${gate.limit}`);
+    return applied;
+}
+
+/** 把项目 manifest 的共享参数映射回画布控件（画幅优先尝试 宽高比×MP combo 匹配）。 */
+function applyParamsToCanvas(node, params) {
+    const applied = applyChainParams(node, params);
     scheduleRefresh(300);
     alert(applied.length
         ? `已套用参数到画布：\n\n${applied.join("\n")}`
-        : "该项目没有可套用的参数（或控件不匹配）");
+        : "当前画布参数已与存档一致（或无可套用的参数）");
 }
 
 /* ---------- LED 状态灯 ---------- */
@@ -2318,6 +2389,9 @@ function injectStyles() {
     .h3d-unlink{display:flex;gap:7px;align-items:center;cursor:pointer;padding:6px 8px;border:1px solid #5a3b2e;border-radius:7px;background:#221912;color:#e0a892;font-size:11.5px;font-weight:600;user-select:none}
     .h3d-unlink:hover{border-color:#8a5a42}
     .h3d-unlink input{accent-color:#e0823d;cursor:pointer}
+    .h3d-unlink.h3d-offrow{border-color:#54383e;background:#241419;color:#e79aa6}
+    .h3d-unlink.h3d-offrow:hover{border-color:#8a5a68}
+    .h3d-unlink.h3d-offrow input{accent-color:#c9566a}
 
     /* ---- 每段时长 + 段级引用素材 ---- */
     .h3d-secs{width:58px;border:1px solid #3a352c;border-radius:5px;background:#211f1a;color:var(--h3d-bone);padding:2px 4px;font:11px ui-monospace,Consolas;text-align:right;outline:none}
@@ -2355,8 +2429,6 @@ function injectStyles() {
     .h3d-updet.on{border-color:#316dca80;box-shadow:inset 0 0 0 1px #316dca26}
     .h3d-updet[open] summary{color:#9ecbff}
     .h3d-upwarn{grid-column:1/-1;padding:7px 10px;border:1px solid #9a4144;border-radius:7px;background:#402227;color:#f0a0a4;font-size:11.5px;line-height:1.6}
-    .h3d-upcb{width:15px;height:15px;margin:4px 2px 0 0;accent-color:#316dca;cursor:pointer;flex:none}
-    .h3d-card.upable{grid-template-columns:auto 150px minmax(0,1fr);align-items:start}
     .h3d-param{margin:0}
     .h3d-param .h3d-hint{display:block;margin-top:4px}
 
@@ -2628,10 +2700,7 @@ function cardsSignature(data) {
         frames: [ds?.first_frame ?? "", ds?.end_frame ?? ""],
         labels: (ds?.ref_assets || []).map((a) => a.label),
         mode: ds?.mode ?? "",
-        /* 二采模式/勾选也要进签名：切模式或勾选段后卡片重建——
-           手动选择勾选框才会立即出现（不进签名则要切页再回来才刷新） */
-        up: [ds?.upscale?.mode ?? "", (ds?.upscale?.include || []).join(",")],
-        /* 重摇标记/运行队列同样进签名：标记/取消/队列消费后待重摇徽章即时刷新 */
+        /* 重摇标记/运行队列进签名：标记/取消/队列消费后待重摇徽章即时刷新 */
         redo: [(ds?.redo_segs || []).map((x) => `${x.slot}:${x.mode}`).join(","),
                (mf?.redo_queue || []).map((x) => (Array.isArray(x) ? x.join(":") : "")).join(",")],
         dur: String(getWidgetValue(data.node, W_DUR) ?? ""),
@@ -2668,9 +2737,11 @@ function updateDesk(data) {
         renderParamsZone(z.rParams, data);
     }
     /* 实验性功能面板（ds.experiments 驱动；编辑动作经 setExp* -> repaintExperiments() 即时重渲，
-     * 不走此守卫；此处守卫仅为保护「全局刷新时区内有输入框正在打字」不丢焦；defs 到达/失败/硬开关变化也触发） */
+     * 不走此守卫；此处守卫仅为保护「全局刷新时区内有输入框正在打字」不丢焦；defs 到达/失败/硬开关变化也触发。
+     * !!node 必须进签名：面板曾在节点未就绪时渲染过「画布上未找到节点」，节点随后可用若
+     * 签名不变则永不重建（experiments 全空时两头签名相同），须先做点别的操作才能显示 */
     const esig = JSON.stringify([data.ds?.experiments ?? {},
-        EXP.defs ? EXP.defs.length : 0, EXP.forceDisabled, EXP.failed]);
+        EXP.defs ? EXP.defs.length : 0, EXP.forceDisabled, EXP.failed, !!data.node]);
     if (!z.rExp.contains(document.activeElement) && z.rExp.dataset.sig !== esig) {
         z.rExp.dataset.sig = esig;
         renderExperimentsZone(z.rExp, data);
@@ -3066,18 +3137,6 @@ function buildCards(data) {
             } else {
                 card.classList.add("mergeable-off");
             }
-        } else if (data.ds.upscale?.mode === "手动选择" && node && isDone && !isDisabled) {
-            /* 手动选择二采：已完成段（含插入视频段）勾选后随下次运行二采
-               （勾选值=全局槽位 0-based，与后端 in_scope 校验同口径）；
-               已禁用段不进成片，勾了二采也无意义，不显示 */
-            const cb = document.createElement("input");
-            cb.type = "checkbox";
-            cb.className = "h3d-upcb";
-            cb.checked = (data.ds.upscale.include || []).includes(idx + off);
-            cb.title = "勾选后点「开始生成」对本段执行潜空间放大二采（外部素材段同样可二采）";
-            cb.onchange = () => toggleUpscaleInclude(node, idx + off);
-            card.classList.add("upable");
-            card.prepend(cb);
         }
 
         /* 每段时长（秒）：留空=跟随节点默认；显示吸附后的帧数 */
@@ -3261,7 +3320,7 @@ function buildCards(data) {
             if (node && it.idx !== undefined) {
                 const seg = (data.ds.segments && data.ds.segments[it.idx]) || defaultSegment();
                 const hasSeg = !!(seg.scene_prompt || seg.character_prompt || seg.soundscape
-                    || seg.music || seg.unlink);
+                    || seg.music || seg.unlink || seg.disabled);
                 const det = el("details", "h3d-seg-panel" + (hasSeg ? " has-content" : ""));
                 det.open = hasSeg;
                 det.innerHTML = `<summary>分段处理 · 场景 / 角色 / 声音${hasSeg ? ' <span class="h3d-chip cyan">已填写</span>' : ""}</summary>`;
@@ -3311,6 +3370,23 @@ function buildCards(data) {
                 };
                 segBody.append(unlinkRow);
 
+                /* 不上链（段禁用）：勾选框即状态——点选立即生效并当场反映，
+                   取代旧版「⏸ 不上链」按钮（点击后界面无反馈的问题根源） */
+                const offRow = el("label", "h3d-unlink h3d-offrow");
+                const offCb = document.createElement("input");
+                offCb.type = "checkbox";
+                offCb.checked = !!seg.disabled;
+                offRow.append(offCb, document.createTextNode("⏸ 不上链（本段跳过执行）"));
+                offRow.title = "本段保留在链上但跳过执行：不采样不解码不进成片，"
+                    + "槽位与存档记录原样保留（取消勾选即零成本恢复，已完成段直接沿用存档），"
+                    + "下段锚定自动跨接到本段之前最近一个已执行段的尾帧；"
+                    + "若本段尚未生成，恢复后会正常采样";
+                offCb.onchange = () => {
+                    setSegmentField(node, it.idx, "disabled", offCb.checked);
+                    scheduleRefresh(60);
+                };
+                segBody.append(offRow);
+
                 det.append(segBody);
                 body.append(det);
             }
@@ -3331,11 +3407,15 @@ function buildCards(data) {
             actions.append(insertButton("在此段后插入", idx + 2));
         } else {
             if (isDisabled) {
-                /* 已禁用段只提供恢复入口（重摇/继续/二采均无意义——不执行不进成片） */
+                /* 已禁用段：恢复入口（勾选框在「分段处理」面板内也可取消勾选；
+                   重摇/继续/二采均无意义——不执行不进成片） */
                 const back = el("button", "h3d-btn h3d-btn-cyan", "▶ 重新上链");
                 back.title = "恢复本段自动执行：已完成段直接沿用存档（零成本），"
                     + "未完成段下次运行起正常采样；前后接缝自动重新衔接";
-                back.onclick = () => setSegmentField(node, it.idx, "disabled", false);
+                back.onclick = () => {
+                    setSegmentField(node, it.idx, "disabled", false);
+                    scheduleRefresh(60);
+                };
                 actions.append(back);
             } else if (isDone) {
                 /* 已完成段两个入口：「从这段继续」= 其后全部级联重做（主动想全重来时用）；
@@ -3360,25 +3440,21 @@ function buildCards(data) {
                 actions.append(insertButton(`插视频到段 ${idx + 1} 前`, idx + 1));
             }
             if (node && it.idx !== undefined) {
-                const offBtn = el("button", "h3d-btn", "⏸ 不上链");
-                offBtn.title = "本段保留在链上但跳过执行：不采样不解码不进成片，"
-                    + "槽位与存档记录原样保留（随时恢复零成本），下段锚定自动跨接到"
-                    + "本段之前最近一个已执行段的尾帧；若本段尚未生成，重新上链时会正常采样";
-                offBtn.onclick = () => setSegmentField(node, it.idx, "disabled", true);
-                actions.append(offBtn);
                 const rm = el("button", "h3d-btn h3d-btn-danger", "✕ 删除此段");
                 rm.title = "删除这一段提示词（其后段落自动前移）";
                 rm.onclick = () => removePromptSegment(node, it.idx);
                 actions.append(rm);
             }
         }
-        /* 单段重新二采（含插入视频段）：已完成段随时可单独补做/重做二采，
-           不动其他段——显示条件放宽到"选了模型"即可见（未做过二采的段也能补做）；
+        /* 单段重新二采（仅生成段）：已完成段随时可单独补做/重做二采，不动其他段
+           ——显示条件放宽到"选了模型"即可见（未做过二采的段也能补做）；
+           插入视频段/序章是外部成品素材，不做二采（成片拼接时按需缩放对齐）；
            已禁用段不进成片，不做二采 */
-        if (isDone && !isDisabled && node && state?.dir && (upRec?.done || data.ds?.upscale?.model)) {
+        if (isDone && !isDisabled && !isInsert && node && state?.dir
+                && (upRec?.done || data.ds?.upscale?.model)) {
             const rst = el("button", "h3d-btn", "🔄 重新二采此段");
             rst.title = "清本段二采记录并立即重做：latent 存档载入 → 神经放大重采样 → 覆盖段视频"
-                + "（不做视频编解码；插入视频段同样适用）。其他段不受影响。"
+                + "（不做视频编解码）。其他段不受影响。"
                 + "参数未变时重渲=同输出；效果不满意请调右栏二采参数";
             rst.onclick = () => doUpscaleSeg(rst, state.dir, idx + off + 1, idx + 1, done, total);
             actions.append(rst);
@@ -3795,7 +3871,7 @@ function repaintExperiments() {
         const node = findNode();
         const ds = node ? getDs(node) : {};
         const esig = JSON.stringify([ds?.experiments ?? {},
-            EXP.defs ? EXP.defs.length : 0, EXP.forceDisabled, EXP.failed]);
+            EXP.defs ? EXP.defs.length : 0, EXP.forceDisabled, EXP.failed, !!node]);
         z.rExp.dataset.sig = esig;   // 与 updateDesk 同公式，防止后续全局刷新重复重建
         renderExperimentsZone(z.rExp, { node });
     } catch (e) {
@@ -4011,14 +4087,15 @@ function renderUpscaleZone(sec, data) {
         return;
     }
 
-    /* 模式：关闭 / 跟随生成 / 手动选择 */
+    /* 模式：关闭 / 跟随生成 */
     const modeField = el("div", "h3d-param");
     modeField.append(el("label", "", "模式"));
     const modeSel = document.createElement("select");
     modeSel.className = "h3d-select";
     modeSel.title = "跟随生成：每段采样定稿后立即二采，段视频直接存高清结果（逐段审片时即「生成一段二采一段」）；"
-        + "手动选择：在段落卡片勾选任意已完成段（含插入视频/序章）后运行；关闭：不执行二采。"
-        + "二采参数不进基础链指纹——改参数只重做二采，不动已生成段";
+        + "关闭：不执行二采（已产出的高清分段/成片不受影响）。"
+        + "二采参数不进基础链指纹——改参数只重做二采，不动已生成段。"
+        + "单段补做/重做：段卡片「🔄 重新二采此段」（仅生成段；插入视频/序章不做二采）";
     for (const m of UP_MODES) {
         const o = document.createElement("option");
         o.value = m;
@@ -4242,13 +4319,9 @@ function renderUpscaleZone(sec, data) {
     const footBits = [];
     if (!on) {
         footBits.push("关闭中：主链照常，不做放大重采样（已产出的高清分段/成片不受影响）");
-    } else if (up.mode === "跟随生成") {
-        footBits.push("跟随生成：每段采样定稿后立即二采（新增/失效段自动重做）；逐段审片=生成一段二采一段");
     } else {
-        const inc = up.include || [];
-        footBits.push(inc.length
-            ? `手动选择：已勾选 ${inc.length} 段（段 ${inc.map((s) => s + 1).join("、")}），点「开始生成」执行`
-            : "手动选择：在中间段落卡片勾选要二采的段（含插入视频/序章），再点「开始生成」");
+        footBits.push("跟随生成：每段采样定稿后立即二采（新增/失效段自动重做）；逐段审片=生成一段二采一段。"
+            + "单段重做用段卡片「🔄 重新二采此段」；插入视频/序章为外部成品素材不二采，成片拼接时缩放对齐");
     }
     if (done > 0) {
         footBits.push(`已二采 ${upDone}/${done} 段`
@@ -4495,17 +4568,9 @@ function renderFooter(z, data) {
         run.textContent = `🎲 继续重摇剩余 ${queued} 段`;
         run.onclick = queuePrompt;
     } else if (done >= total) {
-        /* 链已完成但仍可单独执行二采：手动选择模式勾了段且选了模型——
-           全链回放只跑二采（勾选段重渲高清，其余段沿用），不再被"已完成"锁死 */
-        const inc = data.ds?.upscale?.mode === "手动选择"
-            ? (data.ds.upscale.include || []) : [];
-        if (inc.length && data.ds.upscale?.model) {
-            run.disabled = false;
-            run.textContent = `▶ 执行二采（已勾选 ${inc.length} 段）`;
-        } else {
-            run.disabled = true;
-            run.textContent = `✓ 本链已完成（${total} 段）`;
-        }
+        /* 链已完成：单段二采走段卡片「🔄 重新二采此段」，生成按钮不再提供批量入口 */
+        run.disabled = true;
+        run.textContent = `✓ 本链已完成（${total} 段）`;
     } else {
         run.disabled = false;
         run.textContent = done > 0
@@ -4726,6 +4791,15 @@ function removeFab() {
 
 app.registerExtension({
     name: "H3SeamlessChain.DirectorDesk",
+    /* 画布节点就绪即刷新：面板首刷可能早于工作流载入（节点未就绪 → 各区渲染
+     * 「画布上未找到节点」），之后没有任何事件再触发刷新——这里在节点载入/
+     * 新建时主动补一刷，mini 卡与实验/参数/二采区随之恢复可用 */
+    loadedGraphNode(node) {
+        if (node && node.type === NODE_TYPE) scheduleRefresh(250);
+    },
+    nodeCreated(node) {
+        if (node && node.type === NODE_TYPE) scheduleRefresh(250);
+    },
     setup() {
         console.log("[h3-director] loaded", H3D_VER);
         injectStyles();

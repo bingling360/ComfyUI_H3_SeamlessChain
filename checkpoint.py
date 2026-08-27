@@ -180,6 +180,11 @@ def load_manifest(root: str):
 def assert_match(old: dict, new: dict):
     """严格校验存档参数；不一致直接报错（种子例外，由调用方以存档为准）。
 
+    为什么单段重摇也要参数一致：重摇段与链上其余段共用同一批锚定/桥接与
+    采样配置，参数不同 = 新段与旧段画风不一致的链混搭，且存档 latent 的
+    回放与续接假设同配置。前端提交重摇时已自动套用存档参数
+    （applyChainParams），走到这里仍不一致的多为链结构（模式/首帧/参考素材
+    组合，即 chain 键）或实验性功能开关变了——需要人工决策，不能静默改。
     旧存档缺少的新增参数键（如 smart_cut_max/drop_budget）按"沿用当前值"
     处理不算不一致——旧段生成时该功能不存在，当前值只影响后续段。
     唯 `experiments`（实验性功能组合指纹）例外：缺失按空串（=禁用基线）处理并
@@ -193,9 +198,15 @@ def assert_match(old: dict, new: dict):
         diffs.append("experiments")
     if diffs:
         detail = "; ".join(f"{k}: 存档={old.get(k, '')!r} 当前={new.get(k, '')!r}" for k in diffs)
+        structural = any(k in diffs for k in ("chain", "experiments"))
         raise ValueError(
-            f"存档参数与当前不一致（{detail}）。续拍必须沿用原参数原提示词；"
-            "要开新链请在「存档目录」里填一个新名字")
+            f"存档参数与当前不一致（{detail}）。"
+            + ("同一条链的续拍/重摇必须沿用原参数——重摇段与其余段共享锚定与采样配置，"
+               "参数不同会导致新旧段画风不一致。" if not structural else
+               "链结构（生成模式/首帧/参考素材组合）或实验性功能开关与存档不同，"
+               "重摇前请先把这些切回存档时的状态。")
+            + "数值类参数可在项目列表点「套用参数」一键还原；"
+            "要换参数开新链，请在「存档目录」里填一个新名字")
 
 
 def seg_path(root: str, idx: int) -> str:

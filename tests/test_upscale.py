@@ -1094,6 +1094,57 @@ def test_try_final_skips_disabled_slots(monkeypatch):
         assert "所有段均已禁用" in report[-1]
 
 
+def test_try_final_external_passthrough(monkeypatch):
+    """外部素材段（插入视频/序章）不做二采：无高清记录时按基础分辨率分段直通，
+    拼接画幅取首个带记录段的实测尺寸（直通段 reformat 对齐）；基础分段缺失
+    则回退基础分辨率编码，不静默丢段。"""
+    with _env() as (out, _):
+        from ComfyUI_H3_SeamlessChain import media
+
+        root = os.path.join(out, "h3_projects", "混合源")
+        os.makedirs(root)
+        cfg = upscale.parse_state({"upscale": {"mode": "跟随生成", "model": "m.pth"}})
+        ph = upscale.params_hash(cfg)
+        f1 = checkpoint.upscale_files(1)
+        for name in f1.values():
+            open(os.path.join(root, name), "wb").close()
+        # 段0=序章(has_prologue) 段2=插入视频(inserts)：均无高清记录；段1=生成段有记录
+        open(os.path.join(root, "seg_000.mp4"), "wb").close()
+        open(os.path.join(root, "seg_002.mp4"), "wb").close()
+        checkpoint.save_manifest(root, {
+            "schema": "h3seamless/ckpt-v3", "done": 3, "total": 3,
+            "prompt_hashes": ["a", "b", "c"], "seeds": [1, 2, 3],
+            "has_prologue": True,
+            "inserts": [{"slot": 2, "file": "x.mp4"}],
+            "upscale": {"segs": [None,
+                {"hash": ph, "base_hash": "b|2", "done": True,
+                 "size": [2752, 1536], "files": f1}, None]}})
+
+        called = {}
+
+        def fake_concat(sources, out_path, **kwargs):
+            called["sources"] = sources
+            called.update(kwargs)
+            return True
+
+        monkeypatch.setattr(media, "probe_video_size", lambda _p: (2752, 1536))
+        monkeypatch.setattr(media, "concat_av_mp4", fake_concat)
+        report = []
+        assert upscale.try_final(root, cfg, report) is True
+        # 直通源 = 基础分段同路径；目标画幅 = 首个带记录段的实测尺寸
+        assert called["sources"] == [os.path.join(root, "seg_000.mp4"),
+                                     os.path.join(root, f1["mp4"]),
+                                     os.path.join(root, "seg_002.mp4")]
+        assert called["width"] == 2752 and called["height"] == 1536
+        assert "外部素材段 2 段按基础分辨率缩放对齐" in report[-1]
+
+        # 基础分段缺失 -> 回退（不静默丢段）
+        os.remove(os.path.join(root, "seg_002.mp4"))
+        report = []
+        assert upscale.try_final(root, cfg, report) is False
+        assert "基础分段缺失" in report[-1]
+
+
 def test_upscale_reset():
     with _env() as (out, _):
         root = os.path.join(out, "h3_projects", "乙")

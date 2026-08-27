@@ -5,7 +5,7 @@ let src = fs.readFileSync(path.join(__dirname, "../web/h3_director.js"), "utf8")
 src = src
     .replace('import { app } from "/scripts/app.js";', "const app = { graph: null, registerExtension() {} };")
     .replace('import { api } from "/scripts/api.js";', "const api = { addEventListener() {}, fetchApi: async () => ({ ok: true }) };");
-const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapOldWidgetValuesToCurrent, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, toggleUpscaleInclude, upTargetCanvas, defaultExperiments, normalizeExperiments, expActiveList, expLocked, parseMasterPrompt, exportMasterPrompt, applyMasterPrompt, planOff, redoMap, redoSlotValid, redoPending, redoQueued, reorderChain, nudgeIns };")(() => {}, () => true);
+const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapOldWidgetValuesToCurrent, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, upTargetCanvas, applyChainParams, defaultExperiments, normalizeExperiments, expActiveList, expLocked, parseMasterPrompt, exportMasterPrompt, applyMasterPrompt, planOff, redoMap, redoSlotValid, redoPending, redoQueued, reorderChain, nudgeIns };")(() => {}, () => true);
 let fails = 0;
 function eq(name, got, want) {
     const ok = JSON.stringify(got) === JSON.stringify(want);
@@ -186,18 +186,21 @@ eq("upscale include 只留非负整数", dsP.upscale.include, [1, 2]);
 const nodeO = { widgets: [{ name: "导演台状态", value: JSON.stringify({ mode: "文生视频", prompts: ["a"] }) }], setDirtyCanvas() {} };
 eq("旧 JSON 注入默认二采配置", mod.getDs(nodeO).upscale, mod.defaultUpscale());
 
-/* setUpscaleField：切入手动模式保留已有勾选、切出清空；参数字段直写 */
-mod.setUpscaleField(nodeP, "mode", "手动选择");
-mod.toggleUpscaleInclude(nodeP, 3);
-mod.toggleUpscaleInclude(nodeP, 1);
-eq("手动勾选累积排序", mod.getDs(nodeP).upscale.include, [2, 3]);   // 原 [1,2]，勾3、取消1
+/* setUpscaleField：参数字段直写；「手动选择」已从界面移除（后端保留为单段
+ * 重新二采的内部模式，doUpscaleSeg 临时直写不走本函数），但切换模式仍清勾选 */
 mod.setUpscaleField(nodeP, "scale", 1.5);
 eq("参数字段直写", mod.getDs(nodeP).upscale.scale, 1.5);
 mod.setUpscaleField(nodeP, "mode", "跟随生成");
 eq("切模式清勾选", mod.getDs(nodeP).upscale.include, []);
-mod.toggleUpscaleInclude(nodeP, 2);
-mod.toggleUpscaleInclude(nodeP, 2);
-eq("重复勾选=取消", mod.getDs(nodeP).upscale.include, []);
+eq("界面模式表不含手动选择", mod.getDs(nodeP).upscale.mode, "跟随生成");
+/* doUpscaleSeg 直写的内部模式：widget 原值透传（setDs 不归一化），读回归一化回落关闭 */
+const dsUp = mod.getDs(nodeP);
+dsUp.upscale.mode = "手动选择";
+dsUp.upscale.include = [1];
+mod.setDs(nodeP, dsUp);
+eq("内部模式 widget 原值透传", JSON.parse(nodeP.widgets[0].value).upscale.mode, "手动选择");
+eq("getDs 归一化界面模式回落", mod.getDs(nodeP).upscale.mode, "关闭");
+eq("内部勾选读回保留", mod.getDs(nodeP).upscale.include, [1]);
 
 /* upTargetCanvas：latent 偶数对齐（像素 32 倍数），与后端 target_hw 同口径 */
 const nodeC = { widgets: [{ name: "宽度", value: 1344 }, { name: "高度", value: 768 }] };
@@ -217,6 +220,55 @@ const nodeZ = { widgets: [
     { name: "宽高比", value: "自定义" }, { name: "宽度", value: 864 }, { name: "高度", value: 480 },
 ] };
 eq("自定义仍读宽高控件", mod.upTargetCanvas(nodeZ, 2), "1728×960");
+
+/* ---- applyChainParams：重摇提交前的存档参数静默套用（与后端 assert_match 同口径） ---- */
+const mkW = (name, value, opts) => ({ name, value, options: { options: opts || [] } });
+const mkNode = (specs) => ({ widgets: specs.map((s) => Array.isArray(s) ? mkW(...s) : mkW(s[0], s[1])),
+    setDirtyCanvas() {} });
+/* 组合画幅命中：宽高比/百万像素迁移 + 数值类参数全部写回（组合控件带真实选项表） */
+const nA = mkNode([
+    ["宽高比", "9:16"], ["百万像素", 0.5], ["每段时长", 5],
+    ["引导帧数", "22", ["5", "22", "39", "56"]], ["步数", 20], ["CFG", 4.5],
+    ["采样器", "uni_pc", ["uni_pc", "euler"]], ["调度器", "simple", ["simple", "sgm_uniform"]],
+    ["递减锚定", "关闭"], ["桥帧门控", "标注"], ["清晰度阈值", 30], ["回退上限", 34],
+]);
+const apA = mod.applyChainParams(nA, {
+    width: 1344, height: 768, length: 124, ctx: 39, steps: 24, cfg: 6.0,
+    sampler: "euler", scheduler: "sgm_uniform", fade_ratio: 0.5,
+    gate: { mode: "自动回退", threshold: 25.0, limit: 51 },
+});
+eq("组合画幅迁移", [nA.widgets[0].value, nA.widgets[1].value], ["16:9", 0.98]);
+eq("时长按帧数换算", nA.widgets.find((w) => w.name === "每段时长").value, 5.17);
+eq("引导帧数写回", nA.widgets.find((w) => w.name === "引导帧数").value, "39");
+eq("步数/CFG写回", [nA.widgets.find((w) => w.name === "步数").value,
+    nA.widgets.find((w) => w.name === "CFG").value], [24, 6.0]);
+eq("采样器/调度器写回", [nA.widgets.find((w) => w.name === "采样器").value,
+    nA.widgets.find((w) => w.name === "调度器").value], ["euler", "sgm_uniform"]);
+eq("递减锚定数值写回", nA.widgets.find((w) => w.name === "递减锚定").value, "0.5");
+eq("门控三件套写回", [nA.widgets.find((w) => w.name === "桥帧门控").value,
+    nA.widgets.find((w) => w.name === "清晰度阈值").value,
+    nA.widgets.find((w) => w.name === "回退上限").value], ["自动回退", 25.0, 51]);
+ok("套用报告覆盖全部改动项", apA.length === 11);
+/* 值已一致：幂等重放零改动零报告（重摇连续提交不产生噪音） */
+eq("幂等重放零改动", mod.applyChainParams(nA, {
+    width: 1344, height: 768, length: 124, ctx: 39, steps: 24, cfg: 6.0,
+    sampler: "euler", scheduler: "sgm_uniform", fade_ratio: 0.5,
+    gate: { mode: "自动回退", threshold: 25.0, limit: 51 },
+}), []);
+/* fade_ratio=0 -> 「关闭」；自定义画幅同时切宽高比（只写宽高不生效） */
+const nB = mkNode([["宽高比", "16:9"], ["宽度", 1344], ["高度", 768], ["递减锚定", "0.7"]]);
+mod.applyChainParams(nB, { width: 850, height: 480, fade_ratio: 0.0 });
+eq("自定义画幅切宽高比", nB.widgets.find((w) => w.name === "宽高比").value, "自定义");
+eq("自定义宽高写回", [nB.widgets.find((w) => w.name === "宽度").value,
+    nB.widgets.find((w) => w.name === "高度").value], [850, 480]);
+eq("fade 0 回落关闭", nB.widgets.find((w) => w.name === "递减锚定").value, "关闭");
+/* 组合值不在选项表：跳过该项（写非法组合值会被后端拒绝），其余照常 */
+const nC = mkNode([["引导帧数", "22", ["5", "22", "39", "56"]],
+    ["采样器", "uni_pc", ["uni_pc"]], ["步数", 20]]);
+const apC = mod.applyChainParams(nC, { ctx: 7, sampler: "euler", steps: 30 });
+eq("选项表外的组合值跳过", [nC.widgets.find((w) => w.name === "引导帧数").value,
+    nC.widgets.find((w) => w.name === "采样器").value], ["22", "uni_pc"]);
+eq("选项表外仅步数生效", apC, ["步数 30"]);
 
 /* ---- 选择性重做（重摇标记）：槽位校验 / 标记合并 / 计数（与后端 _parse_redo_segs 同口径） ---- */
 const mkPlan = (kinds) => kinds.map((k) => ({ kind: k }));
