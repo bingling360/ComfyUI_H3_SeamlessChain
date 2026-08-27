@@ -573,7 +573,7 @@ def load_model(name, device, precision, arch="2D"):
         model = model.to(dtype)
     MODEL_CACHE[cache_key] = model
     print(f"[H3二采] 加载放大模型（{arch}）: {name} | 参数量 "
-          f"{sum(p.numel() for p in model.parameters()):,} | Temporal "
+          f"{sum(p.numel() for p in model.parameters()):,} | 设备 {device} | Temporal "
           f"{'开' if cfg['temporal_every'] > 0 else '关'}"
-          f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']})")
+          f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']})", flush=True)
     return model

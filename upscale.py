@@ -605,6 +605,24 @@ def resize_latent_bilinear(z, h, w):
 
 # ---- 运行期（需 ComfyUI 环境，单测不触达） ----
 
+def _cuda_if_room(min_free_gb=2.0):
+    """intermediate_device 返回 CPU 时的纠偏探测：CUDA 可用且空闲显存充足则返回
+    cuda 设备。魔改运行时（DynamicVRAM）账面紧张会把 intermediate_device 打回
+    CPU——放大网络仅 ~0.7GB 且 3D 卷积 CPU 前向是分钟级（autodl 32G 卡实测
+    疑似触发：单线程 99.9% 转 25 分钟、GPU 0%），显存真放不下时仍回落 CPU。"""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info()
+        if free >= min_free_gb * (1 << 30):
+            return torch.device("cuda")
+    except Exception:
+        return None
+    return None
+
+
 def load_net(cfg):
     """按配置加载放大网络（upscale_net 按 名称+架构+设备+精度 缓存）。
 
@@ -621,6 +639,13 @@ def load_net(cfg):
                          "LBH-123-AI/Minimax_h3_latent_Upscaler 下载权重放入 "
                          "models/latent_upscale_models/，刷新导演台后在二采面板选择")
     dev = comfy.model_management.intermediate_device()
+    if dev.type == "cpu":
+        dev2 = _cuda_if_room()
+        if dev2 is not None:
+            print(f"[H3二采] intermediate_device 返回 CPU 但空闲显存充足"
+                  f"——放大模型强制上 {dev2}", flush=True)
+            dev = dev2
+    print(f"[H3二采] 放大模型目标设备：{dev}", flush=True)
     try:
         return upscale_net.load_model(cfg["model"], dev, cfg["precision"], cfg["arch"])
     except FileNotFoundError as e:
@@ -1010,8 +1035,11 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
 
     dev = next(net.parameters()).device
     if dev.type == 'cpu':
-        # 上段二采异常后放大网络留在 CPU，装回 GPU
-        dev = comfy.model_management.intermediate_device()
+        # 上段二采异常后放大网络留在 CPU：优先纠偏回 GPU（intermediate_device
+        # 在魔改运行时账面紧张时可能仍返回 CPU——此时 CPU 前向是分钟级）
+        dev = _cuda_if_room() or comfy.model_management.intermediate_device()
+        if dev.type == 'cuda':
+            print(f"[H3二采] 段{seg_no}：放大网络在 CPU，已挪回 {dev}", flush=True)
         net.to(dev)
 
     # 二采真语义：先由放大网络把 latent 超分到 scale×，再在【高清 latent】上低强度重采样。
@@ -1096,8 +1124,11 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # CachedClipProxy 在位时标注本段高清条件构建的 TE 是否命中缓存
     if _timing is not None:
         _timing["te_hit"] = getattr(clip, "last_encode_hit", None)
-    print(f"[H3二采] 段{seg_no}：放大+高清条件就绪"
-          + ("（TE命中缓存）" if _timing and _timing.get("te_hit") is True else "")
+    _te_hit = None if _timing is None else _timing.get("te_hit")
+    _te_note = "" if _te_hit is None else \
+        ("（TE命中缓存，无文本编码器前向）" if _te_hit is True
+         else "（TE未命中——文本编码器前向中，魔改分页环境下可能分钟级）")
+    print(f"[H3二采] 段{seg_no}：放大+高清条件就绪{_te_note}"
           + " → 显存腾挪（卸载驻留模型）…", flush=True)
     # 抢占式显存腾挪（README 既定设计，be43db8 重构时随三级降级一起被误删，
     # 2026-08-25 1.4× 精化实测 OOM 后恢复）：cond 已建好，TE/videoVAE/audioVAE
@@ -1302,8 +1333,8 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     purge_legacy(root, g)
     _h, _w = int(video_t.shape[-2]), int(video_t.shape[-1])
     _tw, _th = target_pixels(_h, _w, float(cfg.get("scale") or 2.0))
-    print(f"[H3二采] 段{g + 1}：开始渲染（{cfg['arch']} {cfg['scale']:g}× → {_tw}×{_th} 像素）",
-          flush=True)
+    print(f"[H3二采] 段{g + 1}：开始渲染（{cfg['arch']} {cfg['scale']:g}× → {_tw}×{_th} 像素，"
+          f"放大网络 @ {next(net.parameters()).device}）", flush=True)
     _timing = {}
     up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
