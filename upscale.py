@@ -979,7 +979,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
                   pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent,
                   cur_seed,
-                  采样器, 调度器, report=None, _timing=None):
+                  采样器, 调度器, report=None, _timing=None, seg_no=None):
     """基础段 AV latent -> 高清视频 latent（放大 + 低强度重采样）。
 
     kind: "prompt"（提示词段，cond 带本段提示词/参考素材/首帧）
@@ -1103,6 +1103,12 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # CachedClipProxy 在位时标注本段高清条件构建的 TE 是否命中缓存
     if _timing is not None:
         _timing["te_hit"] = getattr(clip, "last_encode_hit", None)
+    # 面包屑：放大/条件/卸载全程无原生控制台输出，用户无法区分「在干活」与
+    # 「卡死」。本行之后应立刻出现「Requested to load MiniMaxH3」+ 精化进度条；
+    # 若长时间没有，即主模型回载（DynamicVRAM 分页加载）卡死，重启 ComfyUI
+    print(f"[H3二采] 段{seg_no}：放大+高清条件就绪"
+          + ("（TE命中缓存）" if _timing and _timing.get("te_hit") is True else "")
+          + " → 显存已腾挪，精化重采样回载主模型…")
 
     # 低强度重采样（高清 latent）：初始 = 放大后的视频 latent + 原音频 latent；
     # 采样输出的音频丢弃，分段/成片音轨 = 原轨（零音频回归）。
@@ -1261,6 +1267,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     finally:
         restore_rows()
     _tmark("refine", _t)
+    print(f"[H3二采] 段{seg_no}：精化重采样完成（{(_timing or {}).get('refine', 0.0):.0f}s）"
+          "→ 高清解码…")
     del cond, latent
     torch.cuda.empty_cache()
     del up_v_base
@@ -1289,13 +1297,16 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
 
     t0 = time.perf_counter()
     purge_legacy(root, g)
-
+    _h, _w = int(video_t.shape[-2]), int(video_t.shape[-1])
+    _tw, _th = target_pixels(_h, _w, float(cfg.get("scale") or 2.0))
+    print(f"[H3二采] 段{g + 1}：开始渲染（{cfg['arch']} {cfg['scale']:g}× → {_tw}×{_th} 像素，"
+          f"神经放大/高清条件阶段无控制台输出属正常）")
     _timing = {}
     up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
-        采样器, 调度器, report=report, _timing=_timing)
+        采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1)
     # 解码高清 latent -> 高清帧（官方 VAE.decode 自带 OOM→tiled 降级，无需干预）
     _t = time.perf_counter()
     frames = video_vae.decode(up_v)
@@ -1325,6 +1336,8 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     files = checkpoint.upscale_files(g)
     _save_png(os.path.join(root, files["last"]), frames[-1])
     _timing["store"] = time.perf_counter() - _t
+    print(f"[H3二采] 段{g + 1}：完成，seg_{g:03d}.mp4 已更新为高清"
+          f"（总耗时 {time.perf_counter() - t0:.0f}s）")
     _sig, _tier, _mo = resolve_refine_sigma(cfg, video_t)
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh,
                             hf_gain=hf_gain, motion=_mo, sharp=sharp)
