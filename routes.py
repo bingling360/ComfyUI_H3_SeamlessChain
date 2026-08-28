@@ -7,7 +7,6 @@
 - POST /create_project  新建项目：当场建文件夹+初始 manifest（游戏存档槽语义）
 - POST /delete_project  删除项目 = 删除整个项目文件夹
 - POST /delete_file     删除项目内单个文件（成片等，限 h3_projects/<项目>/<文件>）
-- POST /delete          删除成片保存节点输出目录中的文件（saver 画廊，限两级路径）
 - POST /merge           按序合并若干段/成片/外部视频 -> merged_*.mp4（流式编码）
 - GET  /upscale_models  列出 latent_upscale_models 目录里的放大权重（二采面板下拉）
 - POST /upscale_reset   清掉某段的二采记录与高清产物（下次运行重做该段）
@@ -44,7 +43,6 @@ ROUTES = [
     ("GET", "/h3chain/experiments"),
     ("POST", "/h3chain/create_project"),
     ("POST", "/h3chain/save_prompts"),
-    ("POST", "/h3chain/delete"),
     ("POST", "/h3chain/delete_project"),
     ("POST", "/h3chain/delete_file"),
     ("POST", "/h3chain/merge"),
@@ -57,16 +55,6 @@ _ROUTES_LOG = ", ".join(f"{m} {p}" for m, p in ROUTES)
 
 def _routes_desc() -> list:
     return [{"method": m, "path": p} for m, p in ROUTES]
-
-
-def safe_relfile(rel):
-    """saver 输出目录内单文件：<前缀>/<文件名>，两级、无穿越。"""
-    s = str(rel or "").strip()
-    parts = s.split("/")
-    if (len(parts) != 2 or not all(projects.safe_name(p) for p in parts)
-            or not os.path.splitext(parts[1])[1]):
-        return None
-    return s
 
 
 def add_routes(routes):
@@ -105,18 +93,6 @@ def add_routes(routes):
             return web.json_response(
                 {"error": "项目不存在（未新建也未跑过，无 manifest 可写）"}, status=404)
         return web.json_response({"ok": True, "manifest": manifest})
-
-    async def delete(request):
-        data = await request.json()
-        if "file" not in data:
-            return web.json_response({"error": "缺少 file 参数"}, status=400)
-        rel = safe_relfile(data.get("file"))
-        root = os.path.realpath(get_output_directory())
-        target = os.path.realpath(os.path.join(root, rel)) if rel else root
-        if not rel or not target.startswith(root + os.sep) or not os.path.isfile(target):
-            return web.json_response({"error": "文件不存在"}, status=404)
-        os.remove(target)
-        return web.json_response({"ok": True})
 
     async def delete_project(request):
         data = await request.json()
@@ -208,7 +184,6 @@ def add_routes(routes):
         ("GET", "/h3chain/experiments", experiment_defs),
         ("POST", "/h3chain/create_project", create_project),
         ("POST", "/h3chain/save_prompts", save_prompts),
-        ("POST", "/h3chain/delete", delete),
         ("POST", "/h3chain/delete_project", delete_project),
         ("POST", "/h3chain/delete_file", delete_file),
         ("POST", "/h3chain/merge", merge),

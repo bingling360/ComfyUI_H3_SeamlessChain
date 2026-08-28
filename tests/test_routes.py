@@ -1,7 +1,7 @@
 """项目存档路由单测（stub 环境挂真实 handler）：python tests/test_routes.py
 
-覆盖：相对文件名安全校验（防目录穿越）、ping/projects/project/delete_project/
-delete_file 端点真实挂载与行为、register/ensure_registered 注册回退链。
+覆盖：ping/projects/project/delete_project/delete_file 端点真实挂载与行为、
+register/ensure_registered 注册回退链。
 """
 import asyncio
 import contextlib
@@ -21,22 +21,13 @@ from test_node_structure import _install_stubs
 
 ROUTE_SET = {"/h3chain/ping", "/h3chain/projects", "/h3chain/project",
              "/h3chain/upscale_models", "/h3chain/experiments", "/h3chain/create_project",
-             "/h3chain/save_prompts", "/h3chain/delete", "/h3chain/delete_project",
+             "/h3chain/save_prompts", "/h3chain/delete_project",
              "/h3chain/delete_file", "/h3chain/merge", "/h3chain/upscale_reset",
              "/h3chain/redo_cancel"}
 # 新版前端 api.fetchApi() 强制给非 /api 路径加 /api 前缀（ComfyApi.apiURL），
 # 自定义路由必须同时挂 /api 副本，否则新前端全部 404
 API_ROUTE_SET = {"/api" + p for p in ROUTE_SET}
 FULL_ROUTE_SET = ROUTE_SET | API_ROUTE_SET
-
-
-def test_safe_relfile():
-    with _server_env():
-        from ComfyUI_H3_SeamlessChain import routes
-        assert routes.safe_relfile("h3_chain/final_1.mp4") == "h3_chain/final_1.mp4"
-        for bad in ("h3_chain", "a/b/c.mp4", "../h3_chain/x.mp4", "h3_chain/noext",
-                    "", ".hidden/x.mp4", "/abs/path.mp4"):
-            assert routes.safe_relfile(bad) is None                # 恒两级、可读名、带扩展名
 
 
 class _Req:
@@ -198,22 +189,6 @@ def test_delete_file():
             assert asyncio.run(handler(_Req({"path": bad})))["status"] == 400
         # 合法格式但文件不存在 -> 404
         assert asyncio.run(handler(_Req({"path": "h3_projects/甲/nope.mp4"})))["status"] == 404
-
-
-def test_delete_endpoint():
-    with _server_env() as (out, router):
-        # delete 文件：限 output 内两级路径（saver 画廊）
-        fdir = os.path.join(out, "h3_chain")
-        os.makedirs(fdir)
-        open(os.path.join(fdir, "final_1.mp4"), "wb").close()
-        assert asyncio.run(router.table["/h3chain/delete"](
-            _Req({"file": "h3_chain/final_1.mp4"})))["json"] == {"ok": True}
-        assert not os.path.exists(os.path.join(out, "h3_chain", "final_1.mp4"))
-        for bad in ("h3_chain/nope.mp4", "../h3_chain/x.mp4", "h3_chain", "/abs/x.mp4", None):
-            resp = asyncio.run(router.table["/h3chain/delete"](_Req({"file": bad})))
-            assert resp["status"] == 404
-        resp = asyncio.run(router.table["/h3chain/delete"](_Req({})))
-        assert resp["status"] == 400                              # 缺参数
 
 
 def test_merge_endpoint_errors():
@@ -477,7 +452,7 @@ def test_add_routes_on_app_router():
         routes.add_routes(router)
         assert set(router.table) == FULL_ROUTE_SET
         # handler 真实可用：缺参 400
-        assert asyncio.run(router.table["/h3chain/delete"](_Req({})))["status"] == 400
+        assert asyncio.run(router.table["/h3chain/redo_cancel"](_Req({})))["status"] == 400
         # 不存在的项目 404
         assert asyncio.run(router.table["/h3chain/delete_project"](_Req({"dir": "nope"})))["status"] == 404
         # 同一目标重复调用不重复挂载（aiohttp 会因重复路由抛错）
@@ -498,7 +473,7 @@ def test_api_prefix_copies():
         assert root["json"]["ok"] is True and via_api["json"]["ok"] is True
         assert root["json"]["routes"] == via_api["json"]["routes"]
         # POST 路由的 /api 副本同样可用（缺参 400）
-        assert asyncio.run(router.table["/api/h3chain/delete"](_Req({})))["status"] == 400
+        assert asyncio.run(router.table["/api/h3chain/redo_cancel"](_Req({})))["status"] == 400
 
 
 def test_add_routes_rejects_unknown_type():

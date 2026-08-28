@@ -37,7 +37,6 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 const NODE_TYPE = "H3SeamlessChainSampler";
-const SAVER_TYPE = "H3ChainSaver";
 const W_REROLL = "重跑起始段";
 const W_SEED = "种子";
 const W_DIR_NAMES = ["存档目录", "断点目录"];
@@ -311,11 +310,6 @@ async function uploadToInput(file) {
 function findNode() {
     const nodes = app.graph?._nodes || [];
     return nodes.find((n) => n.type === NODE_TYPE) || null;
-}
-
-function findSaver() {
-    const nodes = app.graph?._nodes || [];
-    return nodes.find((n) => n.type === SAVER_TYPE) || null;
 }
 
 function dirWidget(node) {
@@ -2051,12 +2045,6 @@ function paintLeds() {
 
 /* ---------- 数据汇总 ---------- */
 
-function saverPrefix() {
-    const node = findSaver();
-    const w = node && (node.widgets || []).find((w) => w.name === "输出前缀");
-    return String((w && w.value) || "h3_chain").trim() || "h3_chain";
-}
-
 function paramsSummary(node, mf) {
     const p = (mf && mf.params) || {};
     const gw = (name) => {
@@ -2133,8 +2121,6 @@ async function collectData() {
     state.done = mf?.done ?? (sameChain ? stateRaw?.done : 0) ?? 0;
     state.total = mf?.total ?? (sameChain ? stateRaw?.total : 0) ?? 0;
 
-    const prefix = saverPrefix();
-    const history = await fetchJson(prefix, "h3saver_history.json");
 
     let plan = null;
     let drafts = [];
@@ -2182,7 +2168,7 @@ async function collectData() {
             plan = [];
         }
     }
-    return { node, state, mf, plan, drafts, history, prefix, ds, projects, apiOk: ping.ok, upscaleModels };
+    return { node, state, mf, plan, drafts, ds, projects, apiOk: ping.ok, upscaleModels };
 }
 
 function statusLine(state, mf, plan) {
@@ -2711,7 +2697,7 @@ function cardsSignature(data) {
 
 function updateDesk(data) {
     if (!desk) return;
-    const { node, state, mf, plan, drafts, history, prefix } = data;
+    const { node, state, mf, plan, drafts } = data;
     const z = desk.zones;
     desk.lastData = data;      // 供 repaintUpscale 局部重渲沿用 mf/state/模型列表缓存
 
@@ -2751,9 +2737,8 @@ function updateDesk(data) {
         z.rUpscale.dataset.sig = usig;
         renderUpscaleZone(z.rUpscale, data);
     }
-    const histSig = prefix + "|" + (history ? history.length + ":" + (history[0]?.file ?? "") : "-")
-        + "|" + (state?.dir ?? "") + "|" + (mf?.finals || []).join(",")
-        + "|" + (mf?.merges || []).map((m) => m?.file || "").join(",");
+        const histSig = (state?.dir ?? "") + "|" + (mf?.finals || []).join(",")
+            + "|" + (mf?.merges || []).map((m) => m?.file || "").join(",");
     if (histSig !== desk.histSig || !z.rHist.querySelector(".h3d-hist")) {
         if (!isVideoPlaying(z.rHist)) {
             desk.histSig = histSig;
@@ -4338,10 +4323,10 @@ function renderUpscaleZone(sec, data) {
 /* ---- 右栏 ---- */
 
 function renderHistoryZone(sec, data) {
-    const { history, prefix, state, mf } = data;
+    const { state, mf } = data;
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
-        "<strong>成片</strong><small>项目文件夹内的成片 + 保存节点历史</small>"));
+        "<strong>成片</strong><small>项目文件夹内的成片（manifest.finals）</small>"));
     const box = el("div", "h3d-hist");
 
     /* 第一区块：项目文件夹内的成片（manifest.finals，最新在前） */
@@ -4459,67 +4444,6 @@ function renderHistoryZone(sec, data) {
         });
     }
 
-    /* 第三区块：成片保存节点（H3ChainSaver）输出历史 */
-    const items = (history || []).slice(0, 10);
-    if (items.length) {
-        if (finals.length) box.append(el("div", "h3d-hist-head", `保存节点历史（output/${escapeHtml(prefix)}/）`));
-        items.forEach((it, i) => {
-            const url = viewUrl(prefix, it.file);
-            const card = el("div", "h3d-result" + (!finals.length && i === 0 ? " current" : ""));
-            const v = document.createElement("video");
-            v.controls = true;
-            v.preload = "metadata";
-            v.src = url;
-            card.append(v, el("div", "h3d-result-name", (!finals.length && i === 0 ? "当前成片 · " : "") + escapeHtml(it.file)));
-            card.append(el("div", "h3d-result-info",
-                escapeHtml(`${fmtTime(it.time)} · ${it.frames || "?"} 帧` +
-                    (it.archive ? ` · 存档 ${it.archive}` : "") +
-                    (it.segments ? ` · 分段×${it.segments}` : ""))));
-            const meta = el("div", "h3d-result-meta");
-            const acts = el("div", "h3d-result-acts");
-            const open = el("a", "h3d-dl", "↗ 打开");
-            open.href = url; open.target = "_blank";
-            const dl = el("a", "h3d-dl", "⬇ 下载");
-            dl.href = url; dl.download = it.file;
-            acts.append(open, dl);
-            const del = el("button", "h3d-btn h3d-btn-danger", "🗑 删除");
-            del.title = "删除成片文件（二次确认）";
-            del.onclick = async () => {
-                if (del.dataset.armed !== "1") {
-                    del.dataset.armed = "1";
-                    del.textContent = "确认删除？";
-                    setTimeout(() => { del.dataset.armed = ""; del.textContent = "🗑 删除"; }, 2500);
-                    return;
-                }
-                try {
-                    const r = await api.fetchApi("/h3chain/delete", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ file: `${prefix}/${it.file}` }),
-                    });
-                    if (r.ok) { refresh(); return; }
-                    if (r.status === 404 || r.status === 405) {
-                        setApiError(`删除接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`);
-                        return;
-                    }
-                    alert("删除失败（文件可能已被移动）");
-                } catch (e) {
-                    alert("删除请求失败：" + e);
-                }
-            };
-            acts.append(del);
-            meta.append(acts);
-            card.append(meta);
-            box.append(card);
-        });
-        if ((history || []).length > 10) {
-            box.append(el("div", "h3d-foot", `仅显示最近 10 条（共 ${history.length} 条），更早在 output/${escapeHtml(prefix)}/`));
-        }
-    } else if (!finals.length) {
-        box.append(el("div", "h3d-empty",
-            "还没有成片：开启「自动成片」（高级设置）后成片直接落在项目文件夹；<br>"
-            + `接 H3ChainSaver 节点的输出历史会出现在 output/${escapeHtml(prefix)}/`));
-    }
     sec.append(box);
     if (state?.dir) {
         sec.append(el("div", "h3d-foot", `项目文件夹：output/h3_projects/${escapeHtml(state.dir)}（分段视频也在其中）`));
@@ -4831,7 +4755,7 @@ app.registerExtension({
         api.addEventListener("executing", ({ detail }) => {
             if (detail === null) { scheduleRefresh(); return; } // 队列清空
             const n = (app.graph?._nodes || []).find((x) => String(x.id) === String(detail));
-            if (n && (n.type === NODE_TYPE || n.type === SAVER_TYPE)) {
+            if (n && n.type === NODE_TYPE) {
                 setLed("running", "生成中");
             }
         });

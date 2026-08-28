@@ -2,7 +2,7 @@
 
 背景：各测试文件按「单文件脚本」设计（python tests/test_xxx.py 时自行
 _install_stubs）。合集运行（pytest tests/）时模块收集顺序按字母序，
-stub 依赖收集期副作用——且 test_checkpoint/test_saver/test_routes 的
+stub 依赖收集期副作用——且 test_checkpoint/test_routes 的
 临时环境上下文退出时会 del sys.modules["folder_paths"] 甚至整个包，
 导致后续测试拿到残缺的 stub 环境。
 

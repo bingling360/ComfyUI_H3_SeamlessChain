@@ -1,7 +1,7 @@
 """PyAV 编解码共享：mp4 落盘与上传视频解码。
 
-分镜段视频（checkpoint.save_segment_mp4）、成片保存（saver.H3ChainSaver）、
-采样器自动保存（nodes 自动成片）三处共用，编码逻辑只维护一份。
+分镜段视频（checkpoint.save_segment_mp4）、采样器自动保存（nodes 自动成片）
+两处共用，编码逻辑只维护一份。
 PyAV 是 ComfyUI 新视频栈（CreateVideo/SaveVideo）的既有依赖，无新依赖。
 """
 

@@ -1,19 +1,16 @@
 import traceback
 
-WEB_DIRECTORY = "./web"  # 成片画廊 JS（h3chain_saver.js）随插件分发
+WEB_DIRECTORY = "./web"  # 导演台前端（h3_director.js）随插件分发
 
 try:
     from comfy_api.latest import ComfyExtension
 
     from .nodes import H3SeamlessChainSampler
-    from .storyboard import H3StoryboardChain
-    from .saver import H3ChainSaver
     from .seam_doctor import H3SeamDoctor
 
     class H3SeamlessChainExtension(ComfyExtension):
         async def get_node_list(self):
-            return [H3SeamlessChainSampler, H3StoryboardChain, H3ChainSaver,
-                    H3SeamDoctor]
+            return [H3SeamlessChainSampler, H3SeamDoctor]
 
         async def add_routes(self, routes):
             # 新版 ComfyUI / Comfy Desktop 官方路径：框架直接传入 routes 对象
@@ -22,8 +19,10 @@ try:
                 _add_routes(routes)
                 print("[ComfyUI_H3_SeamlessChain] 路由已注册（扩展钩子，含 /api 前缀副本）："
                       "GET /h3chain/ping, /h3chain/projects, /h3chain/project, "
-                      "POST /h3chain/create_project, /h3chain/delete, "
-                      "/h3chain/delete_project, /h3chain/delete_file")
+                      "/h3chain/upscale_models, /h3chain/experiments, "
+                      "POST /h3chain/create_project, /h3chain/save_prompts, "
+                      "/h3chain/delete_project, /h3chain/delete_file, /h3chain/merge, "
+                      "/h3chain/upscale_reset, /h3chain/redo_cancel")
             except Exception:
                 print("[ComfyUI_H3_SeamlessChain] 扩展钩子路由注册失败，回退到 PromptServer。详细错误：")
                 traceback.print_exc()
