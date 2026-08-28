@@ -99,6 +99,29 @@ def test_loudness_align_head():
     assert db4 is None and torch.equal(out4, quiet)        # 上段静音 -> 不干预
 
 
+def test_loudness_strength_backward_compatible():
+    """strength=1.0 必须与「不传该参数」逐位相同（默认路径零回归）；0 = 完全不干预。"""
+    if torch is None:
+        return print("SKIP test_loudness_strength_backward_compatible (no torch)")
+    rate, n = 1000, 2000
+    prev = torch.full((1, int(rate * 0.25)), 0.4)
+    quiet = torch.full((1, n), 0.2)
+    loud = torch.full((1, n), 0.8)
+
+    for seg in (quiet, loud):
+        a, db_a = loudness_align_head(seg, prev, rate=rate)                 # 旧调用
+        b, db_b = loudness_align_head(seg, prev, rate=rate, strength=1.0)   # 新调用，默认等价
+        assert torch.equal(a, b), "strength=1.0 必须逐位等价于原行为"
+        assert db_a == db_b
+        # 强度 0：不干预，原样返回且增益为 None
+        c, db_c = loudness_align_head(seg, prev, rate=rate, strength=0.0)
+        assert db_c is None and torch.equal(c, seg)
+    # 中间强度：增益按比例缩小
+    _, db_full = loudness_align_head(loud, prev, rate=rate, strength=1.0)
+    _, db_half = loudness_align_head(loud, prev, rate=rate, strength=0.5)
+    assert abs(db_half - db_full * 0.5) < 1e-9
+
+
 if __name__ == "__main__":
     if torch is None:
         print("no torch in this env; qc tests skipped")

@@ -268,9 +268,16 @@ def test_experiments_endpoint():
         assert body["ok"] is True
         assert "force_disabled" in body
         exps = body["experiments"]
-        assert len(exps) == 4
+        # 数量以 EXPERIMENT_DEFS 为准（新增实验不必改本断言）
+        from ComfyUI_H3_SeamlessChain.experiments import EXPERIMENT_DEFS
+        assert len(exps) == len(EXPERIMENT_DEFS)
         ids = {e["id"] for e in exps}
-        assert ids == {"e1_bridge_shard", "e2_memory_anchor", "e3_motion_gate", "e4_transition_res"}
+        assert ids == set(EXPERIMENT_DEFS)
+        for eid in ("e1_bridge_shard", "e2_memory_anchor", "e3_motion_gate", "e4_transition_res"):
+            assert eid in ids
+        # 新版桥接能力实验（软桥 / 音频软过渡 / 段中锚点）随面板一并下发
+        for eid in ("soft_bridge", "audio_seam", "mid_anchor"):
+            assert eid in ids
         for e in exps:
             assert e["name"] and e["group"] and e["desc"]
             for p in e["params"]:

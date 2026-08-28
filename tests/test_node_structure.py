@@ -239,6 +239,14 @@ def test_structure():
     outs = [(o.id, o.is_output_list) for o in schema.outputs]
     assert outs == [("图像", False), ("音频", False), ("帧率", False), ("报告", False),
                     ("分段图像", True), ("分段音频", True)]
+    # 新版桥接能力（桥区软着陆 / 音频接缝软过渡 / 段中锚点）只走实验开关，
+    # 不新增节点控件——widgets 顺序即工作流 JSON 的 inputs 顺序，旧档才能零改动续用
+    from ComfyUI_H3_SeamlessChain.experiments import EXPERIMENT_DEFS
+    for eid in ("soft_bridge", "audio_seam", "mid_anchor"):
+        assert eid in EXPERIMENT_DEFS
+        assert eid not in ids
+    for pname in ("钉住帧数", "释放曲线", "锚点位置", "响度对齐强度"):
+        assert pname not in ids
     print("PASS test_structure")
 
 

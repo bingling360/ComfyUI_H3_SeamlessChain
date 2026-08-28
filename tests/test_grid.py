@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from grid import (align_frame_count, align_frame_count_down, video_latent_t,
                   latent_t_to_frames, audio_tokens_for_frames,
+                  token_start_frames, token_center_frames, snap_frames_to_tokens,
                   FRAME_PER_TOKEN, FRAME_RESCALE)
 
 
@@ -70,6 +71,31 @@ def test_audio_window():
 
 def test_frame_per_token_shape():
     assert tuple(FRAME_PER_TOKEN) == (1, 4, 4, 4, 4)
+
+
+def test_token_start_center_frames():
+    """首 token 1 帧、其后 4 帧（每 5 token 循环）——逐 token 掩码必须按真实帧位算。"""
+    assert token_start_frames(0) == []
+    assert token_start_frames(7) == [0, 1, 5, 9, 13, 17, 18]
+    assert token_center_frames(3) == [0.5, 3.0, 7.0]
+    # 起止自洽：第 k 个 token 的起点 = 前 k 个 token 承载帧数之和
+    for t in (1, 7, 37, 47):
+        starts = token_start_frames(t)
+        assert starts[0] == 0
+        assert latent_t_to_frames(t) == (
+            starts[-1] + FRAME_PER_TOKEN[(t - 1) % len(FRAME_PER_TOKEN)])
+
+
+def test_snap_frames_to_tokens():
+    """钉住帧数必须落到真实 token 网格（latent 不能切半个 token）。"""
+    assert snap_frames_to_tokens(0) == 0
+    assert snap_frames_to_tokens(-5) == 0
+    for f in (1, 5, 9, 13, 17, 18, 22, 26, 30, 34, 35, 39):
+        assert snap_frames_to_tokens(f) == f                 # 网格点原样
+        assert snap_frames_to_tokens(f, up=False) == f
+    assert snap_frames_to_tokens(21) == 22                   # up：不丢帧
+    assert snap_frames_to_tokens(21, up=False) == 18         # down：不超出
+    assert snap_frames_to_tokens(124) == 124
     assert sum(FRAME_PER_TOKEN) == 17             # 每 5 token 一组 = 17 帧
 
 
