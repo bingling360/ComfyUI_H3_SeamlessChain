@@ -572,7 +572,10 @@ def upscale_video(video_t, net, scale, arch="2D"):
     h2, w2 = target_hw(video_t.shape[-2], video_t.shape[-1], scale)
     if (h2, w2) == (video_t.shape[-2], video_t.shape[-1]):
         return video_t.detach().to(torch.float32).clone()
-    x = video_t.detach().to(torch.float32)
+    # 输入对齐网络设备：魔改 DynamicVRAM 运行时采样输出 latent 可能滞留 CPU，
+    # 网络 @ cuda 时直接前向 = addmm 设备不匹配（mat1 on cpu）崩溃
+    net_dev = next(net.parameters()).device
+    x = video_t.detach().to(net_dev, torch.float32)
     nd = next(net.parameters()).dtype
     mean, std = _norm_tensors(x.device, nd)
     xn = (x.to(nd) - mean) / std
@@ -604,6 +607,36 @@ def resize_latent_bilinear(z, h, w):
 
 
 # ---- 运行期（需 ComfyUI 环境，单测不触达） ----
+
+def _iter_tensors(obj, path="root"):
+    """递归枚举 (路径, 张量)：cond/negative 设备审计用（纯数据结构遍历）。"""
+    if isinstance(obj, torch.Tensor):
+        yield path, obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _iter_tensors(v, f"{path}.{k}")
+    elif isinstance(obj, (list, tuple)):
+        for j, v in enumerate(obj):
+            yield from _iter_tensors(v, f"{path}[{j}]")
+
+
+def _device_mismatches(obj, dev):
+    """递归收集 obj 内不在 dev 上的张量路径（发现不对齐时面包屑定位用）。"""
+    return [f"{p}@{t.device}" for p, t in _iter_tensors(obj) if t.device != dev]
+
+
+def _tensors_to_device(obj, dev):
+    """递归把 obj 内张量挪到 dev（cond/negative 写时复制对齐，结构保持）。"""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(dev) if obj.device != dev else obj
+    if isinstance(obj, dict):
+        return {k: _tensors_to_device(v, dev) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return tuple(_tensors_to_device(v, dev) for v in obj)
+    if isinstance(obj, list):
+        return [_tensors_to_device(v, dev) for v in obj]
+    return obj
+
 
 def _cuda_if_room(min_free_gb=2.0):
     """intermediate_device 返回 CPU 时的纠偏探测：CUDA 可用且空闲显存充足则返回
@@ -1041,6 +1074,10 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         if dev.type == 'cuda':
             print(f"[H3二采] 段{seg_no}：放大网络在 CPU，已挪回 {dev}", flush=True)
         net.to(dev)
+    if dev.type == "cuda" and video_t.device != dev:
+        # 魔改 DynamicVRAM 运行时采样输出可能滞留 CPU：统一对齐后再进放大，
+        # 防止「输入 CPU × 网络 cuda」的 addmm 设备崩溃
+        video_t = video_t.to(dev)
 
     # 二采真语义：先由放大网络把 latent 超分到 scale×，再在【高清 latent】上低强度重采样。
     # 放大网络的逐段输出在此被使用（重采样初始 latent），不存在「白放大」。
@@ -1152,9 +1189,21 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 直接语义映射回 common_ksampler(steps=n, denoise=σ₀)——ComfyUI ≥0.3x 的
     # steps 即实际执行步数、denoise 定 σ 起点。
     seed = (int(cur_seed) + 1) % 0xffffffffffffffff if cur_seed is not None else 1
+    # 精化执行设备 = 主模型运行设备（与放大网络设备无关：net 回 CPU 腾显存后
+    # dev 仍是 cuda，但 CPU 兜底路径下 up_v 会滞留 CPU → UNET cuda 前向崩溃）
+    _edev = comfy.model_management.get_torch_device()
     latent["samples"] = comfy.nested_tensor.NestedTensor(
-        (up_v.to(dev, torch.float32), audio_t.to(dev, torch.float32)))
+        (up_v.to(_edev, torch.float32), audio_t.to(_edev, torch.float32)))
     del up_v
+    # cond/negative 设备对齐：CachedClipProxy 缓存的 cond 张量可能滞留异设备
+    # （魔改运行时 TE 前向设备不稳定），不对齐就是精化第一步 addmm 的 mat1
+    _mis = _device_mismatches(cond, _edev) + _device_mismatches(negative, _edev)
+    if _mis:
+        _mis_txt = "; ".join(_mis[:3]) + ("…" if len(_mis) > 3 else "")
+        print(f"[H3二采] 段{seg_no}：cond/negative 存在异设备张量"
+              f"（{_mis_txt}）——已对齐到 {_edev}", flush=True)
+        cond = _tensors_to_device(cond, _edev)
+        negative = _tensors_to_device(negative, _edev)
 
     restore_rows = plugin_nodes.cond_audio_rows_guard(模型.model.diffusion_model)
 
@@ -1193,9 +1242,31 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     ks_sampler = ks_sampler or 采样器
     ks_scheduler = ks_scheduler or 调度器
 
+    def _is_dev_err(e):
+        return "to be on the same device" in str(e)
+
+    def _inventory():
+        """设备错误时的张量设备清单——把 mat1 在哪钉到报告里，不再猜。"""
+        def _first(obj):
+            for _p, t in _iter_tensors(obj):
+                return f"{_p}@{t.device}"
+            return "无张量"
+        try:
+            _lat = ",".join(str(t.device) for t in latent["samples"].tensors)
+        except Exception:
+            _lat = "?"
+        try:
+            _unet = str(next(模型.model.diffusion_model.parameters()).device)
+        except Exception:
+            _unet = "?"
+        return (f"latent[{_lat}] · cond {_first(cond)} · neg {_first(negative)}"
+                f" · UNET权重 {_unet}")
+
     def _refine_once(sigma_start, cur_latent, cur_seed, round_desc=""):
         """单轮尾段精化：STG / time-bias / shift 各开关在此拼装（每轮 σ₀ 不同，
-        time-bias 窗口与 STG 窗口跟着本轮 σ₀ 走）。OOM → UpscaleAbortError。"""
+        time-bias 窗口与 STG 窗口跟着本轮 σ₀ 走）。OOM → UpscaleAbortError；
+        设备不匹配（魔改分页运行时下克隆模型易触发）→ 去掉全部克隆/补丁用
+        原模型重试一次，仍失败才上抛（带设备清单）。"""
         # 轮间清理（2026-08-25 实测：passes≥2 时首轮 σ₀ 成功、次轮 σ₀·decay
         # OOM——单轮峰值与 σ 无关，差的正是轮间账）：上一轮采样结束只丢函数
         # 局部引用，分配器缓存块与不可达对象全部滞留显存；每轮开跑前回收
@@ -1203,53 +1274,83 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         gc.collect()
         torch.cuda.empty_cache()
         ks_steps, ks_denoise = tail_refine_args(sigma_start, cfg["steps"])
-        restore_tb = time_bias_guard(模型.model.diffusion_model, ks_denoise, tb) \
-            if tb > 0.0 else None
-        try:
-            ks_model = _shifted_model(模型, sh) if sh > 0.0 else 模型
-            if stg > 0.0:
-                # STG 挂在 shift 克隆之上（两次 clone 共享权重，近零成本）；
-                # 弱分支同样过 time_bias patch 的 dit.forward——两边同偏置，
-                # 差分语义保持
-                ks_model = _stg_model(ks_model, ks_denoise, stg, stg_block)
 
-            def _ksample():
-                return comfy_nodes.common_ksampler(
-                    ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
-                    ks_scheduler, cond, negative, cur_latent,
-                    denoise=ks_denoise)[0]
-
+        def _attempt(plain):
+            restore_tb = time_bias_guard(模型.model.diffusion_model, ks_denoise, tb) \
+                if (tb > 0.0 and not plain) else None
             try:
-                return _ksample()
-            except RuntimeError as e:
-                if not _is_oom(e):
-                    raise
-                # 一级自救（fee12e1 机制回归）：全卸驻留模型 + 回收 Python 残留引用 +
-                # 清缓存后【原参】重试一次——参数零改动、产物零降级；仍 OOM 才按
-                # 既定语义硬停整链。gc.collect 先于 empty_cache：引用不回收，
-                # CUDA 块归不了还
+                ks_model = 模型
+                if not plain:
+                    if sh > 0.0:
+                        ks_model = _shifted_model(模型, sh)
+                    if stg > 0.0:
+                        # STG 挂在 shift 克隆之上（两次 clone 共享权重，近零成本）；
+                        # 弱分支同样过 time_bias patch 的 dit.forward——两边同偏置，
+                        # 差分语义保持
+                        ks_model = _stg_model(ks_model, ks_denoise, stg, stg_block)
+
+                def _ksample():
+                    return comfy_nodes.common_ksampler(
+                        ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
+                        ks_scheduler, cond, negative, cur_latent,
+                        denoise=ks_denoise)[0]
+
+                try:
+                    return _ksample()
+                except RuntimeError as e:
+                    if not _is_oom(e):
+                        raise
+                    # 一级自救（fee12e1 机制回归）：全卸驻留模型 + 回收 Python 残留引用 +
+                    # 清缓存后【原参】重试一次——参数零改动、产物零降级；仍 OOM 才按
+                    # 既定语义硬停整链。gc.collect 先于 empty_cache：引用不回收，
+                    # CUDA 块归不了还
+                    comfy.model_management.unload_all_models()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    try:
+                        return _ksample()
+                    except RuntimeError as e2:
+                        if not _is_oom(e2):
+                            raise
+                        e = e2
+                    msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样超出当前可回收显存 "
+                           "{1:g}GB，已自动卸载驻留模型并回收残留后原参重试仍失败）："
+                           "峰值显存由画布×帧数决定——请降低放大倍率或缩短该段帧数"
+                           "（精化步数/起始σ只影响耗时、不影响峰值），或增大显存。"
+                           "当前精化 {2} 步 @ σ≈{3:g}{4}。本段尚未落盘二采产物。".format(
+                               cfg["scale"], _vram_gb(), ks_steps, ks_denoise,
+                               round_desc))
+                    if report is not None:
+                        report.append(msg)
+                    raise UpscaleAbortError(msg) from e
+            finally:
+                if restore_tb is not None:
+                    restore_tb()
+
+        try:
+            return _attempt(plain=False)
+        except RuntimeError as e:
+            # 设备不匹配兜底：克隆模型（shift/STG）与魔改 DynamicVRAM 分页互锁时，
+            # 权重被二次 stage、部分层激活滞留 CPU（mat1 on cpu）。shift/时间偏置
+            # 只是画质微调，砍掉换「这一段能出高清」——重试仍失败才真正上抛
+            if _is_dev_err(e) and (sh > 0.0 or stg > 0.0 or tb > 0.0):
+                if report is not None:
+                    report.append(f"⚠ 段{seg_no} 精化张量设备不匹配（疑似运行时分页与"
+                                  "克隆模型互锁）——已去除 shift/STG/时间偏置，用原模型重试")
+                print(f"[H3二采] 段{seg_no}：精化设备不匹配，去除克隆/补丁用原模型重试…",
+                      flush=True)
                 comfy.model_management.unload_all_models()
                 gc.collect()
                 torch.cuda.empty_cache()
                 try:
-                    return _ksample()
+                    return _attempt(plain=True)
                 except RuntimeError as e2:
-                    if not _is_oom(e2):
-                        raise
-                    e = e2
-                msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样超出当前可回收显存 "
-                       "{1:g}GB，已自动卸载驻留模型并回收残留后原参重试仍失败）："
-                       "峰值显存由画布×帧数决定——请降低放大倍率或缩短该段帧数"
-                       "（精化步数/起始σ只影响耗时、不影响峰值），或增大显存。"
-                       "当前精化 {2} 步 @ σ≈{3:g}{4}。本段尚未落盘二采产物。".format(
-                           cfg["scale"], _vram_gb(), ks_steps, ks_denoise,
-                           round_desc))
-                if report is not None:
-                    report.append(msg)
-                raise UpscaleAbortError(msg) from e
-        finally:
-            if restore_tb is not None:
-                restore_tb()
+                    if _is_dev_err(e2):
+                        raise RuntimeError(
+                            f"二采精化张量设备不匹配（原模型重试仍失败）：{e2}｜"
+                            f"设备清单：{_inventory()}") from e2
+                    raise
+            raise
 
     def _deliver(sampled_dict):
         """精化输出 → 交付 latent：频域细节混合（mix）→ latent 锐化（sharpen）

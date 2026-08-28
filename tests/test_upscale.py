@@ -1183,6 +1183,28 @@ def test_upscale_reset():
                 pass
 
 
+def test_iter_tensors_paths_and_mismatch_audit():
+    """设备审计：路径枚举 + 异设备发现（meta 设备模拟滞留异设备的张量）。"""
+    cond = [(torch.zeros(2, 2), {"pooled": torch.ones(1)}), (torch.zeros(3), {})]
+    paths = [p for p, _t in upscale._iter_tensors(cond)]
+    assert paths == ["root[0][0]", "root[0][1].pooled", "root[1][0]"]
+    mixed = {"a": torch.zeros(1), "b": torch.zeros(1, device="meta")}
+    bad = upscale._device_mismatches(mixed, torch.device("cpu"))
+    assert bad == ["root.b@meta"]
+    assert upscale._device_mismatches({"a": torch.zeros(1)}, torch.device("cpu")) == []
+
+
+def test_tensors_to_device_structure_preserved():
+    """cond 递归挪设备：结构（tuple/dict/list/标量）原样保持，同设备张量直通。"""
+    cond = [(torch.zeros(2, 2), {"pooled": torch.ones(1), "strength": 1.0}), [torch.zeros(1)]]
+    out = upscale._tensors_to_device(cond, torch.device("cpu"))
+    assert isinstance(out, list) and len(out) == 2
+    assert isinstance(out[0], tuple) and isinstance(out[0][1], dict)
+    assert out[0][1]["strength"] == 1.0
+    assert isinstance(out[1], list)
+    assert out[0][0] is cond[0][0]  # 同设备直通返回原对象（零拷贝）
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
