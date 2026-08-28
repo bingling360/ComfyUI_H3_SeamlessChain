@@ -177,6 +177,64 @@ def test_save_prompts():
         assert by_dir["乙"]["total"] == 1 and by_dir["乙"]["done"] == 1
 
 
+def test_save_prompts_segments():
+    """分段字段随提示词回写：切换项目丢场景/角色/声音框的修复的持久层。"""
+    with _env() as out:
+        from ComfyUI_H3_SeamlessChain import projects
+
+        # 基本回写：segments 与 prompts 同序，按全局槽位对齐存 seg_fields
+        projects.create_project("甲")
+        seg = {"scene_prompt": "雨夜街头", "character_prompt": "短发女主",
+               "soundscape": "雨声", "music": "钢琴", "seconds": 7.3,
+               "unlink": True, "disabled": False, "refs": ["角色1"],
+               "frame_refs": ["首帧图"], "evil_key": "应被剔除"}
+        mf = projects.save_prompts("甲", ["镜头一", "镜头二"], [seg, None])
+        f0 = mf["seg_fields"][0]
+        assert f0["scene_prompt"] == "雨夜街头" and f0["character_prompt"] == "短发女主"
+        assert f0["soundscape"] == "雨声" and f0["music"] == "钢琴"
+        assert f0["seconds"] == 7.3 and f0["unlink"] is True and f0["disabled"] is False
+        assert f0["refs"] == ["角色1"] and f0["frame_refs"] == ["首帧图"]
+        assert "evil_key" not in f0                                # 白名单外的键剔除
+        assert mf["seg_fields"][1] is None
+
+        # 全空 segments -> 不写 seg_fields 键（旧 manifest 结构零变化）
+        projects.create_project("乙")
+        mf2 = projects.save_prompts("乙", ["镜头一"])
+        assert "seg_fields" not in mf2
+        # 显式全 None 同样不写
+        mf2b = projects.save_prompts("乙", ["镜头一"], [None])
+        assert "seg_fields" not in mf2b
+        # 只要有任意一段非空就写（序章/插入占位槽为 null，槽位不错位）
+        _mk_project(out, "丙", {
+            "schema": "h3seamless/ckpt-v3", "done": 2, "total": 3, "has_prologue": True,
+            "inserts": [{"slot": 2, "file": "素材A.mp4"}],
+            "prompts": ["「序章（上传视频）」", "正片1", "[插入视频] 素材A.mp4", "正片2"]})
+        mf3 = projects.save_prompts("丙", ["正片1改", "正片2改"],
+                                    [{"scene_prompt": "夜景"}])
+        sf = mf3["seg_fields"]
+        assert sf[0] is None and sf[2] is None and sf[3] is None
+        assert sf[1]["scene_prompt"] == "夜景" and sf[1]["character_prompt"] == ""
+
+        # 脏数据清洗：非 dict 项置 None、类型收敛
+        mf4 = projects.save_prompts("甲", ["镜头一", "镜头二", "镜头三"], [
+            "garbage",
+            {"seconds": "非数值", "refs": ["a", 5, None], "unlink": 1},
+            {"seconds": -3}])
+        assert mf4["seg_fields"][0] is None
+        f1 = mf4["seg_fields"][1]
+        assert f1["seconds"] is None and f1["refs"] == ["a", "5"] and f1["unlink"] is True
+        assert mf4["seg_fields"][2]["seconds"] is None
+
+        # segments 短于/长于 prompts：补 None / 多余忽略
+        mf5 = projects.save_prompts("甲", ["a", "b", "c"], [{"scene_prompt": "s0"}])
+        assert len(mf5["seg_fields"]) == 3 and mf5["seg_fields"][1] is None
+        mf6 = projects.save_prompts("甲", ["a"], [{"scene_prompt": "x"}, {"scene_prompt": "y"}])
+        assert mf6["seg_fields"][0]["scene_prompt"] == "x" and len(mf6["seg_fields"]) == 1
+
+        # 回写后 read_project 原样带出（前端 switchProject 读取路径）
+        assert projects.read_project("甲")["seg_fields"] == mf6["seg_fields"]
+
+
 def test_delete_project():
     with _env() as out:
         from ComfyUI_H3_SeamlessChain import projects

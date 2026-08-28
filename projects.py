@@ -82,15 +82,40 @@ def read_project(name: str):
     return manifest if isinstance(manifest, dict) else None
 
 
-def save_prompts(name: str, prompts):
+_SEG_STR_FIELDS = ("scene_prompt", "character_prompt", "soundscape", "music")
+
+
+def _clean_seg_field(raw) -> dict | None:
+    """前端分段字段白名单清洗：未知键剔除、类型收敛（防脏 JSON 膨胀 manifest）。"""
+    if not isinstance(raw, dict):
+        return None
+    out = {k: (str(raw[k]) if isinstance(raw.get(k), str) else "") for k in _SEG_STR_FIELDS}
+    sec = raw.get("seconds")
+    out["seconds"] = float(sec) if isinstance(sec, (int, float)) and sec > 0 else None
+    out["unlink"] = bool(raw.get("unlink"))
+    out["disabled"] = bool(raw.get("disabled"))
+    refs = raw.get("refs")
+    out["refs"] = [str(x) for x in refs if isinstance(x, (str, int))][:16] \
+        if isinstance(refs, list) else []
+    fr = raw.get("frame_refs")
+    out["frame_refs"] = [str(x) for x in fr if isinstance(x, (str, int))][:4] \
+        if isinstance(fr, list) else None
+    return out
+
+
+def save_prompts(name: str, prompts, segments=None):
     """把导演台当前提示词组回写进项目 manifest（提示词的持久源=项目文件夹）。
 
-    只更新 prompts / total / updated_at（及 done 超界钳制），不动
+    只更新 prompts / seg_fields / total / updated_at（及 done 超界钳制），不动
     params / seeds / prompt_hashes / finals / merges——运行时的重做判定依旧按
     节点控件提示词 vs prompt_hashes 逐段比对，改词段落照常自动重做。
     manifest.prompts 与磁盘段文件按全局槽位对齐（前端卡片/合并按此索引）：
     序章项目自动补回「序章」占位头；已有插入视频段在对应槽位补回
     「[插入视频] 文件名」占位行并计入 total——纯提示词回写不能让槽位错位。
+    segments 为分段处理字段（场景/角色/环境音/配乐/时长/独立镜头/不上链/
+    参考标签/首尾帧引用），与 prompts 同序（仅提示词段），存为
+    manifest["seg_fields"] 并按全局槽位对齐（序章/插入槽为 null）——
+    切换项目时前端据此还原各段卡片，不再丢分段字段。
     目录或 manifest 不存在（未跑过的指纹目录）返回 None，调用方按无项目跳过。
     """
     name = safe_name(name)
@@ -101,6 +126,10 @@ def save_prompts(name: str, prompts):
     if manifest is None:
         return None
     seg_prompts = [str(p) for p in prompts][:64]
+    seg_meta = [_clean_seg_field(x) for x in segments] \
+        if isinstance(segments, list) else []
+    while len(seg_meta) < len(seg_prompts):
+        seg_meta.append(None)
     off = 1 if manifest.get("has_prologue") else 0
     ins_map = {}
     for x in (manifest.get("inserts") or []):
@@ -109,16 +138,24 @@ def save_prompts(name: str, prompts):
                 ins_map[int(x["slot"])] = str(x["file"])
             except (TypeError, ValueError):
                 continue
-    rows, si = [], 0
+    rows, fields, si = [], [], 0
     for g in range(off + len(seg_prompts) + len(ins_map)):
         if g == 0 and off:
             rows.append("「序章（上传视频）」")
+            fields.append(None)
         elif g in ins_map:
             rows.append(f"[插入视频] {ins_map[g]}")
+            fields.append(None)
         else:
             rows.append(seg_prompts[si])
+            fields.append(seg_meta[si])
             si += 1
     manifest["prompts"] = rows
+    # 全空（无任何分段字段）不写键：旧 manifest 结构零变化，体积零增长
+    if any(x is not None for x in fields):
+        manifest["seg_fields"] = fields
+    else:
+        manifest.pop("seg_fields", None)
     manifest["total"] = len(rows)
     manifest["done"] = min(int(manifest.get("done") or 0), manifest["total"])
     manifest["updated_at"] = time.time()

@@ -88,7 +88,8 @@ def add_routes(routes):
 
     async def save_prompts(request):
         data = await request.json()
-        manifest = projects.save_prompts(str(data.get("dir") or ""), data.get("prompts"))
+        manifest = projects.save_prompts(str(data.get("dir") or ""), data.get("prompts"),
+                                         data.get("segments"))
         if manifest is None:
             return web.json_response(
                 {"error": "项目不存在（未新建也未跑过，无 manifest 可写）"}, status=404)

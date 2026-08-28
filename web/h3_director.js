@@ -482,6 +482,26 @@ function defaultSegment() {
     return { scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, disabled: false, frame_refs: null };
 }
 
+/** manifest.seg_fields[全局槽位] -> 分段字段对象（与 defaultSegment 同构）。
+ *  旧存档无该键/槽位为 null（序章/插入槽）→ 全默认空段；键缺失容错补齐。 */
+function restoreSegField(raw) {
+    const base = defaultSegment();
+    if (!raw || typeof raw !== "object") return base;
+    const sec = Number(raw.seconds);
+    return {
+        scene_prompt: typeof raw.scene_prompt === "string" ? raw.scene_prompt : "",
+        character_prompt: typeof raw.character_prompt === "string" ? raw.character_prompt : "",
+        soundscape: typeof raw.soundscape === "string" ? raw.soundscape : "",
+        music: typeof raw.music === "string" ? raw.music : "",
+        seconds: (raw.seconds === null || raw.seconds === undefined
+            || !Number.isFinite(sec) || sec <= 0) ? null : sec,
+        refs: Array.isArray(raw.refs) ? raw.refs.map(String) : [],
+        unlink: !!raw.unlink,
+        disabled: !!raw.disabled,
+        frame_refs: Array.isArray(raw.frame_refs) ? raw.frame_refs.map(String) : null,
+    };
+}
+
 function getDs(node) {
     if (!node) return defaultDs();
     const w = (node.widgets || []).find((x) => x.name === W_DS);
@@ -1865,11 +1885,13 @@ async function deleteProject(dir) {
     }
 }
 
-/** 提示词回写：把画布当前提示词组存进「存档目录」指向的项目 manifest——
- *  项目提示词的持久源=项目文件夹。三个触发点：
+/** 提示词回写：把画布当前提示词组 + 分段处理字段存进「存档目录」指向的项目
+ *  manifest——项目提示词的持久源=项目文件夹。三个触发点：
  *  ① 切换项目前（旧项目先落盘，否则画布状态被覆盖即丢失）；
  *  ② 新建项目前（同上）；
  *  ③ 编辑后 1.5s 防抖自动回写（断电/崩溃也不丢提示词草稿）。
+ *  seg_fields 与 prompts 同序（仅提示词段，全局槽位由后端对齐）——切换项目
+ *  丢分段字段（场景/角色/声音框清空）的修复正依赖这里先存后切。
  *  项目目录/manifest 不存在（未新建未跑过的指纹目录）→ 404 静默跳过；
  *  失败仅 console 警告，绝不阻断切换流程。 */
 async function flushPrompts(node, dir) {
@@ -1878,11 +1900,23 @@ async function flushPrompts(node, dir) {
     const target = dir || getDirValue(node);
     if (!target) return false;
     const ds = getDs(node);
+    const segments = (ds.segments || []).map((s) => s ? {
+        scene_prompt: String(s.scene_prompt || ""),
+        character_prompt: String(s.character_prompt || ""),
+        soundscape: String(s.soundscape || ""),
+        music: String(s.music || ""),
+        seconds: (s.seconds === null || s.seconds === undefined || s.seconds === ""
+            || !Number.isFinite(Number(s.seconds))) ? null : Number(s.seconds),
+        unlink: !!s.unlink,
+        disabled: !!s.disabled,
+        refs: Array.isArray(s.refs) ? s.refs.map(String) : [],
+        frame_refs: Array.isArray(s.frame_refs) ? s.frame_refs.map(String) : null,
+    } : null);
     try {
         const r = await api.fetchApi("/h3chain/save_prompts", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ dir: target, prompts: (ds.prompts || []).map(String) }),
+            body: JSON.stringify({ dir: target, prompts: (ds.prompts || []).map(String), segments }),
         });
         if (r.status === 404) return false;   // 无 manifest 的目录：跳过不报错
         if (!r.ok) { console.warn("[h3-director] save_prompts HTTP", r.status); return false; }
@@ -1928,16 +1962,22 @@ async function switchProject(dir) {
                 }
             }
             const texts = [];
+            const segs = [];
             const inserts = [];
+            /* seg_fields 按全局槽位对齐（序章/插入槽 null）：plist[j] 的全局槽位
+             * = j + off——还原本项目的分段字段（场景/角色/环境音/配乐等），
+             * 不再沿用切走前项目的旧值（切回即丢正是本修复目标） */
+            const fields = Array.isArray(mf.seg_fields) ? mf.seg_fields : [];
             let pos = 0;
-            for (const row of plist) {
+            for (let j = 0; j < plist.length; j++) {
                 pos += 1;
                 if (insByPos[pos]) { inserts.push({ pos, file: insByPos[pos] }); continue; }
-                if (String(row).startsWith("[插入视频]")) continue;   // 无 inserts 记录的残留占位
-                texts.push(String(row ?? ""));
+                if (String(plist[j]).startsWith("[插入视频]")) continue;   // 无 inserts 记录的残留占位
+                texts.push(String(plist[j] ?? ""));
+                segs.push(restoreSegField(fields[j + off]));
             }
             ds.prompts = texts;
-            ds.segments = Array.from({ length: texts.length }, (_v, i) => ds.segments?.[i] ?? defaultSegment());
+            ds.segments = segs.length ? segs : Array.from({ length: texts.length }, () => defaultSegment());
             ds.inserts = inserts;
             setDs(node, ds);
         }
@@ -2143,16 +2183,22 @@ async function collectData() {
                 }
             }
             const texts = [];
+            const segs = [];
             const inserts = [];
+            const fields = Array.isArray(mf?.seg_fields) ? mf.seg_fields : [];
             let pos = 0;
+            let j = 0;
             for (const row of (mf && mf.prompts || []).slice(off)) {
                 pos += 1;
-                if (insByPos[pos]) { inserts.push({ pos, file: insByPos[pos] }); continue; }
-                if (String(row).startsWith("[插入视频]")) continue;
+                if (insByPos[pos]) { inserts.push({ pos, file: insByPos[pos] }); j += 1; continue; }
+                if (String(row).startsWith("[插入视频]")) { j += 1; continue; }
                 texts.push(String(row ?? ""));
+                segs.push(restoreSegField(fields[j + off]));
+                j += 1;
             }
             dsAdopt.prompts = texts;
-            dsAdopt.segments = Array.from({ length: texts.length }, (_v, i) => dsAdopt.segments?.[i] ?? defaultSegment());
+            dsAdopt.segments = segs.length ? segs
+                : Array.from({ length: texts.length }, (_v, i) => dsAdopt.segments?.[i] ?? defaultSegment());
             dsAdopt.inserts = inserts;
             setDs(node, dsAdopt);
             ({ plan, drafts, ds } = planFromDs(node));
@@ -2273,6 +2319,9 @@ function injectStyles() {
     .h3d-proj-name{font-weight:700;word-break:break-all;font-size:12.5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;color:var(--h3d-bone)}
     .h3d-proj-meta{color:var(--h3d-muted);font-size:11px;font-family:ui-monospace,Consolas}
     .h3d-newrow{display:flex;gap:8px;padding:0 12px 12px;flex-wrap:wrap}
+    .h3d-autohint{margin:12px;padding:11px 12px;border:1px solid #4a4230;border-radius:8px;background:#2a2820;color:#d8cfa8;font-size:11.5px;line-height:1.75}
+    .h3d-autohint b{color:#f0d98c}
+    .h3d-autohint .h3d-btn{margin-top:8px}
     .h3d-meter{margin:0 12px 12px;padding:11px;border:1px solid #444c56;border-radius:8px;background:#262c36}
     .h3d-meter strong{display:block;color:var(--h3d-cyan);font:700 16px/1.3 ui-monospace,Consolas}
     .h3d-meter p{margin:4px 0 0;color:var(--h3d-muted);font-size:11px}
@@ -2531,7 +2580,11 @@ function renderMini(data) {
 
     const head = el("div", "h3d-mini-head");
     const brand = el("div", "h3d-mini-brand", "长片导演台");
-    brand.append(el("small", "", escapeHtml(state?.dir || (node ? getDirValue(node) || "未命名链" : "无节点"))));
+    /* 空存档目录 = 按参数指纹自动开项目：如实标注，不拿上次项目名冒充当前链
+     * （否则参数一变悄悄换项目，用户只看到「名字没变却新开了项目」） */
+    brand.append(el("small", "", escapeHtml(node
+        ? (String(getDirValue(node) || "").trim() || "未命名链 · 自动存档")
+        : "无节点")));
     head.append(brand, el("span", `h3d-led ${ledPhase}`, '<i></i><em></em>'));
 
     const rail = el("div", "h3d-mini-rail");
@@ -2757,6 +2810,31 @@ function renderLeftColumn(sec, data) {
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
         "<strong>项目存档</strong><small>一个项目一个文件夹 · 点击读档继续拍</small>"));
+
+    /* 「存档目录」为空 = 按画布参数指纹自动命名：参数一变即静默开新项目
+     * （用户视角就是「保存有时新建项目、有时又不建」）。把隐式行为亮出来：
+     * 提示成因 + 一键固定到上次运行的项目，之后参数漂移会被后端明确拦下 */
+    const autoNamed = !!node && !String(getDirValue(node) || "").trim();
+    if (autoNamed) {
+        const hint = el("div", "h3d-autohint");
+        hint.append(el("div", "",
+            "「存档目录」为空：保存按画布参数指纹自动开项目——参数（画幅/每段时长/"
+            + "步数/CFG/采样器/门控/递减锚定/实验开关等）一变就换新项目，不变则续用同一个。"
+            + (state?.dir ? `上次运行存入 ${escapeHtml(state.dir)}。` : "")
+            + "固定项目：读档任一项目，或点下方按钮。"));
+        if (state?.dir) {
+            const pin = el("button", "h3d-btn h3d-btn-cyan", "📌 固定当前项目");
+            pin.title = `把「${state.dir}」写进存档目录：此后保存固定进这个项目，`
+                + "参数变化时后端会明确报「存档参数与当前不一致」而不是静默开新项目";
+            pin.onclick = () => {
+                if (!setDirValue(node, state.dir)) { alert("节点上没有「存档目录/断点目录」控件"); return; }
+                setLed("idle", `已固定项目「${state.dir}」，此后保存都进这个文件夹`);
+                scheduleRefresh(200);
+            };
+            hint.append(pin);
+        }
+        sec.append(hint);
+    }
 
     const list = el("div", "h3d-projlist");
     const projects = mergeProjects(data.projects, state);

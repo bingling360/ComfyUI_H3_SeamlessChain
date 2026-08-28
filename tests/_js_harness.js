@@ -5,7 +5,7 @@ let src = fs.readFileSync(path.join(__dirname, "../web/h3_director.js"), "utf8")
 src = src
     .replace('import { app } from "/scripts/app.js";', "const app = { graph: null, registerExtension() {} };")
     .replace('import { api } from "/scripts/api.js";', "const api = { addEventListener() {}, fetchApi: async () => ({ ok: true }) };");
-const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapOldWidgetValuesToCurrent, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, planFromDs, defaultUpscale, setUpscaleField, upTargetCanvas, applyChainParams, defaultExperiments, normalizeExperiments, expActiveList, expLocked, parseMasterPrompt, exportMasterPrompt, applyMasterPrompt, planOff, redoMap, redoSlotValid, redoPending, redoQueued, reorderChain, nudgeIns };")(() => {}, () => true);
+const mod = new Function("alert", "confirm", src + "\nreturn { resolveCanvas, snapFrames, matchCanvasCombo, remapOldWidgetValues, remapOldWidgetValuesToCurrent, getDs, setDs, defaultDs, addAsset, toggleSegmentRef, KIND_CAPS, removeRefImage, defaultSegment, restoreSegField, planFromDs, defaultUpscale, setUpscaleField, upTargetCanvas, applyChainParams, defaultExperiments, normalizeExperiments, expActiveList, expLocked, parseMasterPrompt, exportMasterPrompt, applyMasterPrompt, planOff, redoMap, redoSlotValid, redoPending, redoQueued, reorderChain, nudgeIns };")(() => {}, () => true);
 let fails = 0;
 function eq(name, got, want) {
     const ok = JSON.stringify(got) === JSON.stringify(want);
@@ -129,6 +129,25 @@ eq("unlink 布尔归一", dsU.segments.map((s) => s.unlink), [true, true]);
 mod.setDs(nodeU, dsU);
 eq("unlink 回写回环", mod.getDs(nodeU).segments.map((s) => s.unlink), [true, true]);
 eq("defaultSegment unlink 缺省 false", mod.defaultSegment().unlink, false);
+
+/* ---- restoreSegField：manifest.seg_fields[全局槽位] -> 分段字段还原 ---- */
+eq("空档还原为全默认", mod.restoreSegField(null), mod.defaultSegment());
+eq("非对象还原为全默认", mod.restoreSegField("garbage"), mod.defaultSegment());
+const rfOk = mod.restoreSegField({
+    scene_prompt: "雨夜街头", character_prompt: "短发女主", soundscape: "雨声", music: "钢琴",
+    seconds: 7.3, unlink: true, disabled: false, refs: ["图片1", 2], frame_refs: ["首帧图"],
+});
+eq("完整档还原", rfOk, { scene_prompt: "雨夜街头", character_prompt: "短发女主", soundscape: "雨声",
+    music: "钢琴", seconds: 7.3, refs: ["图片1", "2"], unlink: true, disabled: false,
+    frame_refs: ["首帧图"] });
+eq("键缺失补默认", mod.restoreSegField({ scene_prompt: "仅场景" }),
+    Object.assign(mod.defaultSegment(), { scene_prompt: "仅场景" }));
+eq("非字符串键归空", mod.restoreSegField({ scene_prompt: 123, seconds: 0 }),
+    Object.assign(mod.defaultSegment(), { seconds: null }));
+eq("负秒数归 null", mod.restoreSegField({ seconds: -5 }), mod.defaultSegment());
+eq("字符串秒数宽容转数值", mod.restoreSegField({ seconds: "7.3" }).seconds, 7.3);
+eq("refs 非数组归空", mod.restoreSegField({ refs: "图片1" }).refs, []);
+eq("frame_refs 非数组归 null", mod.restoreSegField({ frame_refs: 3 }).frame_refs, null);
 
 /* ---- 插入视频段（ds.inserts）：getDs 规范化（去重/过滤/排序） ---- */
 const nodeI = { widgets: [{ name: "导演台状态", value: JSON.stringify({
@@ -488,7 +507,10 @@ if (wf) {
     const byId = new Map(wf.nodes.map((n) => [n.id, n]));
     const h3n = [...byId.values()].find((n) => n.type === "H3SeamlessChainSampler");
     ok("主节点存在", !!h3n);
-    /* 每条 link 两端节点存在、槽位下标合法、类型一致 */
+    /* 每条 link 两端节点存在、槽位下标合法、类型一致
+       新模板为 ComfyUI 导出的标准格式（无旧构建器私有的 outputs[].link 单数
+       回指）：源端校验 links 数组含该 id，目标端校验 link === id；类型允许
+       通配 *（PreviewAny 等万能输入端点） */
     for (const [lid, sid, sslot, did, dslot, type] of wf.links) {
         const s = byId.get(sid), d = byId.get(did);
         ok(`link${lid} 源节点存在(${sid})`, !!s);
@@ -498,12 +520,15 @@ if (wf) {
         ok(`link${lid} 源槽位合法`, !!so);
         ok(`link${lid} 目标槽位合法`, !!di);
         if (!so || !di) continue;
-        ok(`link${lid} 类型一致 ${so.type}->${di.type}`, so.type === type && di.type === type);
-        ok(`link${lid} 槽位回指`, so.link === lid && di.link === lid);
+        ok(`link${lid} 类型一致 ${so.type}->${di.type}`,
+           so.type === type && (di.type === type || di.type === "*"));
+        ok(`link${lid} 槽位回指`,
+           di.link === lid && Array.isArray(so.links) && so.links.includes(lid));
     }
-    /* 主节点输入槽顺序与后端 schema 一致（autogrow 全组 0 起编号，含提示词组） */
+    /* 主节点输入槽顺序与后端 schema 一致（autogrow 全组 0 起编号，含提示词组）。
+       新模板（导出 JSON 直转）带 4 个提示词槽：0–2 预连线，3 为增长位空槽 */
     const expect = ["模型", "文本编码器", "视频VAE", "音频VAE", "首帧图片", "尾帧图片", "每段尾帧锚定", "起始视频", "起始视频音轨",
-        "提示词组.提示词_0", "提示词组.提示词_1", "提示词组.提示词_2",
+        "提示词组.提示词_0", "提示词组.提示词_1", "提示词组.提示词_2", "提示词组.提示词_3",
         ...Array.from({ length: 9 }, (_v, i) => `参考图片组.参考图片_${i}`),
         ...Array.from({ length: 3 }, (_v, i) => `参考视频组.参考视频_${i}`),
         ...Array.from({ length: 3 }, (_v, i) => `参考视频音轨组.参考视频音轨_${i}`),
@@ -516,25 +541,30 @@ if (wf) {
     ok("目标尾帧图节点存在", !!ef);
     if (ef) {
         eq("目标尾帧图节点隐藏", ef.mode, 2);
-        eq("目标尾帧图→槽位5 尾帧图片", [10, 5],
-            [wf.links.find((l) => l[0] === ef.outputs[0].link)[3], wf.links.find((l) => l[0] === ef.outputs[0].link)[4]]);
+        const efl = wf.links.find((l) => l[0] === ef.outputs[0].links?.[0]);
+        eq("目标尾帧图→槽位5 尾帧图片", efl && [efl[3], efl[4]], [10, 5]);
     }
     /* 每段尾帧锚定：槽位 6 预连线到隐藏「尾帧图」LoadImage（任意模式可点亮） */
     const lf = [...byId.values()].find((n) => n.title === "尾帧图");
     ok("尾帧图节点存在", !!lf);
     if (lf) {
         eq("尾帧图节点隐藏", lf.mode, 2);
-        eq("尾帧图→槽位6 每段尾帧锚定", [10, 6],
-            [wf.links.find((l) => l[0] === lf.outputs[0].link)[3], wf.links.find((l) => l[0] === lf.outputs[0].link)[4]]);
+        const lfl = wf.links.find((l) => l[0] === lf.outputs[0].links?.[0]);
+        eq("尾帧图→槽位6 每段尾帧锚定", lfl && [lfl[3], lfl[4]], [10, 6]);
     }
     /* 分段视频不再单独打包：改由主节点「自动保存」存进项目文件夹（导演台段卡片预览） */
     ok("无遗留分段打包链", ![...byId.values()].some((n) => n.type === "CreateVideo" || n.type === "SaveVideo"));
     /* widgets_values 顺序与后端 schema 控件数一致（29 项 = 28 控件 + 种子 control 占 1 位） */
     eq("主节点 widgets 数量", h3n.widgets_values.length, 29);
-    eq("百万像素浮点默认 0.5", h3n.widgets_values[1], 0.5);
+    eq("百万像素浮点默认 0.4", h3n.widgets_values[1], 0.4);
     eq("主节点锚定加噪默认值", h3n.widgets_values[17], 0.0);
     eq("主节点自动保存默认值", h3n.widgets_values[19], "分段");
-    eq("主节点尾部 生成模式/自动成片/导演台状态/一采编码", h3n.widgets_values.slice(25), ["文生视频", "开启", "", "标准"]);
+    /* 尾部四项：生成模式/自动成片/导演台状态(JSON)/一采编码。新模板出厂即带
+       默认导演台状态（含二采配置草稿）与高清一采档——不再是空串+标准档 */
+    eq("主节点尾部 生成模式/自动成片", h3n.widgets_values.slice(25, 27), ["文生视频", "开启"]);
+    ok("主节点导演台状态为合法 JSON 草稿",
+       (() => { try { const j = JSON.parse(h3n.widgets_values[27]); return j && Array.isArray(j.prompts) && !!j.upscale; } catch { return false; } })());
+    eq("主节点一采编码默认值", h3n.widgets_values[28], "高清");
     /* last_link_id / last_node_id 覆盖全部 */
     eq("last_node_id", wf.last_node_id, Math.max(...wf.nodes.map((n) => n.id)));
     eq("last_link_id", wf.last_link_id, Math.max(...wf.links.map((l) => l[0])));
