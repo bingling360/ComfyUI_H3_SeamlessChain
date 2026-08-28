@@ -87,6 +87,43 @@ def cond_audio_rows_guard(dit):
     return lambda: setattr(dit, "_cond_audio_rows", orig)
 
 
+def cond_video_rows_guard(dit):
+    """安装 _cond_video_rows 兜底 patch，返回恢复函数（try/finally 调用）。
+
+    ComfyUI 0.33.0~0.33.4 的 MiniMaxH3.extra_conds 在 refs 分支用「=」覆盖了
+    keyframes 分支刚写入的 cond_video_latents（0.34.2 起才改成 +=）：
+
+        keyframes -> payload["cond_video_latents"] = [kf latent...]
+        refs      -> payload["cond_video_latents"] = [ref latent...]   # 覆盖！
+
+    于是「段间桥 keyframe + 参考图」同段共存时，keyframe 的 latent 被整个丢掉，
+    而 PackedLayout 仍按 keyframes+refs 两者预留行数 —— _forward 里
+    all_video_rows[~img_update] = cond_video_rows 直接形状错位：
+        shape mismatch: [405, 96] cannot be broadcast to [810, 96]
+    （405 = 864×480 基础画幅一帧的 2×2 patch 行数，810 = 桥锚 + 参考图两份）
+
+    触发面：非首段且本段挂了参考素材（首段无桥所以不挂 keyframe，反而平安）；
+    与二采无关（关掉二采照样崩）。与 cond_audio_rows_guard 同机制，按 layout
+    段顺序（keyframe 在前、refs 在后）用 payload 里完好的素材在线重建。
+    """
+    orig = dit._cond_video_rows
+
+    def fixed(payload, device, _orig=orig):
+        want = [kf["latent"] for kf in (payload.get("keyframes") or [])
+                if kf.get("latent") is not None]
+        want += [r["latent"] for r in (payload.get("refs") or []) if "latent" in r]
+        supplied = payload.get("cond_video_latents") or []
+        # 身份比较：命中官方正确实现（0.34.2+）时零改动，只在被覆盖/被别的
+        # 插件重建过时才接管；不比较张量内容，避免无谓的 GPU 同步
+        if want and [id(z) for z in supplied] != [id(z) for z in want]:
+            payload = dict(payload)
+            payload["cond_video_latents"] = want
+        return _orig(payload, device)
+
+    dit._cond_video_rows = fixed
+    return lambda: setattr(dit, "_cond_video_rows", orig)
+
+
 def step_cond_noise_guard(dit, aug_start, aug_end, fade_ratio):
     """递减锚定：visual_cond_noise_aug 随采样进度从强到弱递减到消失。
 
@@ -1909,6 +1946,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 共存 H3 插件可能丢 keyframe/refs 音频导致 cond_audio 行数错位，
                     # 采样期挂模型层兜底（见 cond_audio_rows_guard），完成后恢复
                     restore_audio_rows = cond_audio_rows_guard(模型.model.diffusion_model)
+                    # 官方 0.33.x extra_conds 用「=」覆盖 cond_video_latents：
+                    # 参考图与段间桥/锚点同段共存时丢 keyframe latent（见
+                    # cond_video_rows_guard），同样在采样期兜底
+                    restore_video_rows = cond_video_rows_guard(模型.model.diffusion_model)
                     # 递减锚定：visual_cond_noise_aug 随采样进度从强到弱递减到消失。
                     # 开启时覆盖 _apply_anchor_noise 写入的固定值——每步动态计算
                     restore_step_aug = None
@@ -1923,6 +1964,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
                     finally:
                         restore_audio_rows()
+                        restore_video_rows()
                         if restore_step_aug:
                             restore_step_aug()
                     dt = time.perf_counter() - t0
@@ -1959,6 +2001,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             aug=aug, fade_ratio=fade_ratio,
                             eff_guide=eff_guide, tail_anchor_latent=tail_anchor_latent,
                             cond_audio_rows_guard=cond_audio_rows_guard,
+                            cond_video_rows_guard=cond_video_rows_guard,
                             step_cond_noise_guard=step_cond_noise_guard,
                             _apply_anchor_noise=_apply_anchor_noise,
                             latent_t_to_frames=latent_t_to_frames,
@@ -2339,6 +2382,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                  aug=0.0, fade_ratio=0.0,
                                  eff_guide=None, tail_anchor_latent=None,
                                  cond_audio_rows_guard=None,
+                                 cond_video_rows_guard=None,
                                  step_cond_noise_guard=None,
                                  _apply_anchor_noise=None,
                                  latent_t_to_frames=None,
@@ -2416,6 +2460,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         # 过渡重采样（低步数）
         restore_rows = cond_audio_rows_guard(模型.model.diffusion_model) if cond_audio_rows_guard else None
+        # 双锚 keyframe 与参考图共存时同样会撞 0.33.x 的 cond_video_latents 覆盖
+        restore_video_rows = cond_video_rows_guard(模型.model.diffusion_model) \
+            if cond_video_rows_guard else None
         restore_step = None
         if fade_ratio > 0 and step_cond_noise_guard is not None and dual_anchor_strength > 0:
             e4_aug_start = 1.0 - (aug / max(0.01, dual_anchor_strength)) if aug > 0 else 0.999
@@ -2428,6 +2475,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         finally:
             if restore_rows:
                 restore_rows()
+            if restore_video_rows:
+                restore_video_rows()
             if restore_step:
                 restore_step()
 
